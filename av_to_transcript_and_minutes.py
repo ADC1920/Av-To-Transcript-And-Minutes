@@ -23,6 +23,8 @@
 
 常用参数：
   --meeting               产出带说话人与时间戳的会议原文（正式纪要由会话内 AI 提炼）
+  --no-diarize            单人素材跳过说话人分离直接整段转写（更快;云端 message 走整文件一次调用）
+  --asr-engine cloud      换云端引擎 qwen-audio-3.1-asr-message（免显存;换子模型加 --asr-extra "--cloud-model omni|filetrans"）
   --no-separate           纯人声素材跳过 Demucs 分离，直接转写（更快）
   --names "0=张三,1=李四"  固定说话人姓名（先听一段确认谁是谁）
   --srt                   额外产出字级时间戳字幕
@@ -310,7 +312,7 @@ def probe_audio_codec(video: Path) -> str:
 
 
 def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=None,
-                   srt=False, engine=None, extra=None, tag=None) -> str:
+                   srt=False, engine=None, extra=None, tag=None, single=False) -> str:
     """转写缓存文件名：任一影响结果的配置不同 → 缓存不同。
     识别引擎（qwen/aed）输出的文本不同，是缓存键的必需维度——漏掉它会让人以为换了引擎、
     实际拿到的是旧引擎结果；热词、人名、字幕、额外 ASR 参数同理不可与默认结果混用。
@@ -319,6 +321,8 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
     parts = []
     if tag:
         parts.append(str(tag))
+    if single:
+        parts.append("不分人")
     if engine == "aed":
         parts.append("aed")
     if diarize_engine == "pyannote":
@@ -337,15 +341,16 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
 
 
 def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
-    """调 qwen_asr.py 转写（恒走 --diarize：说话人分离），返回结构化 JSON。
-    opts 键：threshold / diarize_engine / hotwords / names / srt / engine（识别引擎）
+    """调 qwen_asr.py 转写（默认 --diarize：说话人分离；opts.no_diarize=True 跳过），返回结构化 JSON。
+    opts 键：threshold / diarize_engine / hotwords / names / srt / engine（识别引擎）/ no_diarize
              extra（额外 ASR 参数列表，命令行追加）/ verbose（子进程输出实时透传）
     缓存已存在且非 --force 时直接复用（转写是最贵环节，支持断点续跑）；
     白名单键走任务配置 JSON，其余额外参数以命令行形式追加。"""
     extra = list(opts.get("extra") or [])
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
-        opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra, tag)
+        opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra, tag,
+        single=bool(opts.get("no_diarize")))
     if cache_json.exists() and not force:
         return json.loads(cache_json.read_text(encoding="utf-8"))
     raw_json = vocals.parent / (vocals.stem + ".json")  # qwen_asr 固定输出名：<音频名>.json
@@ -356,9 +361,11 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     raw_json.unlink(missing_ok=True)
     raw_srt.unlink(missing_ok=True)
-    run_child([sys.executable, str(asr_script()), str(vocals), "--diarize",
-               "--job-config", str(cfg_path)] + extra,
-              verbose=bool(opts.get("verbose")), env=child_env())
+    cmd = [sys.executable, str(asr_script()), str(vocals)]
+    if not opts.get("no_diarize"):
+        cmd.append("--diarize")
+    cmd += ["--job-config", str(cfg_path)] + extra
+    run_child(cmd, verbose=bool(opts.get("verbose")), env=child_env())
     cfg_path.unlink(missing_ok=True)
     raw_json.replace(cache_json)
     return json.loads(cache_json.read_text(encoding="utf-8"))
@@ -456,7 +463,7 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     # 说话人结果自检：默认 campp 在语音段不足 2 段时会跳过聚类，把所有人归到说话人 0；
     # 这时给出可执行的下一步，而不是让用户拿着错误的单一说话人继续用
     spk_ids = {l.get("spk") for l in (payload.get("lines") or [])}
-    if (len(spk_ids) <= 1 and not meeting
+    if (len(spk_ids) <= 1 and not meeting and not opts.get("no_diarize")
             and opts.get("diarize_engine") != "pyannote" and not opts.get("names")):
         print("[提示] 本次只输出 1 个说话人：campp 声纹聚类在语音段不足时会跳过聚类。"
               "如需区分说话人，可加 --meeting 或 --diarize-engine pyannote 并用 --force 重跑",
@@ -640,6 +647,9 @@ def main():
                          "mdx_extra 更强但可能引入伪影。换模型会按新模型重跑分离")
     ap.add_argument("--meeting", action="store_true",
                     help="产出会议原文（带时间戳；默认产出转写文稿。转写恒带说话人分离）")
+    ap.add_argument("--no-diarize", action="store_true",
+                    help="单人素材跳过说话人分离直接整段转写（更快；云端 message 引擎将走整文件一次调用）；"
+                         "与 --meeting 互斥")
     ap.add_argument("--diarize-engine", choices=["campp", "pyannote", "auto"], default="auto",
                     help="说话人分离引擎：auto=会议自动用 pyannote（重叠语音更准），其余用 campp；"
                          "campp=轻量声纹聚类；pyannote=分割模型（需已装）")
@@ -653,9 +663,11 @@ def main():
                     help="说话人改名（如 '0=赵总,1=张会计'）——会议原文的说话人标签将显示真实姓名")
     ap.add_argument("--srt", action="store_true",
                     help="额外产出 .srt 字幕（同名，含字级时间戳；加载 fa-zh 对齐模型）")
-    ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto"], default="qwen",
+    ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto", "cloud"], default="qwen",
                     help="识别引擎：qwen=Qwen3-ASR-1.7B（默认，多语言）；aed=FireRedASR2-AED（中/英/粤更准）；"
-                         "auto=按 --language 路由（中/英/粤走 aed，其余走 qwen）")
+                         "auto=按 --language 路由（中/英/粤走 aed，其余走 qwen）；"
+                         "cloud=阿里云百炼（默认 qwen-audio-3.1-asr-message，需 DASHSCOPE_API_KEY，免显存；"
+                         "换子模型加 --asr-extra \"--cloud-model omni|filetrans\"）")
     ap.add_argument("--itn", action="store_true",
                     help="中文逆文本正则化：三百二十万元->320万元、百分之八十->80%%，"
                          "二零二六年十月十五日->2026年10月15日（自写规则，零依赖）")
@@ -695,6 +707,8 @@ def main():
     ap.add_argument("--replace-save", nargs="?", const="auto", default=None,
                     help="把本次纠错条目合并写回词典（裸写或 auto=输出目录 replace_dict.txt，键同新值覆盖）")
     args = ap.parse_args()
+    if args.meeting and args.no_diarize:
+        sys.exit("--meeting 需要说话人分离产出说话人标签，不能与 --no-diarize 同用")
 
     src = Path(args.input)
     if not src.exists():
@@ -743,7 +757,8 @@ def main():
             "hotwords": args.hotwords, "names": args.names, "srt": args.srt,
             "engine": args.asr_engine if args.asr_engine != "qwen" else None,
             "extra": extra, "verbose": args.verbose, "clean": args.clean,
-            "demucs_model": args.demucs_model, "split_channels": args.split_channels}
+            "demucs_model": args.demucs_model, "split_channels": args.split_channels,
+            "no_diarize": args.no_diarize}
 
     # 日志落盘：终端与 run.log 双写，批量跑完还能回溯
     log_path = None

@@ -46,6 +46,10 @@
 #   python qwen_asr.py 录音.m4a --engine aed            # 换 FireRedASR2-AED（中文更准；日文不支持）
 #   python qwen_asr.py 录音.m4a --vad firered            # 换 FireRedVAD 切段
 #   python qwen_asr.py 嘈杂.m4a --denoise                # ZipEnhancer 前处理（含 BGM/强噪时试）
+#   python qwen_asr.py 录音.m4a --engine cloud           # 云端默认 qwen-audio-3.1-asr-message（整文件直出句级+字级时间戳,免显存）
+#   python qwen_asr.py 录音.m4a --engine cloud --cloud-model omni   # 云端 qwen3.8-omni-flash（全模态转写,纯文本）
+#   python qwen_asr.py --engine cloud --cloud-model filetrans --cloud-url <公网音频URL> --diarize
+#                                                        # 云端异步转写（仅公网 URL;自带说话人分离+字级时间戳）
 import argparse, json, os, sys, tempfile, time
 from pathlib import Path
 import numpy as np
@@ -65,6 +69,15 @@ AED_MAX_SPLIT_DEPTH = 2   # OOM 兜底二分深度上限(2 → 最小拆到原�
 PUNCT = set("，。！？；：、,.!?;:…—～~「」『』“”‘’（）()《》〈〉【】[]\"'· \t\n\r")
 HARD_STOP = "。！？；!?;"
 SOFT_STOP = "，,、：:"
+
+# ---- cloud 引擎（阿里云百炼,格式经 2026-10-07 真实探针验证）----
+# message: dashscope SDK WebSocket,本地 wav 直传,整文件直出句级+字级时间戳(diarize 时逐段)
+# omni: OpenAI 兼容接口,data:;base64 音频 + 转写 prompt(无时间戳);filetrans: 异步任务,仅公网 URL,
+# 提交后轮询 tasks,结果 JSON 在 transcription_url(24h 有效);三款均经 2026-10-07 真实探针验证
+CLOUD_BASE = "https://dashscope.aliyuncs.com"
+CLOUD_MODELS = {"message": "qwen-audio-3.1-asr-flash-message",
+                "omni": "qwen3.8-omni-flash",
+                "filetrans": "qwen-audio-3.1-asr-flash-filetrans"}
 
 
 def resolve_model_path():
@@ -259,6 +272,260 @@ def apply_replace(text, matcher):
         return text
     return matcher.apply_text(text)[0]
 
+
+# ---------------- cloud 引擎（百炼 API） ----------------
+
+def load_dashscope_key():
+    """DASHSCOPE_API_KEY:环境变量优先,回退注册表 HKCU\\Environment(会话中途写入注册表也能取到)"""
+    k = os.environ.get("DASHSCOPE_API_KEY")
+    if k:
+        return k
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as reg:
+            k, _ = winreg.QueryValueEx(reg, "DASHSCOPE_API_KEY")
+        return k
+    except OSError:
+        sys.exit("cloud 引擎需要 DASHSCOPE_API_KEY(未在环境变量与 HKCU\\Environment 中找到)")
+
+
+def cloud_post(url, headers, body, timeout=300, retries=2, log=print):
+    """POST,429/5xx/网络异常按 3s/7.5s 退避重试;成功返回 json,其余 sys.exit"""
+    import requests
+    delay = 3
+    for i in range(retries + 1):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 500, 502, 503, 504) and i < retries:
+                log(f"[warn] 云端返回 {r.status_code},{delay}s 后重试({i + 1}/{retries})")
+                time.sleep(delay)
+                delay *= 2.5
+                continue
+            sys.exit(f"云端接口失败 HTTP {r.status_code}: {r.text[:300]}")
+        except requests.RequestException as e:
+            if i < retries:
+                log(f"[warn] 网络异常 {type(e).__name__},{delay}s 后重试")
+                time.sleep(delay)
+                delay *= 2.5
+                continue
+            sys.exit(f"云端接口网络失败: {type(e).__name__}: {e}")
+
+
+def _cloud_hotword_vocab(hotwords, log=None):
+    """顿号/逗号分隔的热词串 -> 即时词表 {词: 4}(文档推荐权重);随请求传入,免预创建与生命周期管理"""
+    words = [w.strip() for w in (hotwords or "").replace("，", ",").replace("、", ",").split(",") if w.strip()]
+    if not words:
+        return None
+    if len(words) > 50:
+        if log:
+            log(f"[提示] 热词 {len(words)} 条,仅取前 50 条")
+        words = words[:50]
+    return {w: 4 for w in words}
+
+
+def _cloud_message_seg(path, ctx):
+    """message 通道单段/单文件:dashscope SDK(WebSocket),本地 wav 直传;
+    返回 (全文, 字级时间戳[[start_ms, end_ms], ...] 相对本段起点)"""
+    try:
+        import dashscope
+        from dashscope.audio.asr import Recognition
+    except ImportError:
+        sys.exit("message 通道需要 dashscope SDK：pip install dashscope（omni/filetrans 通道无需）")
+    dashscope.api_key = ctx["key"]
+    kw = {}
+    vocab = _cloud_hotword_vocab(ctx.get("hotwords"))
+    if vocab:
+        kw["vocabulary"] = vocab
+    rec = Recognition(model=CLOUD_MODELS["message"], format="wav", sample_rate=16000,
+                      callback=None, **kw)
+    res = rec.call(str(path))
+    if getattr(res, "status_code", None) != 200:
+        sys.exit(f"message 通道失败: {getattr(res, 'message', res)}")
+    sents = res.get_sentence() or []
+    text = "".join((s.get("text") or "") for s in sents).strip()
+    ts = []   # 词级时间戳 -> 字符级(词内均分),供 subtitle_units 复用
+    for s in sents:
+        for w in (s.get("words") or []):
+            chars = [c for c in (w.get("text") or "") if c not in PUNCT]
+            if not chars:
+                continue
+            wb, we = int(w.get("begin_time") or 0), int(w.get("end_time") or 0)
+            nn = len(chars)
+            ts.extend([[wb + (we - wb) * i // nn, wb + (we - wb) * (i + 1) // nn] for i in range(nn)])
+    return text, ts
+
+def _cloud_omni_seg(path, ctx):
+    """omni 通道单段:OpenAI 兼容,音频 data:;base64 直传,要求只输出转写文本"""
+    import base64
+    b64 = base64.b64encode(Path(path).read_bytes()).decode()
+    content = [{"type": "input_audio", "input_audio": {"data": "data:;base64," + b64, "format": "wav"}}]
+    prompt = "请将这段音频完整转写为文字，只输出转写结果，不要任何附加说明。"
+    if ctx.get("hotwords"):
+        prompt = "可能出现的术语(仅供参考,不要输出此列表):" + ctx["hotwords"] + "。" + prompt
+    content.append({"type": "text", "text": prompt})
+    body = {"model": CLOUD_MODELS["omni"], "messages": [{"role": "user", "content": content}],
+            "modalities": ["text"], "reasoning_effort": "none"}
+    j = cloud_post(CLOUD_BASE + "/compatible-mode/v1/chat/completions",
+                   {"Authorization": f"Bearer {ctx['key']}", "Content-Type": "application/json"},
+                   body, log=ctx["log"])
+    return ((j.get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
+
+
+def cloud_transcribe_batch(audio_paths, ctx, t2s=None, matcher=None, itn=None):
+    """cloud 同步引擎逐段转写,返回与 transcribe_batch 同构的 parsed
+    ctx: {key,model,log,hotwords};model 为 message/omni 之一(message 走 SDK WebSocket,
+    omni 走 OpenAI 兼容);云端自带标点与规范化,繁转简与专名纠错仍走本地后处理。
+    4 线程并发上传(云端 RPM 600 远大于此),ex.map 按段序保序;文本后处理回主线程做
+    (t2s/itn/matcher 不保证线程安全);message 段回传字级时间戳,存入 cloud_words 供字幕复用"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(p):
+        if ctx["model"] == "message":
+            return _cloud_message_seg(p, ctx)
+        return _cloud_omni_seg(p, ctx), None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        raw = list(ex.map(one, audio_paths))
+    out = []
+    for txt, cts in raw:
+        if t2s is not None:
+            txt = t2s(txt)
+        if itn is not None:
+            txt = itn(txt)
+        item = {"language": None, "transcription": apply_replace(txt, matcher)}
+        if cts:
+            item["cloud_words"] = cts
+        out.append(item)
+    return out
+
+def run_cloud_message(args, out_json, out_srt, matcher, t2s, itn_fn, log, t0, audio_path):
+    """message 通道整文件旁路(非 diarize):SDK 一次调用直出句级文本+时间戳,
+    无需本地 VAD 与 fa-zh 对齐;json(segments) 与 srt 与本地管线同构"""
+    try:
+        import dashscope
+        from dashscope.audio.asr import Recognition
+    except ImportError:
+        sys.exit("message 通道需要 dashscope SDK：pip install dashscope（omni/filetrans 通道无需）")
+    dashscope.api_key = load_dashscope_key()
+    kw = {}
+    vocab = _cloud_hotword_vocab(args.hotwords, log)
+    if vocab:
+        kw["vocabulary"] = vocab
+        log(f"[0] 即时热词 {len(vocab)} 条已启用(随请求传入,免预创建)")
+    rec = Recognition(model=CLOUD_MODELS["message"], format="wav", sample_rate=16000,
+                      callback=None, **kw)
+    res = rec.call(str(audio_path))
+    if getattr(res, "status_code", None) != 200:
+        sys.exit(f"message 通道失败: {getattr(res, 'message', res)}")
+    sents = res.get_sentence() or []
+    units, aligns = [], []
+    for s in sents:
+        # 字级 words -> 字符级 ts(词内均分),供 subtitle_units 按 --max-line 细分字幕
+        ts = []
+        for w in (s.get("words") or []):
+            chars = [c for c in (w.get("text") or "") if c not in PUNCT]
+            if not chars:
+                continue
+            b, e = int(w.get("begin_time") or 0), int(w.get("end_time") or 0)
+            nn = len(chars)
+            ts.extend([[b + (e - b) * i // nn, b + (e - b) * (i + 1) // nn] for i in range(nn)])
+        aligns.append({"tokens": [], "ts": ts})
+        txt = (s.get("text") or "").strip()
+        if t2s is not None:
+            txt = t2s(txt)
+        if itn_fn is not None:
+            txt = itn_fn(txt)
+        units.append({"start_ms": int(s.get("begin_time") or 0), "end_ms": int(s.get("end_time") or 0),
+                      "text": apply_replace(txt, matcher), "spk": None, "spk_name": None})
+    # 字级 ts 与变换后文本去标点字数一致才启用细分(ITN 改长度时自动退回整句一条)
+    good = all(len(a["ts"]) == sum(1 for ch in u["text"] if ch not in PUNCT)
+               for a, u in zip(aligns, units))
+    text = "".join(u["text"] for u in units)
+    print(text)
+    payload = {"language": None, "text": text, "engine": CLOUD_MODELS["message"],
+               "audio": str(Path(os.path.realpath(args.audio))),
+               "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "text": u["text"]} for u in units]}
+    if args.srt:
+        subs = subtitle_units(units, aligns if good else None, args.max_line)
+        payload["sentences"] = subs
+        write_srt(subs, out_srt, use_speaker=False)
+    out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
+        + (f", 字幕: {out_srt}" if args.srt else ""))
+
+def run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, log, t0, audio_path):
+    """filetrans 旁路:整文件提交异步任务(仅公网 URL),轮询取句级时间戳+可选说话人,
+    输出与本地管线同构的 stdout 全文 + json(segments/sentences) + srt"""
+    import requests
+    if not args.cloud_url:
+        sys.exit("--cloud-model filetrans 只接受公网音频 URL(--cloud-url 本地路径无效);"
+                 "本地文件请用 --cloud-model 3.1(自动分段逐段上传)")
+    key = load_dashscope_key()
+    h = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+         "X-DashScope-Async": "enable"}
+    body = {"model": CLOUD_MODELS["filetrans"], "input": {"file_url": args.cloud_url},
+            "parameters": {}}
+    if args.language:
+        body["parameters"]["language_hints"] = [args.language]
+    if args.diarize:
+        body["parameters"]["diarization_enabled"] = True
+    r = requests.post(CLOUD_BASE + "/api/v1/services/audio/asr/transcription",
+                      headers=h, json=body, timeout=60)
+    if r.status_code != 200:
+        sys.exit(f"filetrans 提交失败 HTTP {r.status_code}: {r.text[:300]}")
+    task_id = (r.json().get("output") or {}).get("task_id")
+    if not task_id:
+        sys.exit(f"filetrans 提交未返回 task_id: {r.text[:300]}")
+    log(f"[1] filetrans 任务已提交: {task_id}(轮询中,长音频可能需要数分钟)")
+    qh = {"Authorization": f"Bearer {key}"}
+    jq, last_ping = None, time.time()
+    deadline = time.time() + 7200
+    while time.time() < deadline:
+        time.sleep(3)
+        rq = requests.get(CLOUD_BASE + f"/api/v1/tasks/{task_id}", headers=qh, timeout=30)
+        jq = rq.json()
+        st = (jq.get("output") or {}).get("task_status")
+        if st in ("SUCCEEDED", "FAILED", "CANCELED"):
+            break
+        if time.time() - last_ping > 30:
+            log(f"[1b] 轮询中... 状态 {st or jq.get("code", rq.status_code)}")
+            last_ping = time.time()
+    st = (jq or {}).get("output", {}).get("task_status")
+    if st != "SUCCEEDED":
+        sys.exit(f"filetrans 任务未成功(状态 {st}): {json.dumps(jq or {}, ensure_ascii=False)[:300]}")
+    tr_url = (((jq["output"]).get("results") or [{}])[0]).get("transcription_url")
+    if not tr_url:
+        sys.exit("filetrans 结果缺 transcription_url")
+    tj = requests.get(tr_url, timeout=60).json()
+    tr0 = (tj.get("transcripts") or [{}])[0]
+    sents = tr0.get("sentences") or []
+    text = (tr0.get("text") or "".join(s.get("text", "") for s in sents)).strip()
+    units = []
+    for s in sents:
+        spk = s.get("speaker_id")
+        units.append({"start_ms": int(s.get("begin_time") or 0), "end_ms": int(s.get("end_time") or 0),
+                      "text": (s.get("text") or "").strip(), "spk": spk,
+                      "spk_name": names.get(spk) if isinstance(spk, int) else None})
+    for u in units:
+        u["text"] = apply_replace(u["text"], matcher)
+        if t2s is not None:
+            u["text"] = t2s(u["text"])
+        if itn_fn is not None:
+            u["text"] = itn_fn(u["text"])
+    if matcher or t2s is not None or itn_fn is not None:
+        text = "".join(u["text"] for u in units) or text
+    print(text)
+    payload = {"language": args.language, "text": text, "engine": CLOUD_MODELS["filetrans"],
+               "audio": str(audio_path), "url": args.cloud_url,
+               "segments": [{k: u[k] for k in ("start_ms", "end_ms", "text", "spk")} for u in units]}
+    if args.srt:
+        payload["sentences"] = units
+        write_srt(units, out_srt, use_speaker=args.diarize)
+    out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
+        + (f", 字幕: {out_srt}" if args.srt else ""))
 
 # ---------------- VAD / 对齐 / 字幕 ----------------
 
@@ -752,9 +1019,17 @@ def main():
     ap.add_argument("--diarize-engine", choices=["campp", "pyannote"], default="campp",
                     help="说话人分离引擎: campp=VAD+cam++声纹聚类(默认,轻量); "
                          "pyannote=community-1 分割模型(原生处理重叠语音,会议抢话场景更准; 需已装 pyannote.audio)")
-    ap.add_argument("--engine", choices=["qwen", "aed", "auto"], default="qwen",
+    ap.add_argument("--engine", choices=["qwen", "aed", "auto", "cloud"], default="qwen",
                     help="识别引擎: qwen=Qwen3-ASR-1.7B(默认,多语言含日文); aed=FireRedASR2-AED(中/英/粤更准,不支持日文,输出经 ct-punc 补标点); "
                          "auto=按 --language 路由(中/英/粤走 aed,其余走 qwen;未指定语言时保守走 qwen)")
+    ap.add_argument("--cloud-model", choices=["message", "omni", "filetrans"], default="message",
+                    help="cloud 引擎模型: message=qwen-audio-3.1-asr-message(dashscope SDK,整文件直出"
+                         "句级+字级时间戳,默认;加 --diarize 时逐段并经本地声纹聚类);"
+                         " omni=qwen3.8-omni-flash(OpenAI 兼容全模态转写,无时间戳);"
+                         " filetrans=qwen-audio-3.1-asr-flash-filetrans(异步整文件,仅公网 URL --cloud-url,"
+                         "自带说话人分离(--diarize)与字级时间戳,跳过本地 VAD/模型)")
+    ap.add_argument("--cloud-url", default=None,
+                    help="filetrans 模式的音频公网 URL(仅此模式需要;本地文件用 3.1/3.0 即可)")
     ap.add_argument("--no-punc", action="store_true", help="aed 引擎不补标点(默认用 ct-punc 补)")
     ap.add_argument("--denoise", action="store_true", help="先跑 ZipEnhancer 降噪(含 BGM/强噪时试;白噪声实测无明显收益)")
     ap.add_argument("--threshold", type=float, default=0.75,
@@ -865,6 +1140,7 @@ def main():
         log(f"[0] 纠错词典已合并写回: {save_path}")
 
     use_aed = args.engine == "aed"
+    use_cloud = args.engine == "cloud"
     work_dir = Path(tempfile.mkdtemp(prefix="qwen_asr_")).resolve()
     src0 = ensure_libsndfile_readable(str(audio_path), log)
     if not src0:
@@ -876,10 +1152,13 @@ def main():
     import librosa, soundfile as sf
     preloaded_audio = None
     # AED 只吃 16k wav;为统一,两种引擎都先落到工作目录的 16k wav(顺便完成格式归一)
-    if use_aed:
+    if use_aed or use_cloud:
         src, preloaded_audio = to_wav16k(src, work_dir)
     if use_aed:
         model, processor, load_s = load_aed_model(args.device)
+    elif use_cloud:
+        model, processor = None, None   # 云端推理,不加载本地大模型
+        load_s = time.time() - t0
     else:
         model, processor, load_s = load_model(args.device)
     t2s = build_t2s(args.no_t2s)
@@ -892,13 +1171,19 @@ def main():
             from itn_zh import normalize as itn_fn
         except Exception as e:
             print(f"[warn] ITN 模块加载失败，跳过逆文本正则化: {type(e).__name__}: {e}", file=sys.stderr)
-    log(f"[1] {args.engine.upper()} 引擎已加载到 {args.device} ({load_s:.0f}s)"
+    if use_cloud and args.cloud_model == "message" and not args.diarize:
+        run_cloud_message(args, out_json, out_srt, matcher, t2s, itn_fn, log, t0, src)
+        return
+    if args.engine == "cloud" and args.cloud_model == "filetrans":
+        run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, log, t0, audio_path)
+        return
+    log(f"[1] {('CLOUD:' + args.cloud_model) if use_cloud else args.engine.upper()} 引擎已加载到 {args.device} ({load_s:.0f}s)"
         + ("" if t2s else "（繁->简已关闭）")
         + ("；ITN 已启用" if itn_fn is not None else "")
         + (f"；专名纠错 {len(replace_map)} 条" if replace_map else "")
         + ("；ct-punc 已加载" if punc is not None else ""))
     fa = None
-    if args.srt:
+    if args.srt and not (use_cloud and args.cloud_model == "message"):
         from funasr import AutoModel
         fa = AutoModel(model="fa-zh", device=args.device, disable_update=True)
         log("[1b] fa-zh 强制对齐模型已加载")
@@ -906,6 +1191,11 @@ def main():
     def infer(paths):
         """统一识别入口（按引擎分发,批量）"""
         out = []
+        if use_cloud:
+            cctx = {"key": load_dashscope_key(), "model": args.cloud_model,
+                    "log": log, "hotwords": hotwords}
+            out.extend(cloud_transcribe_batch(paths, cctx, t2s=t2s, matcher=matcher, itn=itn_fn))
+            return out
         if use_aed:
             # 时长感知分批: 段数≤--batch-size 且批内总时长≤AED_BATCH_BUDGET_S;
             # 空结果(疑似 OOM)自动拆小重试
@@ -924,7 +1214,8 @@ def main():
                                         punc=punc, engine=args.engine, itn=itn_fn))
         return out
 
-    _engine_tag = "FireRedASR2-AED" if use_aed else "Qwen3-ASR-1.7B"
+    _engine_tag = ("FireRedASR2-AED" if use_aed else
+                   CLOUD_MODELS[args.cloud_model] if use_cloud else "Qwen3-ASR-1.7B")
 
     if not args.diarize:
         # ---- 整段转写;长音频(>60s)自动 VAD 分段批量(提速+每段语言独立检测),不标说话人 ----
@@ -1114,6 +1405,12 @@ def main():
             log("[4b] 使用 AED 原生字级时间戳")
         elif fa is not None:
             aligns = align_batch(fa, unit_files, [u["text"] for u in units])
+    elif use_cloud and args.cloud_model == "message" and args.srt:
+        if all(p.get("cloud_words") for p in parsed):
+            aligns = [{"tokens": [], "ts": p["cloud_words"]} for p in parsed]
+            log("[4b] 使用云端 message 字级时间戳（跳过 fa-zh）")
+        else:
+            print("[warn] 云端未返回字级时间戳,本次未产出字幕", file=sys.stderr)
     elif fa is not None:
         aligns = align_batch(fa, unit_files, [u["text"] for u in units])
     log(f"[5] 转写完成 (累计 {time.time()-t0:.0f}s),结果:")
@@ -1132,7 +1429,7 @@ def main():
     emotions = analyze_emotion(audio_path, args.device) if args.emotion else None
     if emotions:
         log("[5b] 情绪分析: " + "、".join(f"{e['label']} {e['score']:.2f}" for e in emotions))
-    payload = {"engine": "Qwen3-ASR-1.7B", "audio": str(audio_path),
+    payload = {"engine": _engine_tag, "audio": str(audio_path),
                "speakers": names or None, "lines": lines}
     if emotions:
         payload["emotions"] = emotions

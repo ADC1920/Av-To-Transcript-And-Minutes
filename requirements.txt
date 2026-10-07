@@ -32,6 +32,10 @@ lxml
 # 见 qwen_asr.py 头部注释中的模型与代码获取方式
 # pypinyin rapidfuzz      # 专名纠错拼音模糊匹配（--fuzzy）
 
+# --- 可选：云端 ASR 引擎（--asr-engine cloud，v2.3）---
+# dashscope               # 阿里云百炼 SDK（message 通道需要；omni/filetrans 通道走纯 HTTP 不需要）
+# 另需环境变量 DASHSCOPE_API_KEY（阿里云百炼控制台获取）
+
 # --- 系统依赖（非 pip）---
 # FFmpeg（含 ffmpeg / ffprobe，需在 PATH 中）——拆轨、噪声门、字幕合成
 #   Windows: winget install ffmpeg  或 https://www.gyan.dev/ffmpeg/builds/
