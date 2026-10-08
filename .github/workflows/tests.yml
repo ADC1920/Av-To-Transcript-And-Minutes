@@ -1,0 +1,41 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 轻量离线job：零重依赖（仅 numpy），秒级完成——语法检查 + 全 mock 单测
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装最小依赖
+        run: pip install numpy
+      - name: 语法检查（全部脚本）
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py skills/funasr-transcribe/scripts/*.py
+      - name: ITN 单测（零依赖）
+        run: python skills/funasr-transcribe/scripts/test_itn_zh.py
+      - name: cloud 引擎单测（全 mock，零网络）
+        run: python skills/funasr-transcribe/scripts/test_cloud_units.py
+
+  # 引擎单测job：装 funasr（Linux 上自动带 CPU torch）+ soundfile，跑 51 项纯函数单测
+  engine-units:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装引擎依赖（funasr + 音频 IO）
+        run: pip install numpy soundfile funasr
+      - name: 引擎单元测试（切句/时间戳/碎段合并/字幕细分/词典合并等）
+        run: python skills/funasr-transcribe/scripts/test_qwen_asr_units.py

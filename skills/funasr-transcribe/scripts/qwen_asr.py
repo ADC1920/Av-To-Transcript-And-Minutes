@@ -285,7 +285,7 @@ def load_dashscope_key():
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as reg:
             k, _ = winreg.QueryValueEx(reg, "DASHSCOPE_API_KEY")
         return k
-    except OSError:
+    except (OSError, ImportError):
         sys.exit("cloud 引擎需要 DASHSCOPE_API_KEY(未在环境变量与 HKCU\\Environment 中找到)")
 
 
@@ -490,7 +490,7 @@ def run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, lo
         if st in ("SUCCEEDED", "FAILED", "CANCELED"):
             break
         if time.time() - last_ping > 30:
-            log(f"[1b] 轮询中... 状态 {st or jq.get("code", rq.status_code)}")
+            log(f"[1b] 轮询中... 状态 {st or jq.get('code', rq.status_code)}")
             last_ping = time.time()
     st = (jq or {}).get("output", {}).get("task_status")
     if st != "SUCCEEDED":

@@ -18,12 +18,12 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 
 
 def _find_pipeline() -> pathlib.Path:
-    """自动定位链路主脚本（兼容本机工作名）"""
-    for name in ("av_to_transcript_and_minutes.py", "separate_video_audio.py"):
+    """自动定位链路主脚本（与仓库根脚本同名）"""
+    for name in ("av_to_transcript_and_minutes.py",):
         p = SCRIPT_DIR / name
         if p.is_file():
             return p
-    sys.exit("找不到链路主脚本（av_to_transcript_and_minutes.py / separate_video_audio.py）")
+    sys.exit("找不到链路主脚本（av_to_transcript_and_minutes.py）")
 
 
 PIPELINE = _find_pipeline()

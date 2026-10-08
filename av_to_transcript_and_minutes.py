@@ -30,12 +30,13 @@
   --srt                   额外产出字级时间戳字幕
   --asr-engine aed        换识别引擎（中/英/粤更准）；换引擎会自动用新缓存重转，不复用旧结果
   --replace "错=>对"       确定性专名纠错（同音异字可配 --asr-extra "--fuzzy"），比热词偏置可靠
-  --replace-file [词典.txt]  纠错词典（每行 "错=>对"）；裸写=用输出目录 replace_dict.txt
-  --replace-save [词典.txt]  把本次纠错条目合并写回词典（裸写=输出目录 replace_dict.txt），下次 --replace-file 裸写即自动带上
+  --replace-file [词典.txt]  纠错词典（每行 "错=>对"）；未指定=自动加载根目录 replace_dict.txt；裸写=根目录 replace_dict.txt
+  --replace-save [词典.txt]  把本次纠错条目合并写回词典（裸写=根目录 replace_dict.txt），下次 --replace-file 裸写即自动带上
   --denoise               转写前 ZipEnhancer 降噪（仅真实含 BGM/强噪素材）
   --vad firered           改 VAD 后端（默认 fsmn）
   --asr-extra "--min-seg 300"  其余 qwen_asr 参数原样透传
   --clean                 完成后删除中间件（三份 wav 与转写缓存 json），只留成稿
+  --flat                  平铺输出：成稿直接放素材同目录，删工作子目录与 md 底稿
   --log                   本次运行输出落 <输出目录>/run.log
   --verbose               实时透传子进程输出，排查卡顿与失败原因用
 
@@ -204,6 +205,33 @@ def clean_intermediates(stem_dir: Path) -> list:
     return removed
 
 
+def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
+    """平铺模式（--flat）收尾：成稿 docx（及 srt）移到素材同目录，删除整个工作子目录
+    （含中间件 wav/缓存 json、md 提炼底稿、.demucs_model 标记与拆轨产物）。
+    默认 separated_out 工作目录清空后一并移除；-o 指定的目录不删。"""
+    moved = []
+    for ext in (".docx", ".srt"):
+        src_file = stem_dir / f"{out_stem}{ext}"
+        if src_file.exists():
+            target = media.parent / f"{out_stem}{ext}"
+            try:
+                if target.exists():
+                    target.unlink()
+                shutil.move(str(src_file), str(target))
+                moved.append(target.name)
+            except OSError:
+                pass
+    shutil.rmtree(stem_dir, ignore_errors=True)
+    parent = stem_dir.parent
+    try:
+        if parent.name == "separated_out" and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        pass
+    if moved:
+        print(f"[平铺] {media.stem}：成稿已移入素材目录 → {', '.join(moved)}")
+
+
 def wav_rms_db(path: Path):
     """读 wav 算整体 RMS（dBFS）；读不到或空文件返回 None"""
     try:
@@ -312,12 +340,14 @@ def probe_audio_codec(video: Path) -> str:
 
 
 def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=None,
-                   srt=False, engine=None, extra=None, tag=None, single=False) -> str:
+                   srt=False, engine=None, extra=None, tag=None, single=False,
+                   dict_hash=None) -> str:
     """转写缓存文件名：任一影响结果的配置不同 → 缓存不同。
     识别引擎（qwen/aed）输出的文本不同，是缓存键的必需维度——漏掉它会让人以为换了引擎、
     实际拿到的是旧引擎结果；热词、人名、字幕、额外 ASR 参数同理不可与默认结果混用。
     tag 用于同一目录内存在多份待转写音频的场景（声道分轨），缺了它两路会命中同一份缓存、
-    转出完全相同的文本（实测踩过）。"""
+    转出完全相同的文本（实测踩过）。
+    dict_hash = 纠错词典内容哈希：词典更新后旧缓存不再复用（否则新词条对已缓存素材不生效）。"""
     parts = []
     if tag:
         parts.append(str(tag))
@@ -333,6 +363,8 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
         parts.append("热词" + hashlib.sha256(hotwords.encode("utf-8")).hexdigest()[:6])
     if names:
         parts.append("人名" + hashlib.sha256(names.encode("utf-8")).hexdigest()[:6])
+    if dict_hash:
+        parts.append("词典" + dict_hash)
     if srt:
         parts.append("字幕")
     if extra:
@@ -350,7 +382,7 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
         opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra, tag,
-        single=bool(opts.get("no_diarize")))
+        single=bool(opts.get("no_diarize")), dict_hash=opts.get("dict_hash"))
     if cache_json.exists() and not force:
         return json.loads(cache_json.read_text(encoding="utf-8"))
     raw_json = vocals.parent / (vocals.stem + ".json")  # qwen_asr 固定输出名：<音频名>.json
@@ -540,6 +572,9 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
     # md 为完成标记；但只有 md 而缺 docx（首跑时未装 article-format）不算完成，
     # 交给下游走"仅补排版"分支，避免补装技能后只能 --force 全量重跑
     article = md_exists and (docx_exists or article_skill() is None)
+    # 平铺模式：成稿已摊到素材同目录（md 已删）时同样视为完成，保证幂等
+    if opts.get("flat") and (media.parent / f"{out_stem}.docx").exists():
+        article = True
     if do_asr:
         all_done = article
     else:
@@ -550,6 +585,8 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
             removed = clean_intermediates(stem_dir)
             if removed:
                 print(f"[清理] {media.stem}：移除中间件 {len(removed)} 个（--clean）")
+        if opts.get("flat"):
+            flatten_outputs(stem_dir, media, out_stem)
         return "skip"
     stem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -599,8 +636,11 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
         shutil.rmtree(tmp, ignore_errors=True)
         print(f"[分离] {media.name}：Demucs({demucs_model}) 人声/背景音分离（GPU，耗时随时长增长）")
         # demucs 的进度条有实际参考价值，始终实时透传（不捕获）
+        # HF_HUB_OFFLINE=1：demucs 默认先试 HuggingFace 元数据（不可达时重试约 30 秒才失败回落
+        # 官方源）；离线模式使其立即失败并直接走 dl.fbaipublicfiles.com 兜底，省等待
         run_child(["demucs", "-n", demucs_model, "--two-stems=vocals",
-                   "-o", str(tmp), str(media)], verbose=True, env=child_env())
+                   "-o", str(tmp), str(media)], verbose=True,
+                  env=child_env(HF_HUB_OFFLINE="1"))
         # demucs 固定输出 vocals.wav / no_vocals.wav，移入输出目录时改成自说明中文名
         rename = {"vocals.wav": "人声.wav", "no_vocals.wav": "背景音.wav"}
         # demucs 把模型名写进输出子目录，单模型与 bag 都取实际目录名，避免硬编码
@@ -622,6 +662,8 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
             removed = clean_intermediates(stem_dir)
             if removed:
                 print(f"[清理] {media.stem}：移除中间件 {len(removed)} 个（--clean）")
+        if opts.get("flat") and result in ("done", "redocx"):
+            flatten_outputs(stem_dir, media, out_stem)
         return result
     return "done"
 
@@ -658,7 +700,8 @@ def main():
                          "配合 --force 生效，不同配置存独立缓存")
     ap.add_argument("--hotwords", default=None,
                     help="热词/上下文（逗号分隔），偏置识别引擎提升专名准确率，如 "
-                         "'胚布,白配检测,库龄机制'；变更热词后自动用新缓存重转")
+                         "'胚布,白配检测,库龄机制'；未指定时自动加载根目录 hotwords.txt（每行一个词）；"
+                         "变更热词后自动用新缓存重转")
     ap.add_argument("--names", default=None,
                     help="说话人改名（如 '0=赵总,1=张会计'）——会议原文的说话人标签将显示真实姓名")
     ap.add_argument("--srt", action="store_true",
@@ -700,12 +743,16 @@ def main():
     ap.add_argument("--clean", action="store_true",
                     help="完成后删除中间件（人声/背景音/转写用 wav 与转写缓存 json），"
                          "只留成稿 md/docx/srt；拆轨产物保留")
+    ap.add_argument("--flat", action="store_true",
+                    help="平铺输出：成稿直接放到素材同目录，并删除工作子目录"
+                         "（含中间件、md 底稿、.demucs_model 标记与拆轨产物）")
     ap.add_argument("--log", action="store_true",
                     help="把本次运行输出追加写入 <输出目录>/run.log，便于批量跑完回溯")
     ap.add_argument("--replace-file", nargs="?", const="auto", default=None,
-                    help="纠错词典文件（每行 '错=>对'）；裸写或 auto=输出目录 replace_dict.txt")
+                    help="纠错词典文件（每行 '错=>对'）；未指定时自动加载根目录 replace_dict.txt（存在即加载）；"
+                         "裸写或 auto=根目录 replace_dict.txt")
     ap.add_argument("--replace-save", nargs="?", const="auto", default=None,
-                    help="把本次纠错条目合并写回词典（裸写或 auto=输出目录 replace_dict.txt，键同新值覆盖）")
+                    help="把本次纠错条目合并写回词典（裸写或 auto=根目录 replace_dict.txt，键同新值覆盖）")
     args = ap.parse_args()
     if args.meeting and args.no_diarize:
         sys.exit("--meeting 需要说话人分离产出说话人标签，不能与 --no-diarize 同用")
@@ -727,10 +774,33 @@ def main():
     # auto：会议模式走 pyannote（重叠语音更准），其余走 campp（轻量）
     diarize_engine = ("pyannote" if args.meeting else None) \
         if args.diarize_engine == "auto" else args.diarize_engine
-    # auto 持久化文件统一放输出目录（跨素材共享同一份库/词典），解析成显式路径再透传
+    # auto 持久化文件：声纹库仍放输出目录（跨素材共享）；纠错词典与热词表改放管线根目录固定位置
+    # ——平铺模式（--flat）会删除整个工作子目录，词典放输出目录会被一并删掉、积累失效。
     speaker_db_arg = str(out_dir / "speaker_db.json") if args.speaker_db == "auto" else args.speaker_db
-    replace_file_arg = str(out_dir / "replace_dict.txt") if args.replace_file == "auto" else args.replace_file
-    replace_save_arg = str(out_dir / "replace_dict.txt") if args.replace_save == "auto" else args.replace_save
+    default_dict = SCRIPT_DIR / "replace_dict.txt"
+    if args.replace_file is None:
+        # 未显式指定时：固定词典存在则自动加载（无需每次带参数）
+        replace_file_arg = str(default_dict) if default_dict.is_file() else None
+    elif args.replace_file == "auto":
+        replace_file_arg = str(default_dict)
+    else:
+        replace_file_arg = args.replace_file
+    replace_save_arg = str(default_dict) if args.replace_save == "auto" else args.replace_save
+    # 热词表：未显式给出时读固定位置 hotwords.txt（每行一个词，# 注释）
+    if args.hotwords is None:
+        hot_file = SCRIPT_DIR / "hotwords.txt"
+        if hot_file.is_file():
+            words = [ln.strip() for ln in hot_file.read_text(encoding="utf-8").splitlines()
+                     if ln.strip() and not ln.startswith("#")]
+            if words:
+                args.hotwords = ",".join(words)
+    # 纠错词典内容哈希进缓存指纹：词典更新后旧缓存不复用，保证修正结果一致
+    dict_hash = None
+    if replace_file_arg:
+        try:
+            dict_hash = hashlib.sha256(Path(replace_file_arg).read_bytes()).hexdigest()[:8]
+        except OSError:
+            dict_hash = None
     # 额外 ASR 参数：显式项 + --asr-extra 合并，统一进命令行与缓存键
     extra = []
     for flag, val in (("--replace", args.replace), ("--replace-file", replace_file_arg),
@@ -757,6 +827,7 @@ def main():
             "hotwords": args.hotwords, "names": args.names, "srt": args.srt,
             "engine": args.asr_engine if args.asr_engine != "qwen" else None,
             "extra": extra, "verbose": args.verbose, "clean": args.clean,
+            "flat": args.flat, "dict_hash": dict_hash,
             "demucs_model": args.demucs_model, "split_channels": args.split_channels,
             "no_diarize": args.no_diarize}
 
