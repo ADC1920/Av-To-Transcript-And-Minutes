@@ -80,6 +80,9 @@ def child_env(**overrides) -> dict:
     与父进程解码编码两端必须同时锁定，缺一端就丢日志。"""
     env = os.environ | {"PYTHONIOENCODING": "utf-8",
                         "HF_HUB_DISABLE_SYMLINKS_WARNING": "1"}
+    # demucs/qwen_asr 子进程抗显存碎片(前瞻);Windows 暂不支持 expandable_segments
+    # (2026-10-11 实测告警后回落,无副作用),保留待 PyTorch 支持后自动生效
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     env.update(overrides)
     return env
 
@@ -174,9 +177,10 @@ def gpu_memory_mb():
         return None
 
 
-def warn_low_vram(need_mb: int = 4096) -> None:
+def warn_low_vram(need_mb: int = 4600) -> None:
     """跑前显存预检（只提示不阻断）。实测参考：本链路峰值增量约 4.4 GB，
-    Demucs 与转写串行，各占一段峰值；卡上若已有常驻服务容易挤到上限。"""
+    阈值取 4600 MB 覆盖峰值（4.0~4.4 GB 区间不再漏报）；Demucs 与转写串行，
+    各占一段峰值；卡上若已有常驻服务容易挤到上限。"""
     mem = gpu_memory_mb()
     if mem is None:
         return

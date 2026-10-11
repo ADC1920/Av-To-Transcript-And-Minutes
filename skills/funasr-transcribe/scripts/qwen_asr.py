@@ -50,9 +50,15 @@
 #   python qwen_asr.py 录音.m4a --engine cloud --cloud-model omni   # 云端 qwen3.8-omni-flash（全模态转写,纯文本）
 #   python qwen_asr.py --engine cloud --cloud-model filetrans --cloud-url <公网音频URL> --diarize
 #                                                        # 云端异步转写（仅公网 URL;自带说话人分离+字级时间戳）
-import argparse, json, os, sys, tempfile, time
+import argparse, atexit, json, os, shutil, sys, tempfile, time
 from pathlib import Path
 import numpy as np
+
+# 显存碎片优化(前瞻):expandable_segments 可减少长音频批量推理下 PyTorch 缓存分配器的
+# 碎片虚高;2026-10-11 实测 Windows 暂不支持(告警 "not supported on this platform" 后
+# 回落默认分配器,无副作用,每进程一条告警),保留此设置待 PyTorch 支持后自动生效。
+# 须在 torch 初始化前设置,用户已显式设置时不覆盖
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 REPO_ID = "Qwen/Qwen3-ASR-1.7B-hf"
 MS_CACHE = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / "Qwen--Qwen3-ASR-1.7B-hf" / "snapshots" / "master"
@@ -130,6 +136,13 @@ def load_punc(device):
     except Exception as e:
         print(f"[warn] ct-punc 加载失败,跳过补标点: {type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
         return None
+
+
+def gc_cuda():
+    """显存缓存回收:小模型阶段(VAD/声纹/对齐/补标点)结束后调用,削与主引擎转写峰值的叠加;无 CUDA 时 no-op"""
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def load_speaker_db(path) -> dict:
@@ -935,7 +948,7 @@ def to_wav16k(audio_path, tmp_dir):
     return str(p), y
 
 
-def maybe_denoise(audio_path, enabled, log):
+def maybe_denoise(audio_path, enabled, log, tmp_dir=None):
     """ZipEnhancer 前处理(可选);返回新路径字符串。注意:实测对白噪声未见收益,含 BGM/真实嘈杂再试"""
     if not enabled:
         return str(audio_path)
@@ -943,16 +956,18 @@ def maybe_denoise(audio_path, enabled, log):
     from modelscope.utils.constant import Tasks
     t0 = time.time()
     ans = pipeline(Tasks.acoustic_noise_suppression, model="iic/speech_zipenhancer_ans_multiloss_16k_base")
-    out = Path(tempfile.mkdtemp(prefix="qwen_asr_denoise_")).resolve() / "enhanced.wav"
+    base = Path(tmp_dir) if tmp_dir else Path(tempfile.mkdtemp(prefix="qwen_asr_denoise_")).resolve()
+    out = base / "enhanced.wav"
     ans(str(audio_path), output_path=str(out))
     log(f"[denoise] ZipEnhancer 前处理完成 ({time.time()-t0:.0f}s) -> {out}")
     return str(out)
 
 
-def ensure_libsndfile_readable(src: str, log=print) -> str:
+def ensure_libsndfile_readable(src: str, log=print, tmp_dir=None) -> str:
     """libsndfile（soundfile/librosa 的底层）不解 m4a/AAC 等容器，直喂报 Format not
     recognised（2026-09-23 实测）。可读则原样返回；读不了用 ffmpeg 解码为 16k mono
-    wav 临时文件并返回其路径（ffmpeg 缺失或解码失败返回空串，由调用方终止）。"""
+    wav 临时文件并返回其路径（ffmpeg 缺失或解码失败返回空串，由调用方终止）。
+    tmp_dir 给定时产物落其中（随 work_dir 的 atexit 一起清理），否则落系统 TEMP。"""
     import soundfile as sf
     try:
         sf.info(src)
@@ -961,7 +976,8 @@ def ensure_libsndfile_readable(src: str, log=print) -> str:
         pass
     import subprocess
     p = Path(src)
-    dst = Path(tempfile.gettempdir()) / f"qwen_asr_{p.stem[:60]}_{os.getpid()}_16k.wav"
+    base = Path(tmp_dir) if tmp_dir else Path(tempfile.gettempdir())
+    dst = base / f"qwen_asr_{p.stem[:60]}_{os.getpid()}_16k.wav"
     log(f"[0] {p.suffix or '(无后缀)'} 容器 libsndfile 读不了，先用 ffmpeg 转 16k mono wav")
     r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", src, "-ac", "1",
                         "-ar", "16000", str(dst)], capture_output=True)
@@ -1142,11 +1158,14 @@ def main():
     use_aed = args.engine == "aed"
     use_cloud = args.engine == "cloud"
     work_dir = Path(tempfile.mkdtemp(prefix="qwen_asr_")).resolve()
-    src0 = ensure_libsndfile_readable(str(audio_path), log)
+    # 临时目录随进程清理（覆盖正常结束/sys.exit/异常/中断等全部退出路径）；
+    # 2026-10-11 检查发现此前从不清理，TEMP 实测累积 46 个残留
+    atexit.register(lambda d=work_dir: shutil.rmtree(d, ignore_errors=True))
+    src0 = ensure_libsndfile_readable(str(audio_path), log, tmp_dir=work_dir)
     if not src0:
         sys.exit("输入音频无法读取（ffmpeg 解码失败，见上方日志）")
     if args.denoise:
-        src = maybe_denoise(src0, True, log)
+        src = maybe_denoise(src0, True, log, tmp_dir=work_dir)
     else:
         src = src0
     import librosa, soundfile as sf
@@ -1231,6 +1250,7 @@ def main():
                      for i, (s, e) in enumerate(segments)]
             seg_files = write_unit_wavs(audio, units, work_dir)
             parsed = infer(seg_files)
+            punc = None; gc_cuda()   # ct-punc 已用完,置 None 放开闭包 cell 引用(小模型不驻留到转写峰值后)
             for u, p in zip(units, parsed):
                 u["text"] = p["transcription"]
                 u["language"] = p.get("language")
@@ -1242,6 +1262,7 @@ def main():
                 aligns = align_batch(fa, seg_files, texts)
                 if use_aed:
                     log("[2b] AED 时间戳不可用,已改用 fa-zh 对齐")
+            fa = None; gc_cuda()   # 对齐已完成
             print("\n".join(texts))
             langs = [p.get("language") for p in parsed if p.get("language")]
             main_lang = max(set(langs), key=langs.count) if langs else None
@@ -1257,6 +1278,7 @@ def main():
                 + (f", 字幕: {out_srt}" if aligns is not None else ""))
             return
         res = infer([src])[0]
+        punc = None; gc_cuda()   # 转写已完成,同上释放
         lang = res.get("language") or ("aed" if use_aed else "auto")
         print(f"[{lang}] {res['transcription']}")
         u = {"start_ms": 0, "end_ms": int(duration_s * 1000), "text": res["transcription"],
@@ -1270,6 +1292,7 @@ def main():
             aligns = align_batch(fa, [src], [res["transcription"]])
         else:
             aligns = None
+        fa = None; gc_cuda()   # 对齐已完成
         if aligns:
             payload["sentences"] = subtitle_units([u], aligns, args.max_line)
             write_srt(payload["sentences"], out_srt, use_speaker=False)
@@ -1322,6 +1345,7 @@ def main():
             emb = to_numpy(spk.generate(input=seg, fs=16000)[0]["spk_embedding"]).flatten()
             embeddings.append(emb / np.linalg.norm(emb))
         embeddings = np.array(embeddings)
+        del spk; gc_cuda()   # 声纹提取完毕,campp 不驻留到主引擎批量转写阶段
 
         sim = embeddings @ embeddings.T
         dist = 1 - sim
@@ -1362,9 +1386,11 @@ def main():
         log(f"[4] 输出 {len(units)} 个发言块")
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="qwen_asr_seg_")).resolve()
+    atexit.register(lambda d=tmp_dir: shutil.rmtree(d, ignore_errors=True))   # 分段 wav 随进程清理
     unit_files = write_unit_wavs(audio, units, tmp_dir)
 
     parsed = infer(unit_files)
+    punc = None; gc_cuda()   # 转写已完成,置 None 放开闭包 cell 引用
     if len(parsed) != len(units):  # 防御：任何引擎返回短列表都不能让 zip 静默截断
         print(f"[warn] 识别结果 {len(parsed)} 条 / 输入 {len(units)} 条，缺失段按空文本补齐",
               file=sys.stderr)
@@ -1413,6 +1439,7 @@ def main():
             print("[warn] 云端未返回字级时间戳,本次未产出字幕", file=sys.stderr)
     elif fa is not None:
         aligns = align_batch(fa, unit_files, [u["text"] for u in units])
+    fa = None; gc_cuda()   # 对齐已完成
     log(f"[5] 转写完成 (累计 {time.time()-t0:.0f}s),结果:")
 
     lines = []
