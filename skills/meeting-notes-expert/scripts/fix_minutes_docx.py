@@ -3,10 +3,10 @@
 
 用法：
     python fix_minutes_docx.py <in.docx> <out.docx>
-    python fix_minutes_docx.py <in.docx> <out.docx> --widths 1.15,4.5,2,2.1,1.45,2,2.72
+    python fix_minutes_docx.py <in.docx> <out.docx> --widths 1.15,5.5,2.1,2.2,1.5,3.47
 
 纸型（A4）与 `**加粗**` 已由 article-format v1.5.1 在上游处理，本脚本只修表格：
-  1. 固定列宽——默认 7 列纪要表用实测通过的一组比例；其他列数按内容长度
+  1. 固定列宽——纪要表（6 列默认／7 列旧版）用实测通过的一组比例；其他列数按内容长度
      比例分配（下限 1.0cm），也可用 --widths 显式指定（须与列数一致）
   2. 单元格段落首行缩进清零——首行缩进挂在 Normal 样式上，仅删直接格式无效，
      须在单元格段落写 w:ind firstLineChars/firstLine=0 显式覆盖，否则窄列
@@ -22,9 +22,14 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm
 
-# 7 列纪要表的实测列宽（cm，合计 15.92 = A4 宽 21 - 两道 2.54 边距）
-MINUTES_7COL_CM = [1.15, 4.5, 2.0, 2.1, 1.45, 2.0, 2.72]
-# 非 7 列表格：内容比例分配的列宽下限
+# 纪要表实测列宽（cm，合计 15.92 = A4 宽 21 - 两道 2.54 边距）
+# 6 列 = 序号/待办事项/责任人/完成时间/优先级/备注（v1.6.0 起默认）
+# 7 列 = 旧版含「验收标准」列的表格，兼容保留
+MINUTES_COL_CM = {
+    6: [1.15, 5.5, 2.1, 2.2, 1.5, 3.47],
+    7: [1.15, 4.5, 2.0, 2.1, 1.45, 2.0, 2.72],
+}
+# 其他列数表格：内容比例分配的列宽下限
 MIN_COL_CM = 1.0
 
 
@@ -152,14 +157,14 @@ def main(argv):
                 raise SystemExit(
                     f"--widths 给了 {len(explicit)} 列，表 {idx} 为 {ncols} 列，不一致")
             widths = explicit
-        elif ncols == 7:
-            # 7 列纪要表用实测列宽；页面不是 A4+2.54cm 时按可用宽度等比缩放，防溢出
-            base = sum(MINUTES_7COL_CM)
-            if abs(base - total) > 0.05:
-                k = total / base
-                widths = [round(w * k, 2) for w in MINUTES_7COL_CM]
+        elif ncols in MINUTES_COL_CM:
+            # 纪要表用实测列宽；页面不是 A4+2.54cm 时按可用宽度等比缩放，防溢出
+            base = MINUTES_COL_CM[ncols]
+            if abs(sum(base) - total) > 0.05:
+                k = total / sum(base)
+                widths = [round(w * k, 2) for w in base]
             else:
-                widths = MINUTES_7COL_CM
+                widths = base
         else:
             widths = _proportional_widths(table, total)
         rows = fix_table(table, widths)
