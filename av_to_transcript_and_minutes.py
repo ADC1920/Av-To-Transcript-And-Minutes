@@ -376,19 +376,53 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
     return "转写结果" + ("_" + "_".join(parts) if parts else "") + ".json"
 
 
+def audio_fingerprint(path: Path) -> str:
+    """源音频内容指纹：文件大小 + 首尾各 1MB 的 sha256 前 16 位。
+
+    只取首尾是性能取舍：一小时 44.1kHz 立体声 wav 约 600MB，整文件哈希要 1~2 秒；
+    首尾块足以识别「同一目录下人声.wav 被重新分离或替换」，而缓存误复用的代价
+    （拿旧文本当新素材结果）远高于这点碰撞概率。
+    """
+    try:
+        size = path.stat().st_size
+        h = hashlib.sha256(str(size).encode())
+        with path.open("rb") as f:
+            h.update(f.read(1024 * 1024))
+            if size > 2 * 1024 * 1024:
+                f.seek(-1024 * 1024, os.SEEK_END)
+                h.update(f.read(1024 * 1024))
+        return h.hexdigest()[:16]
+    except OSError:
+        return ""
+
+
 def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     """调 qwen_asr.py 转写（默认 --diarize：说话人分离；opts.no_diarize=True 跳过），返回结构化 JSON。
     opts 键：threshold / diarize_engine / hotwords / names / srt / engine（识别引擎）/ no_diarize
              extra（额外 ASR 参数列表，命令行追加）/ verbose（子进程输出实时透传）
     缓存已存在且非 --force 时直接复用（转写是最贵环节，支持断点续跑）；
-    白名单键走任务配置 JSON，其余额外参数以命令行形式追加。"""
+    白名单键走任务配置 JSON，其余额外参数以命令行形式追加。
+
+    命中缓存时校验 _source_fp：同一目录的人声.wav 被重新分离或手工替换后，缓存键
+    （只含配置维度）不会变，不校验就会把旧文本当新素材结果。旧缓存没有该字段时
+    视为兼容并补写当前指纹，不强制重转（避免升级即全量重跑）。"""
     extra = list(opts.get("extra") or [])
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
         opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra, tag,
         single=bool(opts.get("no_diarize")), dict_hash=opts.get("dict_hash"))
+    source_fp = audio_fingerprint(vocals)
     if cache_json.exists() and not force:
-        return json.loads(cache_json.read_text(encoding="utf-8"))
+        payload = json.loads(cache_json.read_text(encoding="utf-8"))
+        cached_fp = payload.get("_source_fp")
+        if not cached_fp:
+            payload["_source_fp"] = source_fp
+            cache_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            return payload
+        if cached_fp == source_fp:
+            return payload
+        print(f"[缓存] {vocals.name} 源音频已变化（指纹 {cached_fp}→{source_fp}），重转",
+              file=sys.stderr)
     raw_json = vocals.parent / (vocals.stem + ".json")  # qwen_asr 固定输出名：<音频名>.json
     raw_srt = vocals.with_suffix(".srt")
     cfg_path = vocals.parent / "_asr_job.json"
@@ -404,7 +438,11 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     run_child(cmd, verbose=bool(opts.get("verbose")), env=child_env())
     cfg_path.unlink(missing_ok=True)
     raw_json.replace(cache_json)
-    return json.loads(cache_json.read_text(encoding="utf-8"))
+    # 补写源指纹：下次命中时据此判断素材是否被换过
+    payload = json.loads(cache_json.read_text(encoding="utf-8"))
+    payload["_source_fp"] = source_fp
+    cache_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return payload
 
 
 def transcript_md(payload: dict, stem: str) -> str:

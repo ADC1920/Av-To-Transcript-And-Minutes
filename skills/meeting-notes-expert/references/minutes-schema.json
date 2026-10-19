@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "minutes-schema.json",
+  "title": "会议纪要结构（meeting-notes-expert）",
+  "description": "validate_minutes.py 从纪要 md/docx 解析出的结构必须满足本 schema；字段为空表示该节缺失。",
+  "type": "object",
+  "required": ["basic_info", "sections"],
+  "properties": {
+    "basic_info": {
+      "type": "object",
+      "description": "会议基本信息，键为字段名（会议主题/会议时间/…），值为内容",
+      "additionalProperties": {"type": "string", "minLength": 1}
+    },
+    "sections": {
+      "type": "object",
+      "required": ["会议结论", "关键决策", "待办事项", "会议内容"],
+      "additionalProperties": {"type": "string"},
+      "properties": {
+        "会议结论": {"type": "string", "minLength": 1},
+        "关键决策": {"type": "string", "minLength": 1},
+        "待办事项": {"type": "string", "minLength": 1},
+        "待定与开放问题": {"type": "string"},
+        "上期行动项回顾": {"type": "string"},
+        "会议内容": {"type": "string", "minLength": 1}
+      }
+    },
+    "action_items": {
+      "type": "array",
+      "description": "待办表数据行（不含表头）",
+      "items": {
+        "type": "object",
+        "required": ["id", "task", "owner", "due", "priority", "note"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "task": {"type": "string", "minLength": 1},
+          "owner": {"type": "string", "minLength": 1},
+          "due": {"type": "string", "minLength": 1},
+          "priority": {"enum": ["高", "中", "低", "待定"]},
+          "note": {"type": "string"}
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "description": "关键决策条目（每行一条，去掉列表符号）",
+      "items": {"type": "string", "minLength": 1}
+    }
+  }
+}
