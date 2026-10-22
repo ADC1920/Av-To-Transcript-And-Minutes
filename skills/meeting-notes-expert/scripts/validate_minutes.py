@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""validate_minutes.py — 会议纪要结构校验与源文核对（meeting-notes-expert 配套）
+"""validate_minutes.py — 结构化总结结构校验与源文核对（meeting-notes-expert 配套）
 
+按会议版章节名校验，仅适用会议场景的会议纪要；讲座、访谈、播客等通用总结不强制。
 做四件事：
   1) 结构：必需节齐备（会议结论/关键决策/待办事项/会议内容），按 minutes-schema.json 校验；
   2) 版式：待办表六列、优先级枚举合法、基本信息区不得是表格；
@@ -33,6 +34,7 @@ PRIORITIES = {"高", "中", "低", "待定"}
 BASIC_FIELDS_OK = {"会议主题", "会议时间", "会议地点", "参会人员", "记录人",
                    "主持人", "会议方式", "会议编号", "会议形式"}
 HEADING_RE = re.compile(r"^##(?!#)\s+(.+)$")
+HEADING_STYLE_RE = re.compile(r"^(?:Heading|标题)\s*(\d+)$")
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.、)])\s+")
 NUM_RE = re.compile(r"\d+(?:[.,]\d+)*\s*[%％]?")
 OWNER_PLACEHOLDERS = {"待定", "未指定", "全体", "大家", "—", "-"}
@@ -67,7 +69,17 @@ def parse_docx(path):
     blocks = []
     for child in doc.element.body.iterchildren():
         if child.tag == qn("w:p"):
-            blocks.append(("p", Paragraph(child, doc).text))
+            para = Paragraph(child, doc)
+            text = para.text
+            # article-format 出稿后标题是样式不是字面 `##`，这里按样式还原成
+            # Markdown 标题，让 split_sections 的同一套规则同时吃 md 与 docx。
+            style = (para.style.name or "").strip() if para.style is not None else ""
+            m = HEADING_STYLE_RE.match(style)
+            if m:
+                text = "#" * (int(m.group(1)) + 1) + " " + text
+            elif style == "Title":
+                text = "# " + text
+            blocks.append(("p", text))
         elif child.tag == qn("w:tbl"):
             rows = [[c.text.strip() for c in r.cells] for r in Table(child, doc).rows]
             blocks.append(("t", rows))
@@ -261,6 +273,25 @@ def validate(path, source_text=None, strict=False):
     return (1 if fails else 0), results
 
 
+def summarize(results):
+    """三态判定：complete 全过 / degraded 无 FAIL 但有 WARN / failed 有 FAIL。
+
+    借 silverstein/minutes 的 status 枚举思路——把「结构可用但存在非致命问题」
+    从二元的 PASS/FAIL 里分出来，避免有 WARN 的稿子被当成完全健康或彻底报废。
+    """
+    fails = [r for r in results if r[0] == "FAIL"]
+    warns = [r for r in results if r[0] == "WARN"]
+    if fails:
+        status = "failed"
+    elif warns:
+        status = "degraded"
+    else:
+        status = "complete"
+    warnings = [{"step": name, "reason": detail or "未给原因", "message": detail}
+                for _, name, detail in warns]
+    return status, warnings
+
+
 SELFTEST_OK = """# 会议纪要：测试会议
 
 ## 会议基本信息
@@ -340,12 +371,19 @@ def selftest():
         warn_hit = any(r[0] == "WARN" and r[1] == "数字溯源" for r in res3)
         print(f"[{'PASS' if warn_hit else 'FAIL'}] 编造数字应告警")
         ok &= warn_hit
+        # 三态判定：干净稿=complete，有 WARN=degraded，有 FAIL=failed
+        st_clean, _ = summarize(validate(good)[1])
+        st_warn, wl = summarize(res3)
+        st_fail, _ = summarize(validate(badp)[1])
+        tri_ok = st_clean == "complete" and st_warn == "degraded" and st_fail == "failed" and len(wl) > 0
+        print(f"[{'PASS' if tri_ok else 'FAIL'}] 三态判定（{st_clean}/{st_warn}/{st_fail}，告警 {len(wl)} 条）")
+        ok &= tri_ok
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="会议纪要结构校验与源文核对")
+    ap = argparse.ArgumentParser(description="结构化总结结构校验与源文核对（会议版章节名）")
     ap.add_argument("file", nargs="?", help="纪要 md/docx")
     ap.add_argument("--source", default=None, help="源材料文本（转写稿/笔记）")
     ap.add_argument("--strict", action="store_true", help="WARN 也判失败")
@@ -366,11 +404,17 @@ def main(argv=None):
         print(f"[{level}] {name}" + (f"  {detail}" if detail else ""))
     fails = sum(1 for r in results if r[0] == "FAIL")
     warns = sum(1 for r in results if r[0] == "WARN")
+    status, warnings = summarize(results)
     print(f"\n结论：{'PASS' if rc == 0 else 'FAIL'}（FAIL {fails}，WARN {warns}）")
+    print(f"状态：{status}")
+    for w in warnings:
+        print(f"  告警步骤：{w['step']} — {w['reason']}")
     if ns.json_path:
         Path(ns.json_path).write_text(json.dumps(
             {"file": str(path), "verdict": "PASS" if rc == 0 else "FAIL",
-             "results": [{"level": a, "name": b, "detail": c} for a, b, c in results]},
+             "status": status,
+             "results": [{"level": a, "name": b, "detail": c} for a, b, c in results],
+             "processing_warnings": warnings},
             ensure_ascii=False, indent=2), encoding="utf-8")
     return rc
 
