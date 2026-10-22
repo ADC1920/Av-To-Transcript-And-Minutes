@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""音视频 → 转写文稿 / 会议纪要 全自动批量工具（拆轨 + Demucs 人声分离 + 说话人分离转写 + 规范 docx 排版）
+"""音视频 → 转写文稿 / 结构化总结 全自动批量工具（拆轨 + Demucs 人声分离 + 说话人分离转写 + 规范 docx 排版）
 
 流程（视频与音频通用；转写恒走说话人分离）：
   视频 → 无声视频 + 完整音轨（均无损 copy）；音频输入跳过本环（源即完整音频）
   音频/完整音轨 → 人声.wav + 背景音.wav（Demucs 分离）
   人声 → 文字（qwen_asr 恒走 --diarize：VAD 切段 + 声纹聚类说话人）
   文字 → 转写文稿（默认，每4句一段）或 会议原文（--meeting，按时间戳完整转写）
-         → article-format 规范 docx；会议纪要由会话内 AI 从会议原文提炼
+         → article-format 规范 docx；结构化总结由会话内 AI 从会议原文提炼
 
 每个输入产出（同一子目录）：
   无声视频.<原扩展名>           视频流无损提取（仅视频输入）
@@ -16,7 +16,7 @@
   人声_转写用.wav               清除静音伪影后供转写的人声（可复现的中间件）
   转写结果.json                 转写结构化结果（说话人分段 / 文本 / 时间戳）
   转写文稿-<名>.md / .docx      转写文稿（默认模式）
-  会议原文-<名>.md / .docx      会议原文（--meeting；正式纪要由 AI 从原文提炼为「会议纪要-<名>」）
+  会议原文-<名>.md / .docx      完整原文（--meeting；总结由 AI 从原文提炼，会议场景为「会议纪要-<名>」）
 
 用法：
   python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--force] [--no-asr] [--meeting]
@@ -717,7 +717,7 @@ def main():
     # 在 UTF-8 控制台下会显示成乱码
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    ap = argparse.ArgumentParser(description="音视频全自动批量（拆轨 + 人声分离 + 说话人分离转写 → 转写文稿 / 会议纪要）")
+    ap = argparse.ArgumentParser(description="音视频全自动批量（拆轨 + 人声分离 + 说话人分离转写 → 转写文稿 / 结构化总结）")
     ap.add_argument("input", help="视频/音频文件或包含它们的文件夹")
     ap.add_argument("-o", "--output", help="输出目录（默认 <输入>/separated_out）")
     ap.add_argument("--force", action="store_true", help="已处理过的也重跑")

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "minutes-schema.json",
-  "title": "会议纪要结构（meeting-notes-expert）",
-  "description": "validate_minutes.py 从纪要 md/docx 解析出的结构必须满足本 schema；字段为空表示该节缺失。",
+  "title": "结构化总结结构（meeting-notes-expert，会议版章节名）",
+  "description": "validate_minutes.py 从总结 md/docx 解析出的结构必须满足本 schema；字段为空表示该节缺失。仅适用会议版章节名，通用总结不强制。",
   "type": "object",
   "required": ["basic_info", "sections"],
   "properties": {
@@ -44,6 +44,30 @@
       "type": "array",
       "description": "关键决策条目（每行一条，去掉列表符号）",
       "items": {"type": "string", "minLength": 1}
+    },
+    "status": {
+      "$ref": "#/$defs/OutputStatus",
+      "description": "校验三态：complete 全过；degraded 无 FAIL 但有 WARN；failed 有 FAIL"
+    },
+    "processing_warnings": {
+      "type": "array",
+      "description": "非致命问题清单，逐条可定位到具体校验步骤",
+      "items": {"$ref": "#/$defs/ProcessingWarning"}
+    }
+  },
+  "$defs": {
+    "OutputStatus": {
+      "type": "string",
+      "enum": ["complete", "degraded", "failed"]
+    },
+    "ProcessingWarning": {
+      "type": "object",
+      "required": ["step", "reason"],
+      "properties": {
+        "step": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "message": {"type": ["string", "null"]}
+      }
     }
   }
 }
