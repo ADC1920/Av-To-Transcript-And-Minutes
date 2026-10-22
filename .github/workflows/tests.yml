@@ -21,11 +21,31 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py skills/funasr-transcribe/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
       - name: ITN 单测（零依赖）
         run: python skills/funasr-transcribe/scripts/test_itn_zh.py
       - name: cloud 引擎单测（全 mock，零网络）
         run: python skills/funasr-transcribe/scripts/test_cloud_units.py
+
+  # 纪要技能job：装 python-docx + jsonschema，跑结构校验自检与 golden 用例回归。
+  # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，
+  # 其 docx 校验缺陷（只认字面 ##）因此长期未被发现。
+  skill-minutes:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装技能依赖（docx 读写 + schema 校验）
+        run: pip install python-docx jsonschema
+      - name: 结构校验自检（正例/负例/溯源/三态/docx 往返）
+        run: python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
+      - name: golden 用例回归
+        run: python skills/meeting-notes-expert/scripts/golden_cases.py
 
   # 引擎单测job：装 funasr（Linux 上自动带 CPU torch）+ soundfile，跑 51 项纯函数单测
   engine-units:
