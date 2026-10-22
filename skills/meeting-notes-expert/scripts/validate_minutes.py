@@ -378,6 +378,55 @@ def selftest():
         tri_ok = st_clean == "complete" and st_warn == "degraded" and st_fail == "failed" and len(wl) > 0
         print(f"[{'PASS' if tri_ok else 'FAIL'}] 三态判定（{st_clean}/{st_warn}/{st_fail}，告警 {len(wl)} 条）")
         ok &= tri_ok
+        # docx 往返：article-format 出稿后标题是段落样式、正文无 `##`，
+        # 这条断言防 parse_docx 退回「只认字面 ##」的旧缺陷。
+        try:
+            from docx import Document
+        except ImportError:
+            print("[SKIP] docx 往返（未安装 python-docx）")
+        else:
+            dx = Path(td) / "good.docx"
+            doc = Document()
+
+            def flush(rows):
+                if not rows:
+                    return
+                t = doc.add_table(rows=len(rows), cols=len(rows[0]))
+                for i, r in enumerate(rows):
+                    for j, c in enumerate(r[:len(rows[0])]):
+                        t.cell(i, j).text = c
+
+            doc.add_paragraph("会议纪要：测试会议", style="Title")
+            pending = []
+            for line in SELFTEST_OK.splitlines():
+                s = line.strip()
+                if s.startswith("# "):
+                    continue
+                is_table = s.startswith("|")
+                if not is_table:
+                    flush(pending)
+                    pending = []
+                if is_table:
+                    cells = [c.strip() for c in s.strip("|").split("|")]
+                    if not all(set(c) <= set("-: ") for c in cells):
+                        pending.append(cells)
+                    continue
+                if s.startswith("### "):
+                    doc.add_paragraph(s[4:], style="Heading 2")
+                elif s.startswith("## "):
+                    doc.add_paragraph(s[3:].strip(), style="Heading 1")
+                elif s:
+                    doc.add_paragraph(s)
+            flush(pending)
+            doc.save(str(dx))
+            rc4, res4 = validate(dx)
+            docx_ok = rc4 == 0
+            print(f"[{'PASS' if docx_ok else 'FAIL'}] docx 往返按样式识别标题（exit={rc4}）")
+            if not docx_ok:
+                for level, name, detail in res4:
+                    if level != "PASS":
+                        print(f"  {level} {name} {detail}")
+            ok &= docx_ok
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
