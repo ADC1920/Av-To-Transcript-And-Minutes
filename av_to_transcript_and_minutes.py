@@ -212,7 +212,11 @@ def clean_intermediates(stem_dir: Path) -> list:
 def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
     """平铺模式（--flat）收尾：成稿 docx（及 srt）移到素材同目录，删除整个工作子目录
     （含中间件 wav/缓存 json、md 提炼底稿、.demucs_model 标记与拆轨产物）。
-    默认 separated_out 工作目录清空后一并移除；-o 指定的目录不删。"""
+    默认 separated_out 工作目录清空后一并移除；-o 指定的目录不删。
+
+    没有搬出任何成稿时**不删目录**：docx 排版可能因 article-format 缺失而跳过，
+    此时 md 是本次唯一成果，直接 rmtree 会把它一并删掉（实测：未装排版技能 + --flat
+    → 只剩中间件也没了，稿子凭空消失）。"""
     moved = []
     for ext in (".docx", ".srt"):
         src_file = stem_dir / f"{out_stem}{ext}"
@@ -225,6 +229,10 @@ def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
                 moved.append(target.name)
             except OSError:
                 pass
+    if not moved:
+        print(f"[提示] {media.stem}：未产出 docx/srt，跳过平铺清理以免删掉 md 成稿"
+              f"（工作目录保留：{stem_dir}）", file=sys.stderr)
+        return
     shutil.rmtree(stem_dir, ignore_errors=True)
     parent = stem_dir.parent
     try:
@@ -405,7 +413,10 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
 
     命中缓存时校验 _source_fp：同一目录的人声.wav 被重新分离或手工替换后，缓存键
     （只含配置维度）不会变，不校验就会把旧文本当新素材结果。旧缓存没有该字段时
-    视为兼容并补写当前指纹，不强制重转（避免升级即全量重跑）。"""
+    视为兼容并补写当前指纹，不强制重转（避免升级即全量重跑）。
+
+    缓存读失败（写缓存时被杀、磁盘满留下半截 json）按未命中处理并重转，不让一份
+    坏缓存把这份素材永久卡死；写缓存一律先写 .tmp 再 os.replace，避免留下半截文件。"""
     extra = list(opts.get("extra") or [])
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
@@ -413,16 +424,19 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
         single=bool(opts.get("no_diarize")), dict_hash=opts.get("dict_hash"))
     source_fp = audio_fingerprint(vocals)
     if cache_json.exists() and not force:
-        payload = json.loads(cache_json.read_text(encoding="utf-8"))
-        cached_fp = payload.get("_source_fp")
-        if not cached_fp:
-            payload["_source_fp"] = source_fp
-            cache_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            return payload
-        if cached_fp == source_fp:
-            return payload
-        print(f"[缓存] {vocals.name} 源音频已变化（指纹 {cached_fp}→{source_fp}），重转",
-              file=sys.stderr)
+        payload = _read_json(cache_json)
+        if payload is not None:
+            cached_fp = payload.get("_source_fp")
+            if not cached_fp:
+                payload["_source_fp"] = source_fp
+                _write_json(cache_json, payload)
+                return payload
+            if cached_fp == source_fp:
+                return payload
+            print(f"[缓存] {vocals.name} 源音频已变化（指纹 {cached_fp}→{source_fp}），重转",
+                  file=sys.stderr)
+        else:
+            print(f"[缓存] {cache_json.name} 无法解析，按未命中重转", file=sys.stderr)
     raw_json = vocals.parent / (vocals.stem + ".json")  # qwen_asr 固定输出名：<音频名>.json
     raw_srt = vocals.with_suffix(".srt")
     cfg_path = vocals.parent / "_asr_job.json"
@@ -437,12 +451,27 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     cmd += ["--job-config", str(cfg_path)] + extra
     run_child(cmd, verbose=bool(opts.get("verbose")), env=child_env())
     cfg_path.unlink(missing_ok=True)
-    raw_json.replace(cache_json)
     # 补写源指纹：下次命中时据此判断素材是否被换过
-    payload = json.loads(cache_json.read_text(encoding="utf-8"))
+    payload = _read_json(raw_json) or {"lines": []}
     payload["_source_fp"] = source_fp
-    cache_json.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    _write_json(cache_json, payload)
+    raw_json.unlink(missing_ok=True)
     return payload
+
+
+def _read_json(path: Path):
+    """读 JSON；解析失败或读不到返回 None（损坏缓存按未命中处理）"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path: Path, payload) -> None:
+    """原子写 JSON：先写同目录 .tmp 再 os.replace，避免中途被杀留下半截文件"""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def transcript_md(payload: dict, stem: str) -> str:
@@ -556,6 +585,15 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     return "done"
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    """path 是否位于 root 之下（含 root 本身）；解析失败时按字面比较"""
+    try:
+        p = path.resolve()
+    except OSError:
+        p = path
+    return p == root or root in p.parents
+
+
 def probe_channels(media: Path) -> int:
     """取音频流声道数；读不到返回 0"""
     out = run_output(["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -583,6 +621,10 @@ def split_channels_payload(stem_dir: Path, force: bool, opts: dict):
                    "-filter_complex", "channelsplit=channel_layout=stereo[l][r]",
                    "-map", "[l]", str(ch_paths[0]),
                    "-map", "[r]", str(ch_paths[1])], env=child_env())
+    # 声道号就是说话人号：人名必须按声道号取，不能让子进程内 campp 聚类的
+    # spk_name 透传过来——单声道分轨里说话人恒为 0，两路都会拿到 names[0]，
+    # 结果「李四」的发言被标成「张三」（实测）
+    name_map = _parse_names(opts.get("names"))
     lines = []
     for idx, p in enumerate(ch_paths):
         if (wav_rms_db(p) or -999) < -60:      # 整条声道接近静音，跳过
@@ -591,9 +633,24 @@ def split_channels_payload(stem_dir: Path, force: bool, opts: dict):
         for ln in (payload.get("lines") or []):
             item = dict(ln)
             item["spk"] = idx                  # 声道号即说话人号
+            item["spk_name"] = name_map.get(idx)
             lines.append(item)
     lines.sort(key=lambda x: x.get("start_ms", 0))
     return {"lines": lines}
+
+
+def _parse_names(names) -> dict:
+    """把 '0=张三,1=李四' 解析成 {0: '张三', 1: '李四'}；非法项忽略"""
+    out = {}
+    for part in str(names or "").split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        try:
+            out[int(k.strip())] = v.strip()
+        except ValueError:
+            continue
+    return out
 
 
 def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
@@ -660,8 +717,12 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
         vocals_out = stem_dir / "人声.wav"
         if force or not vocals_out.exists():
             why = "分轨模式跳过分离" if opts.get("split_channels") else "跳过人声分离"
-            print(f"[转码] {media.name}：{why}，直接转 44.1kHz 立体声 wav")
-            run_child(["ffmpeg", "-y", "-i", str(media), "-ac", "2", "-ar", "44100",
+            print(f"[转码] {media.name}：{why}，直接转 44.1kHz wav")
+            # 分轨模式不能写 -ac 2：单声道源会被复制成两路相同内容，下游 probe 到
+            # 2 声道就照转两遍，文本整体重复还凭空造出第二个说话人（实测）。
+            # 保留原声道数，让 split_channels_payload 的声道判定看到真实布局。
+            ch_args = [] if opts.get("split_channels") else ["-ac", "2"]
+            run_child(["ffmpeg", "-y", "-i", str(media)] + ch_args + ["-ar", "44100",
                        str(vocals_out)], env=child_env())
     elif force or not separated or not same_model:
         # 分离前对原始素材粗估信噪比（分位法；校准：纯人声 25.9 dB、人声+0.15 粉噪 14.6 dB），
@@ -809,7 +870,16 @@ def main():
             sys.exit(f"不支持的文件类型：{src.suffix}")
         medias = [src]
     else:
-        medias = sorted(p for p in src.rglob("*") if p.suffix.lower() in MEDIA_EXTS)
+        # 排除输出目录：默认输出就落在输入目录下的 separated_out，其拆轨产物
+        # （完整音轨.m4a / 无声视频.mp4）与分离中间件同样是 MEDIA_EXTS，不排除的话
+        # 第二次运行会把它们当新素材再跑一遍 Demucs，既白烧算力又互相覆盖同名 stem
+        try:
+            out_abs = out_dir.resolve()
+        except OSError:
+            out_abs = out_dir
+        medias = sorted(
+            p for p in src.rglob("*")
+            if p.suffix.lower() in MEDIA_EXTS and not _is_under(p, out_abs))
     if not medias:
         sys.exit("没找到视频/音频文件")
 

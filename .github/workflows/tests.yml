@@ -26,6 +26,8 @@ jobs:
         run: python skills/funasr-transcribe/scripts/test_itn_zh.py
       - name: cloud 引擎单测（全 mock，零网络）
         run: python skills/funasr-transcribe/scripts/test_cloud_units.py
+      - name: 缓存源指纹单测（零依赖）
+        run: python skills/funasr-transcribe/scripts/test_cache_fingerprint.py
 
   # 纪要技能job：装 python-docx + jsonschema，跑结构校验自检与 golden 用例回归。
   # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，

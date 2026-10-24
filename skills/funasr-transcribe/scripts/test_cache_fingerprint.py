@@ -14,8 +14,19 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
-MAIN = ROOT / "av_to_transcript_and_minutes.py"
+HERE = Path(__file__).resolve().parent
+
+
+def _find_main() -> Path:
+    """主脚本位置随部署形态不同：仓库里在上溯 3 层的根目录，技能副本里与本文件同目录"""
+    for cand in (HERE.parents[2] / "av_to_transcript_and_minutes.py",   # 仓库布局
+                 HERE / "av_to_transcript_and_minutes.py"):             # 技能副本布局
+        if cand.is_file():
+            return cand
+    return HERE.parents[2] / "av_to_transcript_and_minutes.py"
+
+
+MAIN = _find_main()
 
 fails = []
 
@@ -75,6 +86,69 @@ def main() -> int:
                                     ensure_ascii=False), encoding="utf-8")
         check("指纹不符可被识别",
               json.loads(cache.read_text(encoding="utf-8")).get("_source_fp") != fp2)
+
+    # ---- 平铺清理不得毁掉唯一成果 ----
+    # 曾实测：未装 article-format 时 render_docx 返回 False，调用方仍走 flatten_outputs，
+    # 该函数只搬 docx/srt 后无条件 rmtree，把本次唯一的 md 成稿连目录一起删掉。
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        stem_dir = work / "separated_out" / "录音"
+        stem_dir.mkdir(parents=True)
+        md = stem_dir / "转写文稿-录音.md"
+        md.write_text("# 转写文稿\n\n内容\n", encoding="utf-8")
+        media = work / "录音.mp3"
+        media.write_bytes(b"x")
+        mod.flatten_outputs(stem_dir, media, "转写文稿-录音")
+        check("无 docx/srt 时保留 md", md.is_file(), "md 被删")
+        check("无 docx/srt 时保留工作目录", stem_dir.is_dir(), "目录被 rmtree")
+
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        stem_dir = work / "separated_out" / "录音"
+        stem_dir.mkdir(parents=True)
+        (stem_dir / "转写文稿-录音.md").write_text("# x\n", encoding="utf-8")
+        (stem_dir / "转写文稿-录音.docx").write_bytes(b"PK")
+        media = work / "录音.mp3"
+        media.write_bytes(b"x")
+        mod.flatten_outputs(stem_dir, media, "转写文稿-录音")
+        check("有成稿时 docx 搬到素材目录",
+              (work / "转写文稿-录音.docx").is_file(), "docx 未搬出")
+        check("有成稿时工作目录被清理", not stem_dir.exists(), "工作目录残留")
+
+    # ---- 目录扫描必须排除输出目录 ----
+    # 默认输出落在 <输入>/separated_out，其拆轨产物同为 MEDIA_EXTS；不排除的话
+    # 第二次运行会把它们当新素材再跑一遍 Demucs。
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "separated_out" / "录音").mkdir(parents=True)
+        nested = root / "separated_out" / "录音" / "完整音轨.m4a"
+        nested.write_bytes(b"x")
+        src_media = root / "录音.mp3"
+        src_media.write_bytes(b"x")
+        out_root = (root / "separated_out").resolve()
+        check("输出目录内文件判为输出", mod._is_under(nested, out_root))
+        check("源素材不判为输出", not mod._is_under(src_media, out_root))
+
+    # ---- 缓存读写健壮性 ----
+    # 写缓存中途被杀会留半截 json；旧实现 json.loads 直接抛，这份素材此后只能 --force。
+    with tempfile.TemporaryDirectory() as td:
+        work = Path(td)
+        good = work / "转写结果.json"
+        mod._write_json(good, {"lines": [{"text": "新"}]})
+        check("原子写可读回", mod._read_json(good) == {"lines": [{"text": "新"}]})
+        check("原子写不留 .tmp", not (work / "转写结果.json.tmp").exists(), "临时文件残留")
+
+        broken = work / "坏缓存.json"
+        broken.write_text('{"lines": [', encoding="utf-8")
+        check("损坏缓存读作未命中", mod._read_json(broken) is None, "应返回 None")
+        check("缺失文件读作未命中", mod._read_json(work / "不存在.json") is None)
+
+    # ---- 声道分轨的人名映射 ----
+    # 分轨模式下子进程内说话人恒为 0，两路都会拿到 names[0]；人名必须按声道号取。
+    check("names 解析", mod._parse_names("0=张三,1=李四") == {0: "张三", 1: "李四"})
+    check("names 容忍空格", mod._parse_names("1 = 李四") == {1: "李四"})
+    check("names 空值", mod._parse_names("") == {})
+    check("names 跳过非法项", mod._parse_names("坏项,2=王五") == {2: "王五"})
 
     print("SELFTEST", "PASS" if not fails else f"FAIL（{len(fails)} 项）")
     return 0 if not fails else 1

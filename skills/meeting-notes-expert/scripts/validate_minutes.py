@@ -168,7 +168,9 @@ def validate(path, source_text=None, strict=False):
             blocks = parse_docx(path)
         except Exception as e:
             print(f"读取失败：{e}")
-            return 2, []
+            # 回一条 FAIL 而不是空列表：空列表会让 summarize 判成 complete，
+            # 于是读取失败被打印成「状态：complete」（实测）。退出码仍是 2。
+            return 2, [("FAIL", "读取文件", f"无法解析 md/docx：{type(e).__name__}")]
 
     basic, sections, basic_table = split_sections(blocks)
     if basic_table:
@@ -185,16 +187,21 @@ def validate(path, source_text=None, strict=False):
     else:
         ok("必需节齐备", "结论/决策/待办/内容 均在")
 
+    # 禁用标注必须扫全篇：只扫四个必填节正文时，把「会议时间：待确认」写进基本信息区、
+    # 或另起一个 ## 附录 放不确定表述，都能绕过（实测）
     body = "\n".join(section_text(v) for v in sections.values())
-    hits = [w for w in FORBIDDEN if w in body]
+    full_text = body + "\n" + "\n".join(f"{k}：{v}" for k, v in basic.items())
+    hits = [w for w in FORBIDDEN if w in full_text]
     if hits:
-        bad("禁用标注", "正文出现：" + "、".join(hits))
+        bad("禁用标注", "全文出现：" + "、".join(hits))
     else:
         ok("禁用标注", "无待确认/存疑类标注")
 
     decisions = collect_decisions(sections.get("关键决策", []))
     if not decisions:
         bad("关键决策", "节内无条目（未形成决策时应写「本次会议未形成决策」）")
+    elif re.search(r"(未形成|没有形成|无)(任何)?(关键)?决策", "".join(decisions)):
+        ok("关键决策", "声明未形成决策")
     else:
         bad_lines = [d for d in decisions if re.match(r"^(讨论|研究|考虑)了", d)]
         if bad_lines:
@@ -248,9 +255,16 @@ def validate(path, source_text=None, strict=False):
     # ---- 溯源核对（可选）----
     if source_text:
         src = source_text
-        src_nums = {re.sub(r"[,\s]", "", x).rstrip("%％") for x in NUM_RE.findall(src)}
+        # 源文里的 [00:12] 时间戳要先剥掉：不剥的话「12」会进源数字集合，
+        # 纪要里编造的「12 台」正好命中、查不出来（实测）
+        src_clean = re.sub(r"\[\d{1,3}:\d{2}(?:-\d{1,3}:\d{2})?\]", " ", src)
+        src_nums = {re.sub(r"[,\s]", "", x).rstrip("%％") for x in NUM_RE.findall(src_clean)}
         out_nums = {re.sub(r"[,\s]", "", x).rstrip("%％") for x in NUM_RE.findall(body)}
-        invented = sorted(n for n in out_nums if n not in src_nums and len(n) >= 2)
+        # 一位数不再整体豁免：源文数字很少时它恰恰是编造的重灾区。改为要求该数字
+        # 在源文里以独立 token 出现，避免「1」被「12」包含而误判为已出现。
+        src_tokens = set(NUM_RE.findall(src_clean))
+        invented = sorted(n for n in out_nums
+                          if n not in src_nums and n not in src_tokens)
         if invented:
             warn("数字溯源", "源材料未出现：" + "、".join(invented[:8]))
         else:
@@ -278,7 +292,13 @@ def summarize(results):
 
     借 silverstein/minutes 的 status 枚举思路——把「结构可用但存在非致命问题」
     从二元的 PASS/FAIL 里分出来，避免有 WARN 的稿子被当成完全健康或彻底报废。
+    results 为空表示根本没读到内容，返回 error 而不是 complete——否则读取失败
+    （rc=2）会打印「状态：complete」，把「没校验」说成「校验通过」（实测）。
     """
+    if not results:
+        return "error", []
+    if len(results) == 1 and results[0][1] == "读取文件":
+        return "error", []          # 解析失败，任何一项校验都没跑过
     fails = [r for r in results if r[0] == "FAIL"]
     warns = [r for r in results if r[0] == "WARN"]
     if fails:
@@ -427,6 +447,32 @@ def selftest():
                     if level != "PASS":
                         print(f"  {level} {name} {detail}")
             ok &= docx_ok
+
+        # 禁用标注必须扫到基本信息区：只在四个必填节正文里查时，
+        # 「会议时间：待确认」写进基本信息区能整篇通过（实测）
+        basic_forbidden = SELFTEST_OK.replace("会议时间：2026-10-19", "会议时间：待确认")
+        bf = Path(td) / "basic-forbidden.md"
+        bf.write_text(basic_forbidden, encoding="utf-8")
+        rc5, res5 = validate(bf)
+        caught5 = any(r[0] == "FAIL" and r[1] == "禁用标注" for r in res5)
+        print(f"[{'PASS' if caught5 else 'FAIL'}] 基本信息区的禁用标注应被抓（exit={rc5}）")
+        ok &= caught5
+
+        # 源文时间戳不得参与数字比对：源文里的 [00:12] 会让编造的「12 台」看起来有出处
+        ts_src = "[00:12] 张三：今天讨论一下。\n[01:30] 李四：好的。"
+        rc6, res6 = validate(good, source_text=ts_src)
+        caught6 = any(r[0] == "WARN" and r[1] == "数字溯源" for r in res6)
+        print(f"[{'PASS' if caught6 else 'FAIL'}] 时间戳不得为编造数字背书")
+        ok &= caught6
+
+        # 读取失败必须是 error 态，不能打印 complete
+        junk = Path(td) / "junk.md"
+        junk.write_bytes(b"\xff\xfe\x00\x00not-utf8")
+        rc7, res7 = validate(junk)
+        st7, _ = summarize(res7)
+        err_ok = rc7 == 2 and st7 == "error"
+        print(f"[{'PASS' if err_ok else 'FAIL'}] 读取失败应为 error 态（exit={rc7}，status={st7}）")
+        ok &= err_ok
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
