@@ -49,21 +49,56 @@ _YEAR_CHARS = "[零〇一二三四五六七八九]"
 
 
 def _cn_to_int_conventional(text):
-    """常规读法：三百二十 → 320；十五 → 15；一万二千 → 12000"""
-    total, section, num = 0, 0, 0
+    """常规读法：三百二十 → 320；十五 → 15；一万二千 → 12000
+
+    两条口语规则：
+    ① 省略尾数补位——末尾是裸数字且前面出现过单位时，该数字乘上一级单位
+       （一万二 → 12000、三千五 → 3500、一百二 → 120）。含「零」的读数不做补位，
+       否则「一万零二」会被算成 12000 而不是 10002。
+    ② 连续两个以上非零数字字视为约数短语（三五百、七八成），返回 None 保持原样。
+    """
+    run = max_run = 0
+    for ch in text:
+        if _CN_DIGIT.get(ch):
+            run += 1
+            max_run = max(max_run, run)
+        else:
+            run = 0
+    if max_run >= 2:
+        return None
+    total, section, num, last_unit = 0, 0, 0, 0
     for ch in text:
         if ch in _CN_DIGIT:
             num = _CN_DIGIT[ch]
         elif ch in _CN_UNIT:
-            section += (num if num else 1) * _CN_UNIT[ch]
+            last_unit = _CN_UNIT[ch]
+            section += (num if num else 1) * last_unit
             num = 0
         elif ch in _CN_BIG:
+            last_unit = _CN_BIG[ch]
             section = (section + num) * _CN_BIG[ch]
             total += section
             section, num = 0, 0
         else:
             return None
+    if num and last_unit >= 10 and "零" not in text and "〇" not in text:
+        return total + section + num * (last_unit // 10)
     return total + section + num
+
+
+def _cn_digit_str(text):
+    """逐位读法 → 数字字符串，保留前导零：「零五」→ "05"，「五」→ "5"。
+
+    小数部分必须按字符串拼，不能走 cn_to_int——后者把「零五」算成整数 5，
+    于是「百分之十五点零五」被写成 15.5%（实测），与 15.05% 差一个数量级。
+    """
+    out = []
+    for ch in text:
+        d = _CN_DIGIT.get(ch)
+        if d is None:
+            return None
+        out.append(str(d))
+    return "".join(out) if out else None
 
 
 def cn_to_int(text, allow_digitwise=False):
@@ -99,10 +134,10 @@ def _sub_pct(match):
         return match.group(0)
     frac = match.group("frac")
     if frac:
-        frac_val = cn_to_int(frac, allow_digitwise=True)
-        if frac_val is None:
+        frac_str = _cn_digit_str(frac)
+        if frac_str is None:
             return match.group(0)
-        return f"{val}.{frac_val}{'%' if base == 100 else '‰'}"
+        return f"{val}.{frac_str}{'%' if base == 100 else '‰'}"
     return f"{val}{'%' if base == 100 else '‰'}"
 
 
