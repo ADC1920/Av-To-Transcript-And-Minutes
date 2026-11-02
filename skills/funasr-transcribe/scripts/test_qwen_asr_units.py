@@ -177,6 +177,39 @@ try:
 finally:
     shutil.rmtree(tmpd2, ignore_errors=True)
 
+print("[14] 字幕格式 SRT / VTT")
+from qwen_asr import write_srt, write_vtt, fmt_vtt_ts, fmt_srt_ts
+_SUBS = [
+    {"start_ms": 0, "end_ms": 6646, "text": "第一句。", "spk": "0", "spk_name": "张三"},
+    {"start_ms": 7000, "end_ms": 3725000, "text": "第二句。", "spk": "1", "spk_name": "李四"},
+]
+_tmpd3 = _P(tempfile.mkdtemp(prefix="asr_sub_test_"))
+try:
+    _srt = _tmpd3 / "a.srt"
+    _vtt = _tmpd3 / "a.vtt"
+    write_srt(_SUBS, _srt, use_speaker=True)
+    write_vtt(_SUBS, _vtt, use_speaker=True)
+    st = _srt.read_text(encoding="utf-8")
+    vt = _vtt.read_text(encoding="utf-8")
+
+    check("SRT 毫秒用逗号", "00:00:06,646" in st, st.splitlines()[:3])
+    check("SRT 序号从 1 起", st.startswith("1\n"), st[:10])
+    check("SRT 带说话人标签", "[张三] 第一句。" in st)
+    check("SRT 空行分隔 cue", "\n\n2\n" in st)
+
+    check("VTT 首行是 WEBVTT", vt.startswith("WEBVTT\n"), repr(vt[:20]))
+    check("VTT 毫秒用点号", "00:00:06.646" in vt, vt.splitlines()[:4])
+    check("VTT 不含逗号毫秒", "00:00:06,646" not in vt)
+    check("VTT 带说话人标签", "[李四] 第二句。" in vt)
+    # 超过 1 小时的时间戳不能错位（整数除法是最容易写错的地方）
+    check("跨小时时间戳", "01:02:05.000" in vt, vt.splitlines()[:8])
+
+    check("fmt_srt_ts 千分位", fmt_srt_ts(3725000) == "01:02:05,000", fmt_srt_ts(3725000))
+    check("fmt_vtt_ts 点号", fmt_vtt_ts(3725000) == "01:02:05.000", fmt_vtt_ts(3725000))
+    check("负值钳零", fmt_srt_ts(-5) == "00:00:00,000", fmt_srt_ts(-5))
+finally:
+    shutil.rmtree(_tmpd3, ignore_errors=True)
+
 print()
 if fails:
     print(f"FAILED: {len(fails)} 项 -> {fails}")

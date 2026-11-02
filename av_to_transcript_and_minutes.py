@@ -72,7 +72,7 @@ SENTS_PER_PARA = 4  # 转写文稿分段：每几句拼一段
 # 管线自身保留的 qwen_asr 参数，禁止经 --asr-extra 二次传入（否则重复传参会破坏调用契约）
 RESERVED_ASR_ARGS = {"--job-config", "--diarize", "--audio"}
 # 经任务配置 JSON 透传给 qwen_asr 的键（其余参数一律走命令行 extra，避免"未知项"报错）
-ASR_JOB_KEYS = ("threshold", "diarize_engine", "hotwords", "names", "srt", "engine")
+ASR_JOB_KEYS = ("threshold", "diarize_engine", "hotwords", "names", "srt", "vtt", "engine")
 
 _asr_script_cache = None
 
@@ -222,7 +222,7 @@ def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
     此时 md 是本次唯一成果，直接 rmtree 会把它一并删掉（实测：未装排版技能 + --flat
     → 只剩中间件也没了，稿子凭空消失）。"""
     moved = []
-    for ext in (".docx", ".srt"):
+    for ext in (".docx", ".srt", ".vtt"):
         src_file = stem_dir / f"{out_stem}{ext}"
         if src_file.exists():
             target = media.parent / f"{out_stem}{ext}"
@@ -234,7 +234,7 @@ def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
             except OSError:
                 pass
     if not moved:
-        print(f"[提示] {media.stem}：未产出 docx/srt，跳过平铺清理以免删掉 md 成稿"
+        print(f"[提示] {media.stem}：未产出 docx/srt/vtt，跳过平铺清理以免删掉 md 成稿"
               f"（工作目录保留：{stem_dir}）", file=sys.stderr)
         return
     shutil.rmtree(stem_dir, ignore_errors=True)
@@ -411,6 +411,47 @@ def audio_fingerprint(path: Path) -> str:
         return ""
 
 
+def write_cached_subtitles(subs, opts: dict, out_dir: Path, stem: str) -> list:
+    """用缓存里已有的 sentences 直接写字幕文件，不重跑对齐。
+
+    场景：先前只出 srt，这次加 --vtt。缓存 sentences 是完整对齐结果，
+    格式转换纯属文本重排，没必要再跑一遍对齐模型（那是几秒到几十秒的 GPU 时间）。
+
+    格式与 qwen_asr 的 write_srt/write_vtt 保持一致：SRT 毫秒用逗号、VTT 用点号，
+    VTT 首行 WEBVTT。此处独立实现而非 import，是因为主脚本不应为写字幕去
+    加载 qwen_asr（它 import 时会拉起 funasr 等重依赖）。
+    """
+    def fmt(ms, sep):
+        ms = max(0, int(ms))
+        h, r = divmod(ms, 3600000)
+        m, r = divmod(r, 60000)
+        s, ms3 = divmod(r, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms3:03d}"
+
+    cues = []
+    for s in subs or []:
+        label = ""
+        if s.get("spk_name") or s.get("spk") is not None:
+            label = f"[{s.get('spk_name') or ('说话人' + str(s['spk']))}] "
+        cues.append((f"{label}{s.get('text', '')}", s.get("start_ms", 0), s.get("end_ms", 0)))
+
+    written = []
+    if opts.get("srt"):
+        p = out_dir / f"{stem}.srt"
+        blocks = [f"{i}\n{fmt(a, ',')} --> {fmt(b, ',')}\n{t}\n"
+                  for i, (t, a, b) in enumerate(cues, 1)]
+        p.write_text("\n".join(blocks), encoding="utf-8")
+        written.append(p.name)
+    if opts.get("vtt"):
+        p = out_dir / f"{stem}.vtt"
+        lines = ["WEBVTT", ""]
+        for i, (t, a, b) in enumerate(cues, 1):
+            lines += [str(i), f"{fmt(a, '.')} --> {fmt(b, '.')}", t, ""]
+        p.write_text("\n".join(lines), encoding="utf-8")
+        written.append(p.name)
+    return written
+
+
 def _align_srt_only(vocals: Path, cache_json: Path, opts: dict):
     """缓存已有转写、但没有字幕时，只补一遍对齐（--align-only），不重跑识别。
 
@@ -418,9 +459,13 @@ def _align_srt_only(vocals: Path, cache_json: Path, opts: dict):
     才能让 srt 安全地移出缓存键：不然"先前跑过没字幕、现在要字幕"就得整套重转。
     补出的 sentences 写回缓存，下次直接命中，不会每次重算。
     """
-    raw_srt = vocals.with_suffix(".srt")
     cmd = [sys.executable, str(asr_script()), str(vocals),
            "--align-only", str(cache_json)]
+    # 补对齐同样要按用户选的字幕格式产出：qwen_asr 的 --align-only 分支按 --srt/--vtt 落盘
+    if opts.get("srt"):
+        cmd.append("--srt")
+    if opts.get("vtt"):
+        cmd.append("--vtt")
     align_engine = opts.get("align_engine")
     if align_engine:
         cmd += ["--align-engine", align_engine]
@@ -437,10 +482,12 @@ def _align_srt_only(vocals: Path, cache_json: Path, opts: dict):
               file=sys.stderr)
         return _read_json(cache_json)
     payload = _read_json(cache_json)
-    if payload and raw_srt.exists():
-        keep = vocals.parent / (vocals.stem + ".srt")
-        if raw_srt != keep:
-            shutil.move(str(raw_srt), str(keep))
+    for ext in (".srt", ".vtt"):
+        raw = vocals.with_suffix(ext)
+        if payload and raw.exists():
+            keep = vocals.parent / (vocals.stem + ext)
+            if raw != keep:
+                shutil.move(str(raw), str(keep))
     return payload
 
 
@@ -478,13 +525,29 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     source_fp = audio_fingerprint(vocals)
 
     def _need_srt(payload):
-        """本素材要字幕、而缓存里没有 sentences 时，补一次对齐（不重转）"""
-        if not opts.get("srt") or (payload or {}).get("sentences"):
+        """本素材要字幕、而缓存里没有 sentences 时，补一次对齐（不重转）。
+
+        缓存已有 sentences 时不补对齐，但若用户这次要的格式（srt/vtt）还没落盘，
+        仍需按缓存里的 sentences 直接写——否则"先前只出 srt，这次加 --vtt"会拿不到文件。
+        """
+        if not (opts.get("srt") or opts.get("vtt")):
             return payload
-        return _align_srt_only(vocals, cache_json, opts)
+        subs = (payload or {}).get("sentences")
+        if not subs:
+            return _align_srt_only(vocals, cache_json, opts)
+        written = write_cached_subtitles(subs, opts, vocals.parent, vocals.stem)
+        if written:
+            print(f"[补字幕] {vocals.name}：按缓存 sentences 补写 {', '.join(written)}",
+                  file=sys.stderr)
+        return payload
 
     if cache_json.exists() and not force:
         payload = _read_json(cache_json)
+        if payload is not None and not _schema_ok(payload):
+            # 结构版本不认识：字段含义可能已变，复用它等于拿错数据当结果
+            print(f"[缓存] {cache_json.name} 结构版本 {payload.get('schema_version')} "
+                  f"当前仅支持 {CACHE_SCHEMA_VERSION}，按未命中重转", file=sys.stderr)
+            payload = None
         if payload is not None:
             cached_fp = payload.get("_source_fp")
             if not cached_fp:
@@ -525,6 +588,23 @@ def _read_json(path: Path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+# 转写结果结构版本：与 qwen_asr.SCHEMA_VERSION 同步，lines 结构改动时两边一起升
+CACHE_SCHEMA_VERSION = 1
+
+
+def _schema_ok(payload) -> bool:
+    """缓存是否可安全复用的结构校验。
+
+    只看能不能识别版本，不逐字段深检——字段级缺失由调用方 .get 兜底散步即可，
+    真正会把错数据当结果用的是结构变体（比如 lines 改成嵌套字典）。
+    版本号缺失时按 v1 认：升级前的老缓存正是这套字段，不自作主张重转白烧识别。
+    """
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("schema_version", 1) == CACHE_SCHEMA_VERSION
+
 
 
 def _write_json(path: Path, payload) -> None:
@@ -592,9 +672,12 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     md_path = stem_dir / f"{out_stem}.md"
     docx_path = stem_dir / f"{out_stem}.docx"
     srt_path = stem_dir / f"{out_stem}.srt"
+    vtt_path = stem_dir / f"{out_stem}.vtt"
     # 要字幕但字幕还没出：不能直接 skip，交给下面命中缓存后走"只补对齐"通道。
     # 否则 --srt 在已处理素材上完全无声失效（首次运行后补字幕永远拿不到文件）。
-    needs_srt = bool(opts.get("srt")) and not srt_path.exists()
+    # srt 与 vtt 各自独立判定：只缺 vtt 时要补一次对齐，不能因为 srt 在就跳过。
+    needs_srt = ((opts.get("srt") and not srt_path.exists())
+                 or (opts.get("vtt") and not vtt_path.exists()))
     if md_path.exists() and not force and not needs_srt:
         # md 已在：docx 齐备或排版技能缺失才算完成；只差 docx（首跑时技能未装）则只补排版，
         # 不重跑分离与转写——旧行为要到 --force 全量重跑，连 Demucs 一起白烧
@@ -655,10 +738,13 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     if not md_body:
         return "novoice"
     md_path.write_text(md_body, encoding="utf-8")
-    if opts.get("srt"):  # qwen_asr 产出的字幕转移到本次输出名
-        raw_srt = vocals_asr.with_suffix(".srt")
-        if raw_srt.exists():
-            raw_srt.replace(stem_dir / f"{out_stem}.srt")
+    # qwen_asr 产出的字幕转移到本次输出名（srt 与 vtt 各自独立搬运）
+    for ext, want in ((".srt", opts.get("srt")), (".vtt", opts.get("vtt"))):
+        if not want:
+            continue
+        raw = vocals_asr.with_suffix(ext)
+        if raw.exists():
+            raw.replace(stem_dir / f"{out_stem}{ext}")
     if render_docx(md_path, docx_path, stem_dir, bool(opts.get("verbose"))):
         print(f"[排版] {stem}：article-format 规范 docx 已生成")
     return "done"
@@ -913,6 +999,9 @@ def main():
                     help="说话人改名（如 '0=赵总,1=张会计'）——会议原文的说话人标签将显示真实姓名")
     ap.add_argument("--srt", action="store_true",
                     help="额外产出 .srt 字幕（同名，含字级时间戳；加载 fa-zh 对齐模型）")
+    ap.add_argument("--vtt", action="store_true",
+                    help="额外产出 .vtt 字幕（WebVTT，HTML5 video 的 track 与视频平台直接可用）；"
+                         "与 --srt 共用一次对齐，可同时开")
     ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto", "cloud"], default="qwen",
                     help="识别引擎：qwen=Qwen3-ASR-1.7B（默认，多语言）；aed=FireRedASR2-AED（中/英/粤更准）；"
                          "auto=按 --language 路由（中/英/粤走 aed，其余走 qwen）；"
@@ -1051,7 +1140,7 @@ def main():
         if bad in extra:
             sys.exit(f"--asr-extra 不允许传入管线保留参数：{bad}")
     opts = {"threshold": args.threshold, "diarize_engine": diarize_engine,
-            "hotwords": args.hotwords, "names": args.names, "srt": args.srt,
+            "hotwords": args.hotwords, "names": args.names, "srt": args.srt, "vtt": args.vtt,
             "engine": args.asr_engine if args.asr_engine != "qwen" else None,
             "extra": extra, "verbose": args.verbose, "clean": args.clean,
             "flat": args.flat, "dict_hash": dict_hash,
