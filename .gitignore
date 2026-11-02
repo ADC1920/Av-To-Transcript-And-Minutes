@@ -46,3 +46,12 @@ models/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 本机归集目录（只留本机，不入库）
+archive/
+samples/
+.v2c/
+out/
+
+# 一次性中间产物
+.tmp/
