@@ -72,6 +72,14 @@ AUTO_SEGMENT_S = 60  # 超过此时长自动走 VAD 分段批量转写(实测比
 AED_BATCH_BUDGET_S = 240  # AED 单次前向的批内总音频时长预算(bf16 后显存余量足,120→240 换吞吐)
 AED_MIN_SPLIT_S = 10.0    # OOM 兜底重试时单段最短时长,短于此不再二分
 AED_MAX_SPLIT_DEPTH = 2   # OOM 兜底二分深度上限(2 → 最小拆到原段 1/4)
+# pyannote 长音频分块：整段波形驻留内存按时长线性增长（16k 单声道 float32 约 230MB/小时，
+# 再经 torch.from_numpy 复制一份翻倍）。分块后峰值只与块长相关，与总时长无关。
+# 块间留重叠：同一说话人跨块会各自得到不同标签，靠重叠区的声纹相似度找回对应关系。
+PYANNOTE_CHUNK_S = 900     # 单块上限(秒)，短于此不分块
+PYANNOTE_OVERLAP_S = 30    # 块间重叠(秒)，供跨块说话人标签映射
+# Qwen3 强制对齐模型（--align-engine native 时用；与 ASR 主模型分开，需另行下载约 1.2GB）
+ALIGNER_MS = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / \
+    "Qwen--Qwen3-ForcedAligner-0.6B" / "snapshots" / "master"
 PUNCT = set("，。！？；：、,.!?;:…—～~「」『』“”‘’（）()《》〈〉【】[]\"'· \t\n\r")
 HARD_STOP = "。！？；!?;"
 SOFT_STOP = "，,、：:"
@@ -609,6 +617,58 @@ def align_batch(fa_model, wav_paths, texts):
     return out
 
 
+def aligner_available():
+    """Qwen3 强制对齐模型是否已下载（--align-engine native/auto 的前置）"""
+    return (ALIGNER_MS / "config.json").is_file()
+
+
+def load_aligner(device):
+    """Qwen3-ForcedAligner-0.6B：多语言字级对齐，替代中文专用的 fa-zh。
+    与 ASR 主模型是两个独立模型，用 processor + 分类头模型各一份。"""
+    import torch
+    from transformers import AutoProcessor, Qwen3ASRForTokenClassification
+    t0 = time.time()
+    processor = AutoProcessor.from_pretrained(str(ALIGNER_MS))
+    model = Qwen3ASRForTokenClassification.from_pretrained(
+        str(ALIGNER_MS), dtype=torch.bfloat16).to(torch.device(device))
+    model.eval()
+    return model, processor, time.time() - t0
+
+
+def align_batch_qwen(model, processor, wav_paths, texts, language=None, batch=8):
+    """Qwen3 强制对齐：返回与 align_batch 同构的 [{"tokens","ts"}...]（毫秒）。
+    一次前向给整批 logits，decode_forced_alignment 按 word_list 把时间戳配回词。
+    处理失败的单条退化为空 ts，由 char_times 走跨度均分兜底，不阻断整批。"""
+    import torch
+    out = []
+    lang = language if isinstance(language, (list, type(None))) else [language] * len(wav_paths)
+    for i in range(0, len(wav_paths), batch):
+        chunk_a, chunk_t = wav_paths[i:i + batch], texts[i:i + batch]
+        chunk_l = (lang[i:i + batch] if isinstance(lang, list)
+                   else [None] * len(chunk_a))
+        try:
+            inputs, word_lists = processor.prepare_forced_aligner_inputs(
+                audio=chunk_a, transcript=chunk_t, language=chunk_l)
+            inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v)
+                      for k, v in inputs.items()}
+            with torch.inference_mode():
+                logits = model(**inputs).logits
+            decoded = processor.decode_forced_alignment(
+                logits, inputs["input_ids"], word_lists,
+                timestamp_token_id=model.config.timestamp_token_id)
+            for items in decoded:
+                out.append({"tokens": [it["text"] for it in items],
+                            "ts": [[int(round(it["start_time"] * 1000)),
+                                    int(round(it["end_time"] * 1000))] for it in items]})
+        except Exception as e:
+            print(f"[warn] Qwen 对齐第 {i // batch + 1} 批失败，该批改按跨度均分: "
+                  f"{type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
+            for t in chunk_t:
+                n = sum(1 for c in t if c not in PUNCT)
+                out.append({"tokens": [], "ts": []})
+    return out
+
+
 def char_times(text, tokens, ts, base_ms, fallback_start, fallback_end):
     """去标点字符序 -> [(start_ms,end_ms)];token 数与字符数一致时按序映射,否则按跨度均分兜底"""
     plain_len = sum(1 for c in text if c not in PUNCT)
@@ -733,19 +793,53 @@ def merge_short_segments(segments, min_ms, gap_ms):
     return [(a, b) for a, b in out]
 
 
-def split_long_segments(segments, max_ms):
-    """超长 VAD 段按 max_ms 等分。
+def split_long_segments(segments, max_ms, audio=None, sr=16000, search_ms=1500):
+    """超长段按 max_ms 切分，切点吸附到附近能量最低处（静音点）。
+
     目的：单次超长自回归转写效率崩塌（实测 7 分钟段 GPU 满负荷 20 分钟未完成），
-    拆成 <=max_ms 的多段走批量转写（实测 33 段全量约 3 分钟）。"""
+    拆成 <=max_ms 的多段走批量转写（实测 33 段全量约 3 分钟）。
+
+    为什么不在理想切点硬切：pyannote 的回合常是连续语流，等分点大概率落在词中间，
+    切出来的两段各自带半截词，转写文本在接缝处出现残字或重复。这里在每个理想切点
+    前后 search_ms 范围内找 50ms 窗的最低能量位置，把切点移到声门闭合处。
+    audio 为 None 时退化为等分（保持纯函数可测）。"""
     if max_ms <= 0:
         return [(int(s), int(e)) for s, e in segments]
+
+    def quiet_point(lo_ms, hi_ms, hard_lo, hard_hi):
+        """在 [lo,hi] 毫秒区间找最低能量点，返回切点毫秒；无音频或区间过窄返回 None"""
+        if audio is None or hi_ms - lo_ms < 100:
+            return None
+        lo_ms = max(int(lo_ms), int(hard_lo))
+        hi_ms = min(int(hi_ms), int(hard_hi))
+        win = max(1, int(0.05 * sr))
+        f0, f1 = int(lo_ms * sr / 1000), int(hi_ms * sr / 1000)
+        f0, f1 = max(0, f0), min(len(audio), f1)
+        n_frames = (f1 - f0) // win
+        if n_frames < 2:
+            return None
+        frames = audio[f0:f0 + n_frames * win].reshape(n_frames, win)
+        energy = (frames.astype(np.float64) ** 2).mean(axis=1)
+        k = int(np.argmin(energy))
+        # 采样索引换算回毫秒——返回索引会被上游当作毫秒用，切点直接飞出音频末尾
+        return int(round((f0 + (k + 0.5) * win) * 1000 / sr))
+
     out = []
     for s, e in segments:
         s, e = int(s), int(e)
         n = max(1, -(-(e - s) // max_ms))  # 向上取整
         step = (e - s) / n
-        for k in range(n):
-            out.append((int(round(s + k * step)), int(round(s + (k + 1) * step))))
+        cuts = [s]
+        for k in range(1, n):
+            ideal = s + int(round(k * step))
+            # 搜索窗不越过相邻理想切点的一半，避免两次吸附挤到一起产生零长段
+            half = min(search_ms, step / 2 * 0.9)
+            q = quiet_point(ideal - half, ideal + half, s + 100, e - 100)
+            cuts.append(q if q is not None else ideal)
+        cuts.append(e)
+        for a, b in zip(cuts, cuts[1:]):
+            if b > a:
+                out.append((int(a), int(b)))
     return out
 
 
@@ -880,10 +974,92 @@ def absorb_tiny_clusters(embeddings, labels, segments, max_cluster_ms=5000):
     return np.array(out)
 
 
-def run_pyannote(src, device):
-    """pyannote 说话人分离（community-1 全套本地模型）；返回 [(start_ms, end_ms, spk_label), ...]
+def _merge_spans(spans, gap_ms=0):
+    """合并重叠或相邻的时间区间，用于收敛跨块重复的重叠区标记"""
+    if not spans:
+        return []
+    spans = sorted(spans)
+    out = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= out[-1][1] + gap_ms:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [(a, b) for a, b in out]
+
+
+def extract_segment_embeddings(audio, segments, device, min_ms=300):
+    """按段提 cam++ 声纹向量并 L2 归一化，返回 (embeddings, valid_idx)。
+
+    pyannote 路径原本完全拿不到声纹，导致 --speaker-db 只能整条跳过。pyannote 的
+    分割模型本身不吐 embedding，但段边界已经给好了，拿现成的段单独跑一遍 cam++
+    就能补上——声纹库、跨文件身份复用这些能力因此与分离引擎解耦。
+
+    过短段（<min_ms）不送声纹：几百毫秒的碎段嵌入方差极大，混进质心会污染匹配。
+    这类段在返回值里没有对应行，由调用方按标签就近归类。"""
+    from funasr import AutoModel
+    spk = AutoModel(model="cam++", device=device, disable_update=True)
+
+    def to_numpy(x):
+        return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+
+    embs, valid = [], []
+    for i, (s_ms, e_ms) in enumerate(segments):
+        if e_ms - s_ms < min_ms:
+            continue
+        seg = audio[int(s_ms) * 16: int(e_ms) * 16]
+        if seg.size < 1600:
+            continue
+        emb = to_numpy(spk.generate(input=seg, fs=16000)[0]["spk_embedding"]).flatten()
+        n = float(np.linalg.norm(emb))
+        if n <= 0:
+            continue
+        embs.append(emb / n)
+        valid.append(i)
+    del spk
+    gc_cuda()
+    if not embs:
+        return np.zeros((0, 512), dtype=np.float32), []
+    return np.array(embs), valid
+
+
+def centroid_by_label(embeddings, row_labels):
+    """按标签聚合质心（成员向量取均值再 L2 归一化）。
+    embeddings 每行一个向量，row_labels 与行一一对应；返回 {标签: 归一化质心}"""
+    groups = {}
+    for row, lab in enumerate(row_labels):
+        if lab is None or lab < 0:
+            continue
+        groups.setdefault(int(lab), []).append(embeddings[row])
+    out = {}
+    for lab, vecs in groups.items():
+        cen = np.mean(np.array(vecs), axis=0)
+        n = float(np.linalg.norm(cen))
+        if n > 0:
+            out[lab] = cen / n
+    return out
+
+
+def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers=None,
+                 chunk_s=None, overlap_s=None):
+    """pyannote 说话人分离（community-1 全套本地模型）。
+
+    返回 (turns, overlaps)：
+      turns    = [(start_ms, end_ms, spk_label), ...] 按时间排序的单标签回合
+      overlaps = [(start_ms, end_ms), ...] 两人及以上同时发言的区间
+
     优于 cam++ 聚类之处：分割模型原生处理重叠语音（会议抢话场景），无需后验声纹聚类。
-    注意：用 soundfile 预载波形传入，绕开 torchcodec 的 DLL 依赖。"""
+    用 soundfile 预载波形传入，绕开 torchcodec 的 DLL 依赖。
+
+    说话人数（num/min/max_speakers）显式下发给 pipeline：社区版说话人计数本身不保证准确，
+    已知会议人数时这是最便宜的一项精度提升。
+
+    长音频分块：整段波形驻留内存随时长线性增长（16k 单声道 float32 约 230MB/小时，
+    torch.from_numpy 再复制一份翻倍）。分块后峰值只与块长相关。块间留 overlap_s 重叠，
+    用重叠区的时间重合量把各块的局部标签并到全局标签——同一人跨块会各自得到独立标签，
+    不映射就会凭空多出说话人。分块时不传 num_speakers：单块内人数可能少于全局，
+    硬约束会逼模型把不同人合并或把同一人拆开。
+    """
     if not (PYANNOTE_DIR / "config.yaml").is_file():
         sys.exit(f"pyannote community-1 模型不存在: {PYANNOTE_DIR}\n"
                  f"下载: python -c \"from modelscope import snapshot_download; "
@@ -891,20 +1067,117 @@ def run_pyannote(src, device):
     import soundfile as sf
     import torch
     from pyannote.audio import Pipeline
+
+    chunk_s = PYANNOTE_CHUNK_S if chunk_s is None else chunk_s
+    overlap_s = PYANNOTE_OVERLAP_S if overlap_s is None else overlap_s
+    info = sf.info(str(src))
+    sr = int(info.samplerate)
+    total_s = info.frames / float(sr)
+
+    # 重叠必须小于块长，否则步进为 0 或负数会陷入死循环
+    if chunk_s > 0 and overlap_s >= chunk_s:
+        print(f"[warn] pyannote 块间重叠 {overlap_s}s 不小于块长 {chunk_s}s，已按块长一半处理",
+              file=sys.stderr)
+        overlap_s = chunk_s / 2.0
+    chunked = chunk_s > 0 and total_s > chunk_s
+
     pipe = Pipeline.from_pretrained(str(PYANNOTE_DIR))
     pipe.to(torch.device(device))
-    audio_np, sr = sf.read(str(src))
-    if audio_np.ndim > 1:
-        audio_np = audio_np.mean(axis=1)  # 下混单声道
-    wav = torch.from_numpy(audio_np[None, :]).float()
-    dia = pipe({"waveform": wav, "sample_rate": sr})
-    turns = [(int(turn.start * 1000), int(turn.end * 1000), spk)
-             for turn, _, spk in dia.speaker_diarization.itertracks(yield_label=True)]
+
+    def call_dia(waveform, whole_file):
+        """调用 pipeline；whole_file 为真时才允许断言确切人数"""
+        kw = {}
+        if whole_file and num_speakers:
+            kw["num_speakers"] = num_speakers
+        else:
+            if min_speakers:
+                kw["min_speakers"] = min_speakers
+            if max_speakers:
+                kw["max_speakers"] = max_speakers
+        if kw:
+            try:
+                return pipe({"waveform": waveform, "sample_rate": sr}, **kw)
+            except (TypeError, ValueError) as e:
+                print(f"[warn] pyannote 不接受说话人数参数（{type(e).__name__}），"
+                      f"改用自动推断: {e}", file=sys.stderr)
+        return pipe({"waveform": waveform, "sample_rate": sr})
+
+    if chunked:
+        spans, start = [], 0.0
+        step = chunk_s - overlap_s
+        while start < total_s:
+            end = min(start + chunk_s, total_s)
+            spans.append((start, end))
+            if end >= total_s:
+                break
+            start += step
+    else:
+        spans = [(0.0, total_s)]
+
+    global_turns, overlap_spans, next_gid = [], [], 0
+    for idx, (cs, ce) in enumerate(spans):
+        data, _ = sf.read(str(src), start=int(cs * sr),
+                          frames=int((ce - cs) * sr), dtype="float32", always_2d=False)
+        if data.size == 0:
+            continue
+        if data.ndim > 1:
+            data = data.mean(axis=1)  # 下混单声道
+        wav = torch.from_numpy(data[None, :]).float()
+        dia = call_dia(wav, whole_file=not chunked)
+        base_ms = int(round(cs * 1000))
+        raw = [(base_ms + int(round(t.start * 1000)),
+                base_ms + int(round(t.end * 1000)),
+                str(spk))
+               for t, _, spk in dia.speaker_diarization.itertracks(yield_label=True)]
+        # get_overlap() 返回 Timeline（可直接迭代 Segment），不是可调 itersegments 的对象
+        for seg in dia.speaker_diarization.get_overlap():
+            overlap_spans.append((base_ms + int(round(seg.start * 1000)),
+                                  base_ms + int(round(seg.end * 1000))))
+
+        # 跨块标签映射：只看与本块重叠窗口内、上一轮已确定的全局回合，
+        # 按时间重合毫秒数投票；一个全局标签只能被本块一个局部标签认领
+        mapping = {}
+        if idx > 0 and raw:
+            win_lo, win_hi = base_ms, base_ms + int(round(overlap_s * 1000))
+            prev = [(s, e, g) for s, e, g in global_turns if e > win_lo and s < win_hi]
+            score = {}
+            for s2, e2, spk2 in raw:
+                if e2 <= win_lo or s2 >= win_hi:
+                    continue
+                for s1, e1, g1 in prev:
+                    ov = min(e1, e2, win_hi) - max(s1, s2, win_lo)
+                    if ov > 0:
+                        score[(spk2, g1)] = score.get((spk2, g1), 0) + ov
+            taken = set()
+            for (spk2, g1), ov in sorted(score.items(), key=lambda kv: -kv[1]):
+                if spk2 in mapping or g1 in taken or ov < 200:
+                    continue      # 重合不足 200ms 认定不足以判定同一人，宁可新建
+                mapping[spk2] = g1
+                taken.add(g1)
+
+        # 非首块丢弃完全落在重叠区内的回合：那段内容由前一块负责，否则会重复计入
+        keep_from = base_ms + int(round(overlap_s * 1000)) if idx > 0 else 0
+        for s_ms, e_ms, spk in raw:
+            if e_ms <= keep_from:
+                continue
+            gid = mapping.get(spk)
+            if gid is None:
+                gid = f"G{next_gid}"
+                next_gid += 1
+                mapping[spk] = gid
+            global_turns.append((s_ms, e_ms, gid))
+        del dia, wav, data
+        if chunked:
+            print(f"[2] pyannote 分块 {idx + 1}/{len(spans)} 完成"
+                  f"（{cs:.0f}–{ce:.0f}s，累计 {len(global_turns)} 回合）", file=sys.stderr)
+
     # 必须显式释放：pyannote 模型驻留显存会与后续 Qwen3-ASR 转写争抢，
     # 实测不释放时进程在转写阶段无堆栈硬崩溃（16GB 显存不够两者共存）
-    del pipe, wav, dia
+    del pipe
     torch.cuda.empty_cache()
-    return turns
+    global_turns.sort(key=lambda x: (x[0], x[1]))
+    return global_turns, _merge_spans(overlap_spans)
+
 
 
 def merge_by_speaker(segments, labels, gap_ms, max_ms=60000):
@@ -1010,6 +1283,69 @@ def merge_replace_dict(path: str, items: dict) -> int:
     return len(items)
 
 
+def run_align_only(args, src, log, t0, audio_path, out_json, out_srt):
+    """只做字幕对齐：读已有转写 JSON 的 lines，跑对齐，补写 sentences 并产出 .srt。
+
+    不加载识别模型，只加载对齐模型——补字幕的成本从"整套重转"降到"一遍对齐"。
+    已有 lines 的 start_ms/end_ms 就是各发言块的真实边界，直接沿用，只补充块内字级时间戳。
+    """
+    legacy = Path(os.path.realpath(args.align_only))
+    if not legacy.is_file():
+        sys.exit(f"--align-only 指定的转写结果不存在: {legacy}")
+    payload = json.loads(legacy.read_text(encoding="utf-8"))
+    lines = payload.get("lines") or []
+    if not lines:
+        sys.exit(f"--align-only 结果里没有 lines 字段，无法对齐: {legacy}")
+    import numpy as np, soundfile as sf
+    import librosa
+    y, _ = librosa.load(str(src), sr=16000, mono=True)
+    sr = 16000
+    units = [{"start_ms": int(l["start_ms"]), "end_ms": int(l["end_ms"]),
+              "text": l.get("text") or "", "spk": l.get("spk"),
+              "spk_name": l.get("spk_name")} for l in lines]
+    # 按段切 wav 供对齐器读取（对齐模型吃文件路径或 np 数组，用切好的临时文件最省内存）
+    tmp_dir = Path(tempfile.mkdtemp(prefix="align_only_")).resolve()
+    atexit.register(lambda d=tmp_dir: shutil.rmtree(d, ignore_errors=True))
+    seg_files = write_unit_wavs(y, units, tmp_dir)
+
+    want = args.align_engine
+    if want == "auto":
+        want = "native" if aligner_available() else "fa-zh"
+    fa = None
+    qwen_aligner = None
+    if want == "native" and aligner_available():
+        try:
+            qwen_aligner = load_aligner(args.device)
+            log(f"[1] Qwen3-ForcedAligner 已加载 ({qwen_aligner[2]:.0f}s)")
+        except Exception as e:
+            print(f"[warn] Qwen 对齐器加载失败，回落 fa-zh: {type(e).__name__}: "
+                  f"{str(e)[:120]}", file=sys.stderr)
+            want = "fa-zh"
+    if qwen_aligner is None:
+        from funasr import AutoModel
+        fa = AutoModel(model="fa-zh", device=args.device, disable_update=True)
+        log("[1] fa-zh 强制对齐模型已加载（中文专用）")
+
+    texts = [u["text"] for u in units]
+    if qwen_aligner is not None:
+        aligns = align_batch_qwen(qwen_aligner[0], qwen_aligner[1], seg_files, texts,
+                                  language=args.language)
+    else:
+        aligns = align_batch(fa, seg_files, texts)
+    del fa, qwen_aligner
+    gc_cuda()
+
+    subs = subtitle_units(units, aligns, args.max_line)
+    if not subs:
+        sys.exit("对齐未产出可用字幕")
+    payload["sentences"] = subs
+    write_srt(subs, out_srt, use_speaker=True)
+    out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"[2] 仅对齐完成：字幕 {out_srt.name}（{len(subs)} 条），结果已回写 {out_json.name}"
+        f"（总耗时 {time.time()-t0:.0f}s）")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Qwen3-ASR 本地转写（可说话人分离/字幕/专名纠错）")
     ap.add_argument("audio", help="音频文件路径(mp3/m4a/wav/flac/ogg/webm)")
@@ -1047,6 +1383,21 @@ def main():
     ap.add_argument("--cloud-url", default=None,
                     help="filetrans 模式的音频公网 URL(仅此模式需要;本地文件用 3.1/3.0 即可)")
     ap.add_argument("--no-punc", action="store_true", help="aed 引擎不补标点(默认用 ct-punc 补)")
+    ap.add_argument("--align-engine", choices=["auto", "fa-zh", "native"], default="auto",
+                    help="字幕强制对齐后端: auto=有 Qwen3-ForcedAligner 就用它、否则回落 fa-zh(默认);"
+                         "fa-zh=FunASR 中文专用对齐(38M,仅中文);"
+                         "native=Qwen3-ForcedAligner-0.6B(多语言,需先下载约 1.2GB)")
+    ap.add_argument("--num-speakers", type=int, default=None,
+                    help="已知说话人数(pyannote 引擎):精确人数最准;仅在整段分析时生效,分块时忽略")
+    ap.add_argument("--min-speakers", type=int, default=None,
+                    help="说话人数下限(pyannote 引擎),与 --max-speakers 配合挡住过度切分")
+    ap.add_argument("--max-speakers", type=int, default=None,
+                    help="说话人数上限(pyannote 引擎),会议人数不确定时用它限制")
+    ap.add_argument("--pyannote-chunk-s", type=int, default=None,
+                    help=f"pyannote 单块时长上限秒(默认 {PYANNOTE_CHUNK_S},0=不分块);"
+                         "长素材分块可显著降内存峰值")
+    ap.add_argument("--pyannote-overlap-s", type=int, default=None,
+                    help=f"pyannote 块间重叠秒(默认 {PYANNOTE_OVERLAP_S}),供跨块说话人标签映射")
     ap.add_argument("--denoise", action="store_true", help="先跑 ZipEnhancer 降噪(含 BGM/强噪时试;白噪声实测无明显收益)")
     ap.add_argument("--threshold", type=float, default=0.75,
                     help="声纹余弦聚类阈值(声音相近漏分调低0.65-0.7,同人被拆调高0.8)")
@@ -1054,7 +1405,10 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=2048, help="单段最大生成 token 数")
     ap.add_argument("--no-t2s", action="store_true", help="关闭默认的繁->简转换(保留模型原始输出)")
     ap.add_argument("--itn", action="store_true",
-                    help="中文逆文本正则化:三百二十万元->320万元、百分之八十->80%%、二零二六年十月十五日->2026年10月15日(自写规则,零依赖)")
+                    help="中文逆文本正则化:三百二十万元->320万元、百分之八十->80%%、二零二六年十月十五日->2026年10月15日")
+    ap.add_argument("--itn-backend", choices=["auto", "wtp", "legacy"], default="auto",
+                    help="ITN 后端: auto=装了 WeTextProcessing 就用、否则自写规则(默认); "
+                         "wtp=强制 WeTextProcessing(覆盖更全,需 pynini,Windows 需 MSVC); legacy=自写零依赖规则")
     ap.add_argument("--emotion", action="store_true",
                     help="emotion2vec+large 整段情绪分析(8 类情绪,结果写入 json 的 emotions 字段);"
                          "注意它不做笑声/掌声这类音频事件检测")
@@ -1069,6 +1423,9 @@ def main():
     ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
     ap.add_argument("--job-config", default=None,
                     help="任务配置 JSON 路径（供管线脚本透传参数；与命令行同名参数等价）")
+    ap.add_argument("--align-only", default=None, metavar="JSON",
+                    help="只做字幕对齐：读已有转写结果 JSON，产出 .srt 并补写 sentences 字段，"
+                         "不重新跑识别。补字幕时可省掉最贵的转写环节")
     args = ap.parse_args()
 
     # 任务配置合并：仅覆盖命令行未显式给出的项（命令行优先）
@@ -1170,6 +1527,13 @@ def main():
         src = src0
     import librosa, soundfile as sf
     preloaded_audio = None
+
+    # ---- 只补字幕模式：读已有转写结果，只跑对齐 ----
+    # 补字幕之所以要独立通道，是因为对齐的成本远低于转写（38M/0.6B 对齐模型 vs 1.7B
+    # 自回归识别）。把 srt 放进转写缓存键会让"加字幕"等于整套重转，白白烧掉最贵环节。
+    if args.align_only:
+        return run_align_only(args, src, log, t0, audio_path, out_json, out_srt)
+
     # AED 只吃 16k wav;为统一,两种引擎都先落到工作目录的 16k wav(顺便完成格式归一)
     if use_aed or use_cloud:
         src, preloaded_audio = to_wav16k(src, work_dir)
@@ -1187,7 +1551,13 @@ def main():
     if args.itn:
         # itn_zh.py 与本脚本同目录；直接运行/子进程调用时脚本目录在 sys.path[0]
         try:
-            from itn_zh import normalize as itn_fn
+            from itn_zh import normalize as _itn_normalize, wtp_available
+            backend = args.itn_backend
+            if backend == "auto":
+                backend = "wtp" if wtp_available() else "legacy"
+                log(f"[0] ITN 后端: {'WeTextProcessing' if backend == 'wtp' else '自写规则'}"
+                    + ("" if backend == "wtp" else "（装 WeTextProcessing 可获更全覆盖）"))
+            itn_fn = lambda s, _b=backend: _itn_normalize(s, backend=_b)
         except Exception as e:
             print(f"[warn] ITN 模块加载失败，跳过逆文本正则化: {type(e).__name__}: {e}", file=sys.stderr)
     if use_cloud and args.cloud_model == "message" and not args.diarize:
@@ -1201,11 +1571,50 @@ def main():
         + ("；ITN 已启用" if itn_fn is not None else "")
         + (f"；专名纠错 {len(replace_map)} 条" if replace_map else "")
         + ("；ct-punc 已加载" if punc is not None else ""))
+    # ---- 字幕对齐后端：fa-zh（中文专用 38M）或 Qwen3-ForcedAligner（多语言）----
+    # auto 默认优先 Qwen 对齐器：它的词表覆盖 11 种语言，fa-zh 只认中文，
+    # 非中文素材用 fa-zh 会产出错位时间戳。模型没下时静默回落 fa-zh 而不是报错。
+    use_fa = False
     fa = None
+    qwen_aligner = None
     if args.srt and not (use_cloud and args.cloud_model == "message"):
-        from funasr import AutoModel
-        fa = AutoModel(model="fa-zh", device=args.device, disable_update=True)
-        log("[1b] fa-zh 强制对齐模型已加载")
+        want = args.align_engine
+        if want == "auto":
+            want = "native" if aligner_available() else "fa-zh"
+            if want == "fa-zh" and not args.language:
+                pass  # 未指定语言也可能是中文，fa-zh 仍是可用兜底
+        if want == "native":
+            if aligner_available():
+                try:
+                    qwen_aligner = load_aligner(args.device)
+                    log(f"[1b] Qwen3-ForcedAligner 已加载 ({qwen_aligner[2]:.0f}s，多语言对齐)")
+                except Exception as e:
+                    print(f"[warn] Qwen 对齐器加载失败，回落 fa-zh: {type(e).__name__}: "
+                          f"{str(e)[:120]}", file=sys.stderr)
+                    use_fa = True
+            else:
+                if args.align_engine == "native":
+                    sys.exit(f"Qwen3-ForcedAligner 模型不存在: {ALIGNER_MS}\n"
+                             f"下载: python -c \"from modelscope import snapshot_download; "
+                             f"snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B', "
+                             f"local_dir=r'{ALIGNER_MS.parents[2]}')\"")
+                use_fa = True
+                log("[1b] 未找到 Qwen3-ForcedAligner，回落 fa-zh 中文对齐")
+        else:
+            use_fa = True
+        if use_fa:
+            from funasr import AutoModel
+            fa = AutoModel(model="fa-zh", device=args.device, disable_update=True)
+            log("[1b] fa-zh 强制对齐模型已加载（中文专用）")
+
+    def align_units(wav_paths, texts):
+        """统一对齐入口：按当前后端产出与 fa-zh 同构的 aligns，失败返回 None"""
+        if qwen_aligner is not None:
+            return align_batch_qwen(qwen_aligner[0], qwen_aligner[1], wav_paths, texts,
+                                    language=args.language)
+        if fa is not None:
+            return align_batch(fa, wav_paths, texts)
+        return None
 
     def infer(paths):
         """统一识别入口（按引擎分发,批量）"""
@@ -1258,11 +1667,11 @@ def main():
             if use_aed and aed_ts_usable(parsed):
                 aligns = aed_aligns_from(parsed)
                 log(f"[2b] 使用 AED 原生字级时间戳（{len(parsed)} 段）")
-            elif fa is not None:
-                aligns = align_batch(fa, seg_files, texts)
+            elif fa is not None or qwen_aligner is not None:
+                aligns = align_units(seg_files, texts)
                 if use_aed:
-                    log("[2b] AED 时间戳不可用,已改用 fa-zh 对齐")
-            fa = None; gc_cuda()   # 对齐已完成
+                    log("[2b] AED 时间戳不可用,已改用强制对齐")
+            fa = None; qwen_aligner = None; gc_cuda()   # 对齐已完成
             print("\n".join(texts))
             langs = [p.get("language") for p in parsed if p.get("language")]
             main_lang = max(set(langs), key=langs.count) if langs else None
@@ -1288,11 +1697,11 @@ def main():
         if use_aed and aed_ts_usable([res]):
             aligns = aed_aligns_from([res])
             log("[2b] 使用 AED 原生字级时间戳")
-        elif fa is not None:
-            aligns = align_batch(fa, [src], [res["transcription"]])
+        elif fa is not None or qwen_aligner is not None:
+            aligns = align_units([src], [res["transcription"]])
         else:
             aligns = None
-        fa = None; gc_cuda()   # 对齐已完成
+        fa = None; qwen_aligner = None; gc_cuda()   # 对齐已完成
         if aligns:
             payload["sentences"] = subtitle_units([u], aligns, args.max_line)
             write_srt(payload["sentences"], out_srt, use_speaker=False)
@@ -1304,21 +1713,30 @@ def main():
     # ---- 说话人分离模式:分环实现(与技能 diarize.py 同一逻辑,识别引擎换成 Qwen3-ASR) ----
     audio = preloaded_audio if preloaded_audio is not None else librosa.load(src, sr=16000, mono=True)[0]
 
+    overlaps = []
     if args.diarize_engine == "pyannote":
         # pyannote 路径：分割模型原生给出「片段+说话人」，跳过 VAD/声纹聚类链
-        turns = run_pyannote(src, args.device)
+        turns, overlaps = run_pyannote(
+            src, args.device,
+            num_speakers=args.num_speakers,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers,
+            chunk_s=args.pyannote_chunk_s,
+            overlap_s=args.pyannote_overlap_s)
         if not turns:
             sys.exit("pyannote 未检测到语音")
         spk_ids, segments, labels = {}, [], []
         for s, e, spk in turns:
             if spk not in spk_ids:
                 spk_ids[spk] = len(spk_ids)
-            for ps, pe in split_long_segments([(s, e)], args.max_unit):  # 超长片段切分保转写吞吐
+            # 超长片段切分保转写吞吐；切点吸附到静音点，避免把词切成两半
+            for ps, pe in split_long_segments([(s, e)], args.max_unit, audio=audio):
                 segments.append((ps, pe))
                 labels.append(spk_ids[spk])
         labels = np.array(labels)
         log(f"[2] pyannote 分离: {len(turns)} 个片段 -> {len(spk_ids)} 个说话人"
             + (f"（超长切分后 {len(segments)} 段）" if len(segments) != len(turns) else "")
+            + (f"，重叠区间 {len(overlaps)} 处" if overlaps else "")
             + f" (累计 {time.time()-t0:.0f}s)")
     else:
         from sklearn.cluster import AgglomerativeClustering
@@ -1328,7 +1746,7 @@ def main():
             sys.exit("未检测到语音(VAD 结果为空)")
         n_raw = len(segments)
         segments = merge_short_segments(segments, args.min_seg, 500)   # 碎段先并入邻近段
-        segments = split_long_segments(segments, args.max_unit)        # 超长段强制切分
+        segments = split_long_segments(segments, args.max_unit, audio=audio)  # 超长段切分(静音点吸附)
         log(f"[2] VAD({args.vad}) 切出 {n_raw} 个语音段"
             + (f" -> 碎段合并/超长切分后 {len(segments)} 段" if len(segments) != n_raw else "")
             + f" (累计 {time.time()-t0:.0f}s)")
@@ -1346,6 +1764,8 @@ def main():
             embeddings.append(emb / np.linalg.norm(emb))
         embeddings = np.array(embeddings)
         del spk; gc_cuda()   # 声纹提取完毕,campp 不驻留到主引擎批量转写阶段
+        # campp 分支的声纹按段一一对应（无跳过），质心用于声纹库
+        all_seg_idx = list(range(len(segments)))
 
         sim = embeddings @ embeddings.T
         dist = 1 - sim
@@ -1397,19 +1817,25 @@ def main():
         parsed = list(parsed) + [{"transcription": ""}
                                  for _ in range(len(units) - len(parsed))]
     # 声纹库：跨文件复用说话人身份（同一批会议里不必每次都重新认人）
+    # pyannote 与 campp 现在都能供声纹：campp 分支的 embeddings 按段一一对应，
+    # pyannote 分支在现场用 extract_segment_embeddings 按已定好的段边界补算。
     db_names = {}
-    if speaker_db_path:
-        emb = locals().get("embeddings")          # pyannote 路径不产声纹向量
-        if emb is None or not len(labels):
-            print("[提示] --speaker-db 只在 campp 引擎下可用（pyannote 路径不产声纹向量），本次跳过",
+    if speaker_db_path and len(labels):
+        emb = locals().get("embeddings")
+        valid_idx = locals().get("all_seg_idx")
+        if emb is None or not len(emb):
+            log("[4c] 提取声纹向量供声纹库使用（pyannote 路径按已定段边界补算）")
+            emb, valid_idx = extract_segment_embeddings(audio, segments, args.device)
+        if emb is None or not len(emb):
+            print("[提示] 未能提取到可用声纹（语音段过短或过少），声纹库本次跳过",
                   file=sys.stderr)
         else:
+            seg_labels = [int(x) for x in labels]
+            rows = valid_idx if valid_idx else list(range(len(seg_labels)))
+            # 只取有向量的段对应的标签；行号与 emb 行一一对应
+            row_labels = [seg_labels[i] for i in rows if i < len(seg_labels)]
+            cents = centroid_by_label(emb, row_labels)
             db = load_speaker_db(speaker_db_path)
-            cents = {}
-            for c in sorted({int(x) for x in labels}):
-                member = emb[labels == c]
-                if len(member):
-                    cents[c] = member.mean(axis=0)
             for c, cen in cents.items():
                 hit, sim = match_speaker_db(cen, db, args.speaker_db_threshold)
                 if hit:
@@ -1429,17 +1855,17 @@ def main():
         if all(len(p["timestamp"]) == len(p["transcription"]) for p in parsed):
             aligns = aed_aligns_from(parsed)
             log("[4b] 使用 AED 原生字级时间戳")
-        elif fa is not None:
-            aligns = align_batch(fa, unit_files, [u["text"] for u in units])
+        elif fa is not None or qwen_aligner is not None:
+            aligns = align_units(unit_files, [u["text"] for u in units])
     elif use_cloud and args.cloud_model == "message" and args.srt:
         if all(p.get("cloud_words") for p in parsed):
             aligns = [{"tokens": [], "ts": p["cloud_words"]} for p in parsed]
             log("[4b] 使用云端 message 字级时间戳（跳过 fa-zh）")
         else:
             print("[warn] 云端未返回字级时间戳,本次未产出字幕", file=sys.stderr)
-    elif fa is not None:
-        aligns = align_batch(fa, unit_files, [u["text"] for u in units])
-    fa = None; gc_cuda()   # 对齐已完成
+    elif fa is not None or qwen_aligner is not None:
+        aligns = align_units(unit_files, [u["text"] for u in units])
+    fa = None; qwen_aligner = None; gc_cuda()   # 对齐已完成
     log(f"[5] 转写完成 (累计 {time.time()-t0:.0f}s),结果:")
 
     lines = []
@@ -1458,6 +1884,11 @@ def main():
         log("[5b] 情绪分析: " + "、".join(f"{e['label']} {e['score']:.2f}" for e in emotions))
     payload = {"engine": _engine_tag, "audio": str(audio_path),
                "speakers": names or None, "lines": lines}
+    if overlaps:
+        # 重叠区间（两人及以上同时发言）：只做标记不改归属。纪要提炼时它是"这段在抢话"
+        # 的信号，比把交叠内容强行判给某一个人更诚实。
+        payload["overlaps"] = [{"start_ms": int(s), "end_ms": int(e)} for s, e in overlaps]
+        log(f"[5b] 重叠语音区间 {len(overlaps)} 处（已写入 overlaps 字段）")
     if emotions:
         payload["emotions"] = emotions
     if aligns is not None:
