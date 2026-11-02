@@ -21,7 +21,7 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
       - name: ITN 单测（零依赖）
         run: python skills/funasr-transcribe/scripts/test_itn_zh.py
       - name: cloud 引擎单测（全 mock，零网络）
@@ -67,3 +67,19 @@ jobs:
         run: pip install numpy soundfile funasr
       - name: 引擎单元测试（切句/时间戳/碎段合并/字幕细分/词典合并等）
         run: python skills/funasr-transcribe/scripts/test_qwen_asr_units.py
+
+  # 质量基线：DER/CER/重叠检测。需要 Windows TTS 造素材 + GPU 跑模型，
+  # Linux runner 上 make_fixtures 会自己识别环境并跳过（退出码 0），
+  # 所以本 job 在 CI 里的作用是"入口存在且脚本可导入"，真正的质量门槛在本机跑。
+  # 需要 CI 也验质量时，改成自托管 Windows runner 并预先放好 fixtures。
+  quality-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 素材生成脚本环境自检（非 Windows 应报告不可用且不失败）
+        run: python scripts/make_fixtures.py --check
+      - name: 质量基线（缺素材自动跳过，不判失败）
+        run: python tests/test_quality_baseline.py --no-generate
