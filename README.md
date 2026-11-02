@@ -35,7 +35,7 @@ python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输
 - **说话人分离双引擎**：
   - `pyannote`（community-1，会议场景默认）——分割模型原生处理**重叠语音**，实测真实 28 分钟会议从 35 个假说话人收敛到 2 个；支持 `--num-speakers` / `--min-speakers` / `--max-speakers` 下发人数约束（最便宜的精度提升）；重叠区间单独标记进 `overlaps` 字段而不强行归给某一人
   - `campp`（VAD + cam++ 声纹聚类）——轻量，单人/访谈素材够用
-  - **长音频分块**：超过 15 分钟自动分块分析（`--pyannote-chunk-s` 可调，0 关闭），块间带 30 秒重叠做说话人标签映射，内存峰值只与块长相关而非总时长
+  - **长音频分块**：超过 15 分钟自动分块分析（`--pyannote-chunk-s` 可调，0 关闭），块间带 30 秒重叠，跨块用声纹相似度合并说话人标签，内存峰值只与块长相关而非总时长
 - **声纹库双引擎通用**：`--speaker-db` 原先只有 campp 可用，现在 pyannote 路径会在已定段边界上补算声纹，两条路线都能跨文件复用说话人身份
 - **字幕与纠错**：`--srt` 出字级时间戳字幕；`--replace` 确定性专名纠错（比 `--hotwords` 偏置可靠）；`--replace-file` / `--replace-save` 纠错词典读取与回写（本次纠错条目自动并入词典，下次自动带上）；`--names` 说话人真名映射；`--asr-extra` 透传其余引擎参数
 - **字幕对齐后端可选**：`--align-engine auto|fa-zh|native`——`native` 用 Qwen3-ForcedAligner-0.6B，覆盖 11 种语言；`fa-zh` 是中文专用的 38M 模型。默认 auto（有 Qwen 对齐器就用，没有回落 fa-zh）。**中文以外素材必须用 native**，fa-zh 会产出错位时间戳
@@ -245,10 +245,18 @@ DER 用 pyannote.metrics 的标准实现（0.25 秒 collar 容差），CER 自�
 
 2026-10-28 对标公开方案批次实测：
 - 补字幕通道：首跑 15.3s（含分离+识别），事后加 `--srt` 只补对齐 9.0s，缓存文件数不变（字幕未进键），第三次运行正确跳过
-- pyannote 新参数：`--num-speakers` + 分块（`--pyannote-chunk-s 3`）实跑通过，分块映射正确合并跨块说话人，重叠区间写入 `overlaps` 字段 1 处
+- pyannote 新参数：`--num-speakers` 实跑通过，重叠区间写入 `overlaps` 字段 1 处。**分块映射当时只在 3 秒块上验过"能跑通"，没验说话人身份是否保住**——2026-11-02 用 31 秒双人素材复测发现 chunk=20s 时同一人被拆成两个标签、chunk=15s 时两人被合为一个，详见下方修复记录
 - 声纹库在 pyannote 路径建库成功（此前被硬性跳过）
 - 单测新增三层：`test_split_and_cluster.py`（含抓到的采样索引/毫秒混用缺陷）、`test_pyannote_chunking.py`（锁住 `get_overlap()` 返回 Timeline 可迭代、无 `itersegments` 的实测 API）、`benchmark_quality.py --selftest`
 - 全部 7 组单测 + e2e 19 项断言 ALL PASS
+
+2026-11-02 分块丢说话人修复与实跑验证（pyannote 模型首次在本机落地）：
+- 素材：31.4 秒双人交替会议音频（Windows TTS + rubberband 降调模拟第二人），带人工标注 `.ref.json`
+- 整段不分块：G0→A、G1→B，DER **13.61%**（漏检 0s / 误报 0s / 混淆 0.12s）。人物归属零错误，误差全在边界
+- 分块后修复前：chunk=20s 多出 G2（同一人拆成两个标签），chunk=15s 时 G1 混了 A 和 B（两人合并）
+- 修复后：chunk=900s / 30s / 20s 均正确分出两人并映射到 A/B；chunk=15s、10s 仍会失败，因为短块内 pyannote 自身聚不出多人（强制 `num_speakers=2` 也无效），已加 30 秒下限提示
+- 完整管线实跑：`--meeting --diarize-engine pyannote --num-speakers 2 --names` 15.1 秒产出会议原文，时间戳、人名映射、docx 排版全部正确
+- e2e 19 项断言 ALL PASS；9 组单测 ALL PASS
 
 2026-10-01 健壮性改动后实测：`test_pipeline_e2e.py` 17 项断言 **ALL PASS**（自动合成 TTS 视频走完整链路，37 秒）。
 
@@ -280,7 +288,7 @@ Demucs 子进程 `HF_HUB_OFFLINE=1`（离线环境省约 30 秒 HuggingFace 重�
 - **三层声纹防护**（cam++ 引擎）：碎段合并（<400ms）→ 超长段切分（>60s，保批量转写吞吐）→ 小簇吸收（<5s 的碎簇并入最相似大簇）。
 - **pyannote 优先**：实测真实会议抢话交叠场景，pyannote 分离质量显著优于声纹聚类路线。
 - **切点吸附静音**：超长段切分不再纯等分——在每个理想切点前后搜 50ms 窗的最低能量位置，把切点移到声门闭合处。实测等分点常落在词中间，接缝处出现残字或重复；吸附后跨句截断明显减少。纯函数无音频时退化为等分（保持可测）。
-- **分块降内存**：pyannote 整段波形按时长线性占内存（16k 单声道 float32 约 230MB/小时，再复制一份翻倍）。超 15 分钟自动分块，块间留 30 秒重叠，用重叠区的回合重合量把各块局部标签并到全局标签——不映射就会凭空多出说话人。
+- **分块降内存**：pyannote 整段波形按时长线性占内存（16k 单声道 float32 约 230MB/小时，再复制一份翻倍）。超 15 分钟自动分块，块间留 30 秒重叠，用 pyannote 自带的 WeSpeaker 声纹把各块局部标签并到全局标签——同一人跨块会各自得到独立标签，不映射就会凭空多出说话人。声纹按段独立判定，与块边界位置无关；时间重合投票只作声纹不可用时的兜底，它在块边界正好切在换人处时会投错边。块长低于 30 秒会提示：实测 10 秒块内 pyannote 会把两人合并成单标签，且强制人数约束也救不回来。
 - **重叠不强行归属**：`get_overlap()` 的区间单独写进 `overlaps` 字段。抢话段交给两人中任意一个都是错的，标记出来比二选一诚实。
 - **torchcodec 规避**：pyannote 引入的 torchcodec 与静态 FFmpeg 不兼容；链路用 soundfile 预载波形绕过，建议 `pip uninstall torchcodec`。
 - **AED 显存三层防护**（v2.1）：FireRedASR2-AED 引擎经 `firered_mem_patch.py` 分块注意力（softmax 按行独立，数学等价）+ 时长感知分批（`AED_BATCH_BUDGET_S`）+ OOM 拆批/静音点二分兜底，再配 bf16（`use_half=True`）与 decoder 三角 mask 缓存；实测 4×107s 批量峰值显存 11.8GB → 3.5GB、推理提速 3 倍（不改官方源码，monkey-patch 可还原）。
