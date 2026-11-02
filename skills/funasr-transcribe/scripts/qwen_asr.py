@@ -80,6 +80,11 @@ PYANNOTE_OVERLAP_S = 30    # 块间重叠(秒)，供跨块说话人标签映射
 PYANNOTE_EMB_THRESHOLD = 0.5   # 跨块声纹同人判定阈值（实测同人 0.72-0.77 / 异人 0.11-0.17）
 PYANNOTE_MIN_CHUNK_S = 30  # 块长下限(秒)：实测 10s 块内 pyannote 把两人合并成单标签，
                            # 且强制 num_speakers=2 也救不回来（上下文太短，聚类无从展开）
+
+# 转写结果 JSON 的 schema 版本。lines 结构一旦改动就升这个号；读取方（主脚本缓存复用、
+# benchmark_quality.py）按版本决定能否消费，版本不认识就按未命中处理重转，
+# 避免旧缓存字段对不上时静默丢信息。改字段请同步 SCHEMA_VERSION 与 _schema_ok。
+SCHEMA_VERSION = 1
 # Qwen3 强制对齐模型（--align-engine native 时用；与 ASR 主模型分开，需另行下载约 1.2GB）
 ALIGNER_MS = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / \
     "Qwen--Qwen3-ForcedAligner-0.6B" / "snapshots" / "master"
@@ -468,13 +473,14 @@ def run_cloud_message(args, out_json, out_srt, matcher, t2s, itn_fn, log, t0, au
                for a, u in zip(aligns, units))
     text = "".join(u["text"] for u in units)
     print(text)
-    payload = {"language": None, "text": text, "engine": CLOUD_MODELS["message"],
+    payload = {"schema_version": SCHEMA_VERSION, "language": None, "text": text,
+               "engine": CLOUD_MODELS["message"],
                "audio": str(Path(os.path.realpath(args.audio))),
                "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "text": u["text"]} for u in units]}
-    if args.srt:
+    if args.srt or getattr(args, "vtt", False):
         subs = subtitle_units(units, aligns if good else None, args.max_line)
         payload["sentences"] = subs
-        write_srt(subs, out_srt, use_speaker=False)
+        write_subtitles(subs, args, out_srt, use_speaker=False)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
         + (f", 字幕: {out_srt}" if args.srt else ""))
@@ -541,12 +547,13 @@ def run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, lo
     if matcher or t2s is not None or itn_fn is not None:
         text = "".join(u["text"] for u in units) or text
     print(text)
-    payload = {"language": args.language, "text": text, "engine": CLOUD_MODELS["filetrans"],
+    payload = {"schema_version": SCHEMA_VERSION, "language": args.language, "text": text,
+               "engine": CLOUD_MODELS["filetrans"],
                "audio": str(audio_path), "url": args.cloud_url,
                "segments": [{k: u[k] for k in ("start_ms", "end_ms", "text", "spk")} for u in units]}
-    if args.srt:
+    if args.srt or getattr(args, "vtt", False):
         payload["sentences"] = units
-        write_srt(units, out_srt, use_speaker=args.diarize)
+        write_subtitles(units, args, out_srt, use_speaker=args.diarize)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
         + (f", 字幕: {out_srt}" if args.srt else ""))
@@ -768,14 +775,53 @@ def fmt_srt_ts(ms):
     return f"{ms // 3600000:02d}:{ms % 3600000 // 60000:02d}:{ms % 60000 // 1000:02d},{ms % 1000:03d}"
 
 
-def write_srt(subs, path, use_speaker):
-    blocks = []
-    for i, s in enumerate(subs, 1):
+def fmt_vtt_ts(ms):
+    """WebVTT 时间戳：与 SRT 同布局，但毫秒用点号而非逗号（用逗号浏览器不解析）"""
+    return fmt_srt_ts(ms).replace(",", ".")
+
+
+def _subtitle_cues(subs, use_speaker):
+    """把字幕单元整理成 [(text, start_ms, end_ms)]，SRT 与 VTT 共用，避免两套格式走偏"""
+    cues = []
+    for s in subs:
         label = ""
         if use_speaker and (s.get("spk_name") or s.get("spk") is not None):
             label = f"[{s.get('spk_name') or ('说话人' + str(s['spk']))}] "
-        blocks.append(f"{i}\n{fmt_srt_ts(s['start_ms'])} --> {fmt_srt_ts(s['end_ms'])}\n{label}{s['text']}\n")
+        cues.append((f"{label}{s['text']}", s["start_ms"], s["end_ms"]))
+    return cues
+
+
+def write_srt(subs, path, use_speaker):
+    blocks = []
+    for i, (text, start, end) in enumerate(_subtitle_cues(subs, use_speaker), 1):
+        blocks.append(f"{i}\n{fmt_srt_ts(start)} --> {fmt_srt_ts(end)}\n{text}\n")
     path.write_text("\n".join(blocks), encoding="utf-8")
+
+
+def write_vtt(subs, path, use_speaker):
+    """WebVTT：HTML5 <track> 与各家视频平台直接吃，SRT 不行。
+    首行必须是 WEBVTT，其后空行再进 cue；cue 可不带序号，带了也不影响兼容性。"""
+    lines = ["WEBVTT", ""]
+    for i, (text, start, end) in enumerate(_subtitle_cues(subs, use_speaker), 1):
+        lines.append(str(i))
+        lines.append(f"{fmt_vtt_ts(start)} --> {fmt_vtt_ts(end)}")
+        lines.append(text)
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_subtitles(subs, args, out_srt, use_speaker):
+    """按 --srt / --vtt 写字幕文件，返回实际写出的路径列表。
+    两种格式共用同一份 cue 数据与一次对齐成本，同时开就同时出，不重复跑对齐。"""
+    written = []
+    if args.srt:
+        write_srt(subs, out_srt, use_speaker)
+        written.append(out_srt)
+    if getattr(args, "vtt", False):
+        out_vtt = out_srt.with_suffix(".vtt")
+        write_vtt(subs, out_vtt, use_speaker)
+        written.append(out_vtt)
+    return written
 
 
 def merge_short_segments(segments, min_ms, gap_ms):
@@ -1494,7 +1540,7 @@ def run_align_only(args, src, log, t0, audio_path, out_json, out_srt):
     if not subs:
         sys.exit("对齐未产出可用字幕")
     payload["sentences"] = subs
-    write_srt(subs, out_srt, use_speaker=True)
+    write_subtitles(subs, args, out_srt, use_speaker=True)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[2] 仅对齐完成：字幕 {out_srt.name}（{len(subs)} 条），结果已回写 {out_json.name}"
         f"（总耗时 {time.time()-t0:.0f}s）")
@@ -1515,6 +1561,8 @@ def main():
                     help="把本次纠错条目合并写回词典:裸写或 auto=音频同目录 replace_dict.txt,也可给显式路径(键相同以新值为准)")
     ap.add_argument("--fuzzy", action="store_true", help="纠错启用拼音模糊匹配（需 pypinyin+rapidfuzz）")
     ap.add_argument("--srt", action="store_true", help="额外输出 .srt 字幕（加载 fa-zh 强制对齐出字级时间戳）")
+    ap.add_argument("--vtt", action="store_true",
+                    help="额外输出 .vtt 字幕（WebVTT，HTML5 <track> 与视频平台直接可用）；与 --srt 同源同成本")
     ap.add_argument("--max-line", type=int, default=28, help="单条字幕最大字数(默认28)")
     ap.add_argument("--names", default=None, help="说话人重命名,如 '0=张三,1=李四'")
     ap.add_argument("--merge-gap", type=int, default=800, help="相邻同说话人合并间隔阈值ms(默认800,设0关闭)")
@@ -1616,7 +1664,8 @@ def main():
     # 输出路径锁定在音频同目录(派生后显式校验目录边界)
     out_json = audio_path.with_suffix(".json")
     out_srt = audio_path.with_suffix(".srt")
-    for p in (out_json, out_srt):
+    out_vtt = audio_path.with_suffix(".vtt")
+    for p in (out_json, out_srt, out_vtt):
         if p.parent != audio_path.parent:
             sys.exit("输出路径越出音频目录,已终止")
     hotwords = "、".join(w.strip() for w in args.hotwords.split(",") if w.strip()) if args.hotwords else None
@@ -1830,14 +1879,15 @@ def main():
             print("\n".join(texts))
             langs = [p.get("language") for p in parsed if p.get("language")]
             main_lang = max(set(langs), key=langs.count) if langs else None
-            payload = {"language": main_lang, "text": "\n".join(texts), "engine": _engine_tag,
+            payload = {"schema_version": SCHEMA_VERSION, "language": main_lang,
+                       "text": "\n".join(texts), "engine": _engine_tag,
                        "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "language": u.get("language"),
                                      "text": u["text"]} for u in units]}
             if aligns is not None:
                 payload["sentences"] = subtitle_units(units, aligns, args.max_line)
             out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             if aligns is not None:
-                write_srt(payload["sentences"], out_srt, use_speaker=False)
+                write_subtitles(payload["sentences"], args, out_srt, use_speaker=False)
             log(f"[3] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
                 + (f", 字幕: {out_srt}" if aligns is not None else ""))
             return
@@ -1847,7 +1897,8 @@ def main():
         print(f"[{lang}] {res['transcription']}")
         u = {"start_ms": 0, "end_ms": int(duration_s * 1000), "text": res["transcription"],
              "spk": None, "spk_name": None}
-        payload = {"language": res.get("language"), "text": res["transcription"],
+        payload = {"schema_version": SCHEMA_VERSION, "language": res.get("language"),
+                   "text": res["transcription"],
                    "engine": _engine_tag}
         if use_aed and aed_ts_usable([res]):
             aligns = aed_aligns_from([res])
@@ -1859,7 +1910,7 @@ def main():
         fa = None; qwen_aligner = None; gc_cuda()   # 对齐已完成
         if aligns:
             payload["sentences"] = subtitle_units([u], aligns, args.max_line)
-            write_srt(payload["sentences"], out_srt, use_speaker=False)
+            write_subtitles(payload["sentences"], args, out_srt, use_speaker=False)
         out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
             + (f", 字幕: {out_srt}" if payload.get("sentences") else ""))
@@ -2037,7 +2088,7 @@ def main():
     emotions = analyze_emotion(audio_path, args.device) if args.emotion else None
     if emotions:
         log("[5b] 情绪分析: " + "、".join(f"{e['label']} {e['score']:.2f}" for e in emotions))
-    payload = {"engine": _engine_tag, "audio": str(audio_path),
+    payload = {"schema_version": SCHEMA_VERSION, "engine": _engine_tag, "audio": str(audio_path),
                "speakers": names or None, "lines": lines}
     if overlaps:
         # 重叠区间（两人及以上同时发言）：只做标记不改归属。纪要提炼时它是"这段在抢话"
@@ -2049,7 +2100,7 @@ def main():
     if aligns is not None:
         subs = subtitle_units(units, aligns, args.max_line)
         payload["sentences"] = subs
-        write_srt(subs, out_srt, use_speaker=True)
+        write_subtitles(subs, args, out_srt, use_speaker=True)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[6] 结构化结果已保存: {out_json}" + (f", 字幕: {out_srt}" if aligns is not None else "")
         + f"  (总耗时 {time.time()-t0:.0f}s)")
