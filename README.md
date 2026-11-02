@@ -1,4 +1,4 @@
-# 音视频 → 转写文稿 / 结构化总结（av-to-transcript-and-minutes）
+# 音视频 → 转写文稿 / 结构化总结（Av-To-Transcript-And-Minutes）
 
 一套**默认完全离线、本地运行**的「音视频 → 转写文稿 / 结构化总结」全流程工具箱（亦可选接阿里云百炼云端 ASR 引擎）：
 
@@ -169,7 +169,7 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 ## 🧩 项目结构
 
 ```
-av-to-transcript-and-minutes/
+Av-To-Transcript-And-Minutes/
 ├── av_to_transcript_and_minutes.py  # 全自动链路主脚本（①→⑤）
 ├── test_pipeline_e2e.py             # 端到端回归（自动合成素材，17 项断言）
 ├── hotwords.example.txt             # 热词表示例（复制为 hotwords.txt 自动加载）

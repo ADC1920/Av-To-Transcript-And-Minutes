@@ -1,15 +1,15 @@
 # Agent 日志 · Av-To-Transcript-And-Minutes
 
-> 权威承载：项目根 `.git`（GitHub ADC1920/av-to-transcript-and-minutes）+ 本文件
+> 权威承载：项目根 `.git`（GitHub ADC1920/Av-To-Transcript-And-Minutes）+ 本文件
 > 通用规则见全局 `~/.zcode/AGENTS.md`
 
 ## 状态段
 
 - 当前状态：主仓库已从 `Daily Use/publish/av-to-transcript-and-minutes` 整体移入项目根，工作区干净。
-- 分支：`feat/quality-baseline-batch`（当前，已推 origin）+ `main`。原 4 个残留分支已删并打 `backup/*` 标签。
-- 未提交改动：无。原 784 行改动已拆成 5 个提交入库，见流水区。
-- 远端：`origin = https://github.com/ADC1920/av-to-transcript-and-minutes.git`
-- 进行中：PR #11（https://github.com/ADC1920/av-to-transcript-and-minutes/pull/11），CI 6 项全绿，待合并。
+- 分支：`main`（当前）。PR #11 已合并（merge commit `b655448`），`feat/quality-baseline-batch` 已并入。
+- 未提交改动：无。原 784 行改动已拆成 6 个提交入库。
+- 远端：`origin = https://github.com/ADC1920/Av-To-Transcript-And-Minutes.git`（2026-11-02 由小写名改来，旧 URL 仍重定向）
+- 待补验证：pyannote 实跑与端到端 e2e。
 
 ## 本机归集目录（不入库，见 .gitignore）
 
