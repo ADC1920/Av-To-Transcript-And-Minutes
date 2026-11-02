@@ -21,13 +21,19 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
       - name: ITN 单测（零依赖）
         run: python skills/funasr-transcribe/scripts/test_itn_zh.py
       - name: cloud 引擎单测（全 mock，零网络）
         run: python skills/funasr-transcribe/scripts/test_cloud_units.py
       - name: 缓存源指纹单测（零依赖）
         run: python skills/funasr-transcribe/scripts/test_cache_fingerprint.py
+      - name: 超长段切分与声纹质心单测（零依赖，仅 numpy）
+        run: python skills/funasr-transcribe/scripts/test_split_and_cluster.py
+      - name: pyannote 分块与重叠区间单测（无 pyannote 时自动跳过）
+        run: python skills/funasr-transcribe/scripts/test_pyannote_chunking.py
+      - name: 基准脚本自检（CER/编辑距离；DER 需 pyannote.metrics，缺则跳过）
+        run: python benchmark_quality.py --selftest
 
   # 纪要技能job：装 python-docx + jsonschema，跑结构校验自检与 golden 用例回归。
   # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，

@@ -20,9 +20,20 @@ demucs>=4.0               # htdemucs 两轨分离（--no-separate 可跳过）
 
 # --- 说话人分离（pyannote 引擎，会议场景推荐）---
 pyannote.audio>=4.0       # community-1 分割模型（重叠语音更准）
+# pyannote.metrics 随 pyannote.audio 装上，供 benchmark_quality.py 算 DER（缺则只算 CER）。
 # 注意：pyannote.audio 会引入 torchcodec，而 torchcodec 要求 FFmpeg full-shared 版；
 # 若报 libtorchcodec 加载失败，执行：pip uninstall torchcodec
 # 本项目用 soundfile 预载波形，不依赖 torchcodec。
+
+# --- 可选：多语言字幕对齐（--align-engine native）---
+# 需另行下载 Qwen/Qwen3-ForcedAligner-0.6B（约 1.2GB）：
+#   python -c "from modelscope import snapshot_download; snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B')"
+# 未下载时字幕自动回落中文专用的 fa-zh；非中文素材必须装它，否则时间戳错位。
+
+# --- 可选：更完整的 ITN 规则库（--itn-backend wtp）---
+# WeTextProcessing 依赖 pynini，而 pynini 在 PyPI 只有源码包，Windows 下需 MSVC 编译。
+# 装不上不影响使用：ITN 回落自写零依赖规则（覆盖窄一些）。
+# WeTextProcessing
 
 # --- 文稿排版（article-format 技能，按需）---
 python-docx               # 生成规范 docx
