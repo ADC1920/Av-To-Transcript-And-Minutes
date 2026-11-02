@@ -5,10 +5,15 @@
 # GPU 加速需先按 https://pytorch.org 指引安装对应 CUDA 版本的 torch。
 
 # --- 语音转写（核心）---
-torch>=2.0                # 需 CUDA 版以获得 GPU 加速（CPU 亦可运行，速度慢）
-torchaudio                # 音频读写（与 torch 版本配套）
-transformers>=4.45        # Qwen3-ASR 模型加载（需支持 Qwen3ASRForConditionalGeneration）
-funasr>=1.1               # VAD 切段 / cam++ 声纹 / ct-punc 标点 / fa-zh 强制对齐
+# 上界不是洁癖，是防止上游大版本改接口把管线打穿。已知会踩的：
+#   transformers 大版本可能改 processor.decode(return_format="parsed") 的返回结构；
+#   funasr 1.x → 2.x 会动 AutoModel.generate 的入参与时间戳格式；
+#   torch 2.x 升 3.x 会破坏 stack-level API 与 CUDA 轮子兼容。
+# 上界放宽的时机：实测新大版本跑通全部单测 + e2e 后。
+torch>=2.0,<3.0           # 需 CUDA 版以获得 GPU 加速（CPU 亦可运行，速度慢）
+torchaudio>=2.0,<3.0      # 音频读写（与 torch 版本配套）
+transformers>=4.45,<6.0   # Qwen3-ASR 模型加载（需支持 Qwen3ASRForConditionalGeneration）
+funasr>=1.1,<2.0          # VAD 切段 / cam++ 声纹 / ct-punc 标点 / fa-zh 强制对齐
 librosa                   # 音频重采样
 soundfile                 # wav 读写
 numpy
@@ -16,10 +21,10 @@ scikit-learn              # 声纹层次聚类（cam++ 引擎）
 opencc-python-reimplemented  # 繁→简转换（默认启用）
 
 # --- 人声/背景音分离 ---
-demucs>=4.0               # htdemucs 两轨分离（--no-separate 可跳过）
+demucs>=4.0,<5.0          # htdemucs 两轨分离（--no-separate 可跳过）
 
 # --- 说话人分离（pyannote 引擎，会议场景推荐）---
-pyannote.audio>=4.0       # community-1 分割模型（重叠语音更准）
+pyannote.audio>=4.0,<5.0  # community-1 分割模型（重叠语音更准）
 # pyannote.metrics 随 pyannote.audio 装上，供 benchmark_quality.py 算 DER（缺则只算 CER）。
 # 注意：pyannote.audio 会引入 torchcodec，而 torchcodec 要求 FFmpeg full-shared 版；
 # 若报 libtorchcodec 加载失败，执行：pip uninstall torchcodec

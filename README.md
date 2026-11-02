@@ -37,7 +37,7 @@ python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输
   - `campp`（VAD + cam++ 声纹聚类）——轻量，单人/访谈素材够用
   - **长音频分块**：超过 15 分钟自动分块分析（`--pyannote-chunk-s` 可调，0 关闭），块间带 30 秒重叠，跨块用声纹相似度合并说话人标签，内存峰值只与块长相关而非总时长
 - **声纹库双引擎通用**：`--speaker-db` 原先只有 campp 可用，现在 pyannote 路径会在已定段边界上补算声纹，两条路线都能跨文件复用说话人身份
-- **字幕与纠错**：`--srt` 出字级时间戳字幕；`--replace` 确定性专名纠错（比 `--hotwords` 偏置可靠）；`--replace-file` / `--replace-save` 纠错词典读取与回写（本次纠错条目自动并入词典，下次自动带上）；`--names` 说话人真名映射；`--asr-extra` 透传其余引擎参数
+- **字幕与纠错**：`--srt` 出字级时间戳字幕，`--vtt` 出 WebVTT（HTML5 `<track>` 与视频平台直接可用，与 `--srt` 共用一次对齐可同时开）；`--replace` 确定性专名纠错（比 `--hotwords` 偏置可靠）；`--replace-file` / `--replace-save` 纠错词典读取与回写（本次纠错条目自动并入词典，下次自动带上）；`--names` 说话人真名映射；`--asr-extra` 透传其余引擎参数
 - **字幕对齐后端可选**：`--align-engine auto|fa-zh|native`——`native` 用 Qwen3-ForcedAligner-0.6B，覆盖 11 种语言；`fa-zh` 是中文专用的 38M 模型。默认 auto（有 Qwen 对齐器就用，没有回落 fa-zh）。**中文以外素材必须用 native**，fa-zh 会产出错位时间戳
 - **补字幕不重转**：字幕已移出缓存键。先跑转写、事后加 `--srt`，只补一遍对齐（实测 15.3s → 9.0s），不会重跑最贵的识别环节
 - **ITN 后端可选**：`--itn-backend auto|wtp|legacy`——装了 WeTextProcessing 就走它（货币/度量/分数表达更全），没装继续用零依赖自写规则
@@ -202,6 +202,12 @@ Av-To-Transcript-And-Minutes/
 # 端到端回归（自动合成 TTS 测试素材，断言全链路产物）
 python test_pipeline_e2e.py
 
+# 质量基线（带标注合成素材：DER / CER / 重叠检测；素材缺失会自动生成）
+python tests/test_quality_baseline.py
+
+# 合成回归素材（双人对话+DER 标注 / 抢话 / 单人 / 低信噪；音频不入库，现场生成）
+python scripts/make_fixtures.py
+
 # 引擎单元测试（切句/时间戳/碎段合并/超长切分/小簇吸收等纯逻辑）
 python skills/funasr-transcribe/scripts/test_qwen_asr_units.py
 
@@ -218,7 +224,10 @@ python benchmark_quality.py --selftest
 ### 质量基准（DER / CER）
 
 合成素材只能验证"管道不炸"，验不出"转得准不准"。改任何一项（切分策略、说话人数、
-声纹库、对齐后端）之前，先攒几份带人工标注的真实素材做基线，否则无法判断改动是变好还是变坏。
+声纹库、对齐后端）之前，先攒几份带标注的素材做基线，否则无法判断改动是变好还是变坏。
+
+**素材来源**：`scripts/make_fixtures.py` 现场合成（音频本体不入库，可复现）。两类素材：
+带 `ref.json` 标注的用于算 DER/CER，抢话素材只验重叠检测（重叠段归属本身无唯一解）。
 
 标注放在素材同目录，命名 `<素材名>.ref.json`：
 
@@ -257,6 +266,18 @@ DER 用 pyannote.metrics 的标准实现（0.25 秒 collar 容差），CER 自�
 - 修复后：chunk=900s / 30s / 20s 均正确分出两人并映射到 A/B；chunk=15s、10s 仍会失败，因为短块内 pyannote 自身聚不出多人（强制 `num_speakers=2` 也无效），已加 30 秒下限提示
 - 完整管线实跑：`--meeting --diarize-engine pyannote --num-speakers 2 --names` 15.1 秒产出会议原文，时间戳、人名映射、docx 排版全部正确
 - e2e 19 项断言 ALL PASS；9 组单测 ALL PASS
+
+2026-11-02 质量基线落地（4 项工程改进）：
+- `scripts/make_fixtures.py` 合成四类素材：双人对话（带 DER 标注）、抢话、单人、低信噪。
+  两个说话人靠语速 + 变调拉开（本机另一系统音色 Zira 是 en-US，念中文产出 0 帧，已踩过）
+- `tests/test_quality_baseline.py` 实测：**DER 9.86%**（pyannote.metrics 标准口径，0.25s collar）、
+  **CER 0**、重叠检测 1 处 5.4 秒
+- 结果 JSON 加 `schema_version`，四处 payload（分离 / 无分离 / 云端 message / filetransfer）全覆盖；
+  缓存读取按版本校验，版本不认识就重转，不再把结构变了的旧数据当结果用
+- 新增 `--vtt`：WebVTT 与 SRT 共用一次对齐、可同时开；只加 `--vtt` 时按缓存 sentences 直接重排，
+  不重跑对齐（此前只出 srt 的素材补 vtt 会白跑一遍 GPU）
+- 依赖加上界（torch/transformers/funasr/demucs/pyannote.audio），防上游大版本改接口打穿管线
+- 本机 11 组测试 ALL PASS
 
 2026-10-01 健壮性改动后实测：`test_pipeline_e2e.py` 17 项断言 **ALL PASS**（自动合成 TTS 视频走完整链路，37 秒）。
 

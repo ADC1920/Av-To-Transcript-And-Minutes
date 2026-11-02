@@ -55,3 +55,6 @@ out/
 
 # 一次性中间产物
 .tmp/
+
+# 合成测试素材：音频本体与标注都是可复现产物，由 scripts/make_fixtures.py 现场生成
+# （.tmp/fixtures/ 已被上面的 .tmp/ 覆盖，此处仅作说明；如需改放别处请同步本规则）
