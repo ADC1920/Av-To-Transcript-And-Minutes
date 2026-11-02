@@ -92,12 +92,86 @@ def test_merge_spans():
     check("空输入", q._merge_spans([]) == [])
 
 
+def _vec(*xs):
+    """造归一化向量，省得单测里写 numpy"""
+    import math
+    n = math.sqrt(sum(x * x for x in xs))
+    return [x / n for x in xs]
+
+
+def test_embed_mapping():
+    """跨块声纹映射：这层原先完全没覆盖，分块丢说话人的 bug 就是从这里漏过去的"""
+    print("[4] 跨块声纹标签映射")
+
+    # 两人声纹正交：A=(1,0) B=(0,1)
+    A, B = _vec(1, 0), _vec(0, 1)
+    global_cents = {"G0": A, "G1": B}
+
+    m = q.map_labels_by_embedding({"S0": A, "S1": B}, global_cents)
+    check("同人正确认领", m == {"S0": "G0", "S1": "G1"}, m)
+
+    m = q.map_labels_by_embedding({"S1": B, "S0": A}, global_cents)
+    check("顺序无关", m == {"S1": "G1", "S0": "G0"}, m)
+
+    # 全新的人（与两人都不像）不该被硬塞给已有标签。
+    # 三维空间里 C 与 A、B 都接近正交，相似度 ~0，远低于阈值。
+    C = _vec(0, 0, 1)
+    m = q.map_labels_by_embedding({"S2": C}, {"G0": _vec(1, 0, 0), "G1": _vec(0, 1, 0)})
+    check("陌生人不大最低相似度标签", m == {}, m)
+
+    # 一个全局标签只能被认领一次
+    m = q.map_labels_by_embedding({"S0": A, "S1": A}, global_cents)
+    check("一对一不重复认领", len(m) == 1 and m["S0"] == "G0", m)
+
+    # 阈值高于实际相似度时不该认领（A 与 A 相似度 1.0，阈值 1.01 时全拒）
+    m = q.map_labels_by_embedding({"S0": A}, global_cents, threshold=1.01)
+    check("阈值可调", m == {}, m)
+
+
+def test_time_mapping():
+    """时间投票兜底：块边界切在换人处时它会投错，只作声纹不可用时的后备"""
+    print("[5] 跨块时间投票映射（兜底）")
+
+    prev = [(17000, 18500, "G0"), (18500, 20000, "G1")]
+    raw = [(17000, 18400, "S0"), (18600, 20000, "S1")]
+    m = q.map_labels_by_time(raw, prev, 17000, 20000)
+    check("各自对上", m == {"S0": "G0", "S1": "G1"}, m)
+
+    raw = [(20000, 21000, "S0")]
+    m = q.map_labels_by_time(raw, prev, 17000, 20000)
+    check("窗口外不映射", m == {}, m)
+
+    raw = [(17000, 17100, "S0")]
+    m = q.map_labels_by_time(raw, prev, 17000, 20000, min_overlap_ms=500)
+    check("重合不足拒映射", m == {}, m)
+
+    prev2 = [(17000, 20000, "G0")]
+    raw2 = [(17000, 18500, "S0"), (18500, 20000, "S1")]
+    m = q.map_labels_by_time(raw2, prev2, 17000, 20000)
+    check("一对一不重复认领", len(m) == 1, m)
+
+
+def test_global_centroids():
+    print("[6] 全局标签声纹质心")
+    A = _vec(1, 0)
+    pool = {"G0": [A, A], "G1": [_vec(0, 1)]}
+    c = q._global_label_centroids(pool, {"G0", "G1"})
+    check("两标签都产出", set(c) == {"G0", "G1"}, c)
+    check("质心已归一化", abs(sum(x * x for x in c["G0"]) - 1.0) < 1e-6)
+    c = q._global_label_centroids(pool, {"G0"})
+    check("只取指定标签", set(c) == {"G0"}, c)
+    check("空池不报错", q._global_label_centroids({}, {"G0"}) == {})
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     test_spans()
     test_overlap_api()
     test_merge_spans()
+    test_embed_mapping()
+    test_time_mapping()
+    test_global_centroids()
     print()
     if fails:
         print(f"FAILED ({len(fails)}): {', '.join(fails)}")

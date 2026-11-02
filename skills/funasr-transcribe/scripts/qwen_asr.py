@@ -77,6 +77,9 @@ AED_MAX_SPLIT_DEPTH = 2   # OOM 兜底二分深度上限(2 → 最小拆到原�
 # 块间留重叠：同一说话人跨块会各自得到不同标签，靠重叠区的声纹相似度找回对应关系。
 PYANNOTE_CHUNK_S = 900     # 单块上限(秒)，短于此不分块
 PYANNOTE_OVERLAP_S = 30    # 块间重叠(秒)，供跨块说话人标签映射
+PYANNOTE_EMB_THRESHOLD = 0.5   # 跨块声纹同人判定阈值（实测同人 0.72-0.77 / 异人 0.11-0.17）
+PYANNOTE_MIN_CHUNK_S = 30  # 块长下限(秒)：实测 10s 块内 pyannote 把两人合并成单标签，
+                           # 且强制 num_speakers=2 也救不回来（上下文太短，聚类无从展开）
 # Qwen3 强制对齐模型（--align-engine native 时用；与 ASR 主模型分开，需另行下载约 1.2GB）
 ALIGNER_MS = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / \
     "Qwen--Qwen3-ForcedAligner-0.6B" / "snapshots" / "master"
@@ -1040,6 +1043,104 @@ def centroid_by_label(embeddings, row_labels):
     return out
 
 
+def map_labels_by_embedding(local_cents, global_cents, threshold=None):
+    """按声纹相似度把本块的局部标签映射到全局标签（贪心一对一）。
+
+    local_cents  = {局部标签: 归一化向量}
+    global_cents = {全局标签: 归一化向量}
+    返回 {局部标签: 全局标签}；相似度低于阈值的不映射（调用方会新建全局标签）。
+
+    贪心顺序按相似度从高到低，一个全局标签只能被一个局部标签认领——否则两个局部标签
+    可能同时抢同一个全局标签，把两个不同的人并成一个。
+    """
+    thr = PYANNOTE_EMB_THRESHOLD if threshold is None else threshold
+    cand = []
+    for spk, lc in local_cents.items():
+        for g, gc in global_cents.items():
+            cand.append((float(np.dot(lc, gc)), spk, g))
+    out, taken = {}, set()
+    for sim, spk, g in sorted(cand, key=lambda x: -x[0]):
+        if sim < thr:
+            continue
+        if spk in out or g in taken:
+            continue
+        out[spk] = g
+        taken.add(g)
+    return out
+
+
+def map_labels_by_time(raw, prev, win_lo, win_hi, min_overlap_ms=200):
+    """时间重合投票映射（声纹不可用时的兜底）。
+
+    按局部标签与每个全局标签在重叠窗口内的累计重合毫秒数取最大，贪心一对一。
+    实测缺陷：块边界正好切在换人处时，窗口内两人都出现过，累计毫秒接近就投错边
+    （chunk=15s 时两人被合成一个标签），因此只在声纹路径不可用时才用。
+    """
+    score = {}
+    for s2, e2, spk2 in raw:
+        if e2 <= win_lo or s2 >= win_hi:
+            continue
+        for s1, e1, g1 in prev:
+            ov = min(e1, e2, win_hi) - max(s1, s2, win_lo)
+            if ov > 0:
+                score[(spk2, g1)] = score.get((spk2, g1), 0) + ov
+    out, taken = {}, set()
+    for (spk2, g1), ov in sorted(score.items(), key=lambda kv: -kv[1]):
+        if spk2 in out or g1 in taken or ov < min_overlap_ms:
+            continue      # 重合不足 min_overlap_ms 认定不足以判定同一人，宁可新建
+        out[spk2] = g1
+        taken.add(g1)
+    return out
+
+
+def _global_label_centroids(global_vecs, active_gids):
+    """把已累积的全局标签声纹池聚成质心（均值再 L2 归一化），只取重叠窗口涉及的标签。
+    global_vecs = {全局标签: [向量, ...]}；返回 {全局标签: 归一化质心}"""
+    out = {}
+    for g in active_gids:
+        vecs = global_vecs.get(g)
+        if not vecs:
+            continue
+        cen = np.mean(np.array(vecs), axis=0)
+        n = float(np.linalg.norm(cen))
+        if n > 0:
+            out[g] = cen / n
+    return out
+
+
+def _pyannote_embed_segments(embed_infer, waveform, sr, segments, min_ms=500):
+    """用 pyannote 自带的 WeSpeaker embedding 模型给每段提声纹向量（L2 归一化）。
+
+    为什么不复用 extract_segment_embeddings：那支走 funasr cam++，模型与 pyannote 分割
+    不同源，跨块匹配时声纹空间不一致；且额外加载一份模型要多占显存。pyannote community-1
+    的 pipeline 本就带着 embedding 模型（WeSpeaker ResNet34，256 维），与分割同源，
+    实测同人相似度 0.72–0.77、异人 0.11–0.17，0.5 阈值能干净切开。
+
+    segments 为 [(start_ms, end_ms, ...), ...]，时间单位是**毫秒**（与 run_pyannote 的
+    raw 一致）。返回 {段索引: 归一化向量}；过短段（<min_ms）不成向量，由调用方按最近段归类。
+    """
+    out = {}
+    if embed_infer is None or not len(segments):
+        return out
+    import torch
+    for i, seg in enumerate(segments):
+        s_ms, e_ms = int(seg[0]), int(seg[1])
+        if e_ms - s_ms < min_ms:
+            continue
+        chunk = waveform[int(s_ms * sr / 1000): int(e_ms * sr / 1000)]
+        if chunk.size < int(sr * min_ms / 1000):
+            continue
+        wav = torch.from_numpy(np.asarray(chunk, dtype=np.float32)[None, :])
+        try:
+            vec = np.asarray(embed_infer({"waveform": wav, "sample_rate": sr})).flatten()
+        except Exception:
+            continue          # 单段失败不该整条分离失败，缺这段靠后续时间投票兜底
+        n = float(np.linalg.norm(vec))
+        if n > 0:
+            out[i] = vec / n
+    return out
+
+
 def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers=None,
                  chunk_s=None, overlap_s=None):
     """pyannote 说话人分离（community-1 全套本地模型）。
@@ -1056,9 +1157,13 @@ def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers
 
     长音频分块：整段波形驻留内存随时长线性增长（16k 单声道 float32 约 230MB/小时，
     torch.from_numpy 再复制一份翻倍）。分块后峰值只与块长相关。块间留 overlap_s 重叠，
-    用重叠区的时间重合量把各块的局部标签并到全局标签——同一人跨块会各自得到独立标签，
+    跨块用声纹相似度把各块的局部标签并到全局标签——同一人跨块会各自得到独立标签，
     不映射就会凭空多出说话人。分块时不传 num_speakers：单块内人数可能少于全局，
     硬约束会逼模型把不同人合并或把同一人拆开。
+
+    跨块映射用声纹而非时间重合投票：后者在块边界正好切在换人处时会失效——重叠窗口内
+    两个说话人都出现过，累计毫秒数接近就投错边（实测 chunk=15s 时两人被合成一个标签）。
+    声纹按段独立判定，与切点位置无关。声纹不可用（过短段/模型缺失）时才退回时间投票。
     """
     if not (PYANNOTE_DIR / "config.yaml").is_file():
         sys.exit(f"pyannote community-1 模型不存在: {PYANNOTE_DIR}\n"
@@ -1074,6 +1179,13 @@ def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers
     sr = int(info.samplerate)
     total_s = info.frames / float(sr)
 
+    # 块长下限：太短的块 pyannote 聚不出多人（实测 10s 内两人被合成单标签，
+    # 且下发 num_speakers=2 也无效）。用户显式给了更小值时提示并按真实值跑，
+    # 不擅自改——他可能就是要试小块的内存表现。
+    if 0 < chunk_s < PYANNOTE_MIN_CHUNK_S:
+        print(f"[warn] pyannote 块长 {chunk_s:.0f}s 低于建议下限 {PYANNOTE_MIN_CHUNK_S}s，"
+              f"短块内多人可能被合并成单标签（内存换精度）", file=sys.stderr)
+
     # 重叠必须小于块长，否则步进为 0 或负数会陷入死循环
     if chunk_s > 0 and overlap_s >= chunk_s:
         print(f"[warn] pyannote 块间重叠 {overlap_s}s 不小于块长 {chunk_s}s，已按块长一半处理",
@@ -1083,6 +1195,17 @@ def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers
 
     pipe = Pipeline.from_pretrained(str(PYANNOTE_DIR))
     pipe.to(torch.device(device))
+
+    # 分块才需要跨块声纹映射；整段不分块时省掉这次模型加载
+    embed_infer = None
+    if chunked:
+        from pyannote.audio import Inference, Model
+        try:
+            _emb_model = Model.from_pretrained(str(PYANNOTE_DIR / "embedding"))
+            embed_infer = Inference(_emb_model, window="whole", device=torch.device(device))
+        except Exception as e:
+            print(f"[warn] pyannote 声纹模型加载失败，跨块映射退回时间投票: {e}",
+                  file=sys.stderr)
 
     def call_dia(waveform, whole_file):
         """调用 pipeline；whole_file 为真时才允许断言确切人数"""
@@ -1115,6 +1238,7 @@ def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers
         spans = [(0.0, total_s)]
 
     global_turns, overlap_spans, next_gid = [], [], 0
+    global_vecs = {}      # {全局标签: [声纹向量, ...]}，供后续块做声纹比对
     for idx, (cs, ce) in enumerate(spans):
         data, _ = sf.read(str(src), start=int(cs * sr),
                           frames=int((ce - cs) * sr), dtype="float32", always_2d=False)
@@ -1134,26 +1258,49 @@ def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers
             overlap_spans.append((base_ms + int(round(seg.start * 1000)),
                                   base_ms + int(round(seg.end * 1000))))
 
-        # 跨块标签映射：只看与本块重叠窗口内、上一轮已确定的全局回合，
-        # 按时间重合毫秒数投票；一个全局标签只能被本块一个局部标签认领
+        # 本块全部回合的声纹（块内相对时间；waveform 也是块内波形）。
+        # 分块时才提；整段不分块不需要跨块比对。
+        local_embs_all = {}
+        if embed_infer is not None:
+            local_segs = [(s - base_ms, e - base_ms) for s, e, _ in raw]
+            local_embs_all = _pyannote_embed_segments(embed_infer, data, sr, local_segs)
+
+        # 跨块标签映射：优先声纹，声纹不可用时退回时间重合投票。
+        # 声纹：本块每个局部标签取"重叠窗口内各段向量"的质心，与全局标签质心比相似度，
+        # 取最相似且过阈值的认领。与切点位置无关，块边界正好落在换人处也不受影响。
+        # 时间投票：只作兜底——它按累计毫秒判归属，换人点附近容易投错边。
         mapping = {}
         if idx > 0 and raw:
             win_lo, win_hi = base_ms, base_ms + int(round(overlap_s * 1000))
             prev = [(s, e, g) for s, e, g in global_turns if e > win_lo and s < win_hi]
-            score = {}
-            for s2, e2, spk2 in raw:
-                if e2 <= win_lo or s2 >= win_hi:
-                    continue
-                for s1, e1, g1 in prev:
-                    ov = min(e1, e2, win_hi) - max(s1, s2, win_lo)
-                    if ov > 0:
-                        score[(spk2, g1)] = score.get((spk2, g1), 0) + ov
-            taken = set()
-            for (spk2, g1), ov in sorted(score.items(), key=lambda kv: -kv[1]):
-                if spk2 in mapping or g1 in taken or ov < 200:
-                    continue      # 重合不足 200ms 认定不足以判定同一人，宁可新建
-                mapping[spk2] = g1
-                taken.add(g1)
+            mapped = False
+
+            if local_embs_all and global_vecs:
+                # 局部标签质心用**本块全部段**，不只重叠窗口内的：某人的发言若完全落在
+                # 块的后段（不跨重叠区），窗口里根本没有它的样本，只用窗口样本就会
+                # 认不出它、凭空新建一个全局标签（实测 chunk=20s 多出 G2）。
+                # 声纹按段独立，窗口内外同属一人，全用更稳。
+                win_local = {}
+                for i, (s_ms, e_ms, spk) in enumerate(raw):
+                    if i in local_embs_all:
+                        win_local.setdefault(spk, []).append(local_embs_all[i])
+                local_cents = {}
+                for spk, vecs in win_local.items():
+                    cen = np.mean(np.array(vecs), axis=0)
+                    n = float(np.linalg.norm(cen))
+                    if n > 0:
+                        local_cents[spk] = cen / n
+                if local_cents:
+                    # 声纹比对看**全部**已确定的全局标签，不只重叠窗口内的：
+                    # 窗口只用来挑样本段，若某人本块没在窗口里出现，它仍是候选——
+                    # 跨块身份是全局的，限制在窗口里会让新人凭空新建（实测多出说话人）。
+                    global_cents = _global_label_centroids(
+                        global_vecs, set(global_vecs.keys()))
+                    mapping = map_labels_by_embedding(local_cents, global_cents)
+                    mapped = True
+
+            if not mapped:
+                mapping = map_labels_by_time(raw, prev, win_lo, win_hi)
 
         # 非首块丢弃完全落在重叠区内的回合：那段内容由前一块负责，否则会重复计入
         keep_from = base_ms + int(round(overlap_s * 1000)) if idx > 0 else 0
@@ -1166,6 +1313,14 @@ def run_pyannote(src, device, num_speakers=None, min_speakers=None, max_speakers
                 next_gid += 1
                 mapping[spk] = gid
             global_turns.append((s_ms, e_ms, gid))
+
+        # 累积声纹：把本块各段的向量挂到它最终归属的全局标签上
+        for i, (s_ms, e_ms, spk) in enumerate(raw):
+            if i in local_embs_all and e_ms > keep_from:
+                gid = mapping.get(spk)
+                if gid is None:
+                    continue
+                global_vecs.setdefault(gid, []).append(local_embs_all[i])
         del dia, wav, data
         if chunked:
             print(f"[2] pyannote 分块 {idx + 1}/{len(spans)} 完成"
