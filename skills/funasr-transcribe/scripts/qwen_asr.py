@@ -80,6 +80,11 @@ PYANNOTE_OVERLAP_S = 30    # 块间重叠(秒)，供跨块说话人标签映射
 PYANNOTE_EMB_THRESHOLD = 0.5   # 跨块声纹同人判定阈值（实测同人 0.72-0.77 / 异人 0.11-0.17）
 PYANNOTE_MIN_CHUNK_S = 30  # 块长下限(秒)：实测 10s 块内 pyannote 把两人合并成单标签，
                            # 且强制 num_speakers=2 也救不回来（上下文太短，聚类无从展开）
+
+# 转写结果 JSON 的 schema 版本。lines 结构一旦改动就升这个号；读取方（主脚本缓存复用、
+# benchmark_quality.py）按版本决定能否消费，版本不认识就按未命中处理重转，
+# 避免旧缓存字段对不上时静默丢信息。改字段请同步 SCHEMA_VERSION 与 _schema_ok。
+SCHEMA_VERSION = 1
 # Qwen3 强制对齐模型（--align-engine native 时用；与 ASR 主模型分开，需另行下载约 1.2GB）
 ALIGNER_MS = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / \
     "Qwen--Qwen3-ForcedAligner-0.6B" / "snapshots" / "master"
@@ -468,13 +473,14 @@ def run_cloud_message(args, out_json, out_srt, matcher, t2s, itn_fn, log, t0, au
                for a, u in zip(aligns, units))
     text = "".join(u["text"] for u in units)
     print(text)
-    payload = {"language": None, "text": text, "engine": CLOUD_MODELS["message"],
+    payload = {"schema_version": SCHEMA_VERSION, "language": None, "text": text,
+               "engine": CLOUD_MODELS["message"],
                "audio": str(Path(os.path.realpath(args.audio))),
                "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "text": u["text"]} for u in units]}
-    if args.srt:
+    if args.srt or getattr(args, "vtt", False):
         subs = subtitle_units(units, aligns if good else None, args.max_line)
         payload["sentences"] = subs
-        write_srt(subs, out_srt, use_speaker=False)
+        write_subtitles(subs, args, out_srt, use_speaker=False)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
         + (f", 字幕: {out_srt}" if args.srt else ""))
@@ -541,12 +547,13 @@ def run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, lo
     if matcher or t2s is not None or itn_fn is not None:
         text = "".join(u["text"] for u in units) or text
     print(text)
-    payload = {"language": args.language, "text": text, "engine": CLOUD_MODELS["filetrans"],
+    payload = {"schema_version": SCHEMA_VERSION, "language": args.language, "text": text,
+               "engine": CLOUD_MODELS["filetrans"],
                "audio": str(audio_path), "url": args.cloud_url,
                "segments": [{k: u[k] for k in ("start_ms", "end_ms", "text", "spk")} for u in units]}
-    if args.srt:
+    if args.srt or getattr(args, "vtt", False):
         payload["sentences"] = units
-        write_srt(units, out_srt, use_speaker=args.diarize)
+        write_subtitles(units, args, out_srt, use_speaker=args.diarize)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
         + (f", 字幕: {out_srt}" if args.srt else ""))
@@ -1830,14 +1837,15 @@ def main():
             print("\n".join(texts))
             langs = [p.get("language") for p in parsed if p.get("language")]
             main_lang = max(set(langs), key=langs.count) if langs else None
-            payload = {"language": main_lang, "text": "\n".join(texts), "engine": _engine_tag,
+            payload = {"schema_version": SCHEMA_VERSION, "language": main_lang,
+                       "text": "\n".join(texts), "engine": _engine_tag,
                        "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "language": u.get("language"),
                                      "text": u["text"]} for u in units]}
             if aligns is not None:
                 payload["sentences"] = subtitle_units(units, aligns, args.max_line)
             out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             if aligns is not None:
-                write_srt(payload["sentences"], out_srt, use_speaker=False)
+                write_subtitles(payload["sentences"], args, out_srt, use_speaker=False)
             log(f"[3] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
                 + (f", 字幕: {out_srt}" if aligns is not None else ""))
             return
@@ -1847,7 +1855,8 @@ def main():
         print(f"[{lang}] {res['transcription']}")
         u = {"start_ms": 0, "end_ms": int(duration_s * 1000), "text": res["transcription"],
              "spk": None, "spk_name": None}
-        payload = {"language": res.get("language"), "text": res["transcription"],
+        payload = {"schema_version": SCHEMA_VERSION, "language": res.get("language"),
+                   "text": res["transcription"],
                    "engine": _engine_tag}
         if use_aed and aed_ts_usable([res]):
             aligns = aed_aligns_from([res])
