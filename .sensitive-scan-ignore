@@ -1,0 +1,8 @@
+# 敏感扫描豁免清单
+#
+# 每行格式：<glob> <规则id|*>
+#   只登记确实无害的命中，行尾写清理由。
+
+# qwen_asr.py 中的 dashscope 密钥赋值语句：SDK 标准写法，值由 load 函数
+# 从环境变量或注册表读取，源码内不含字面量
+skills/funasr-transcribe/scripts/qwen_asr.py   cred.assignment

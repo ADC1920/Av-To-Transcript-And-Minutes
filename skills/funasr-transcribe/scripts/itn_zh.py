@@ -167,8 +167,40 @@ _WAN_RE = re.compile(r"(" + _CN_NUM_LAZY + r")(万元|亿元)")
 _NUM_UNIT_RE = re.compile(r"(" + _CN_NUM_LAZY + r")(" + _UNIT_RE + r")")
 
 
-def normalize(text):
-    """对一段文本做 ITN；不匹配的地方原样保留。text 为空返回空。"""
+_WTP_NORMALIZER = None
+_WTP_STATE = "unknown"   # unknown / ready / unavailable
+
+
+def _load_wtp():
+    """惰性加载 WeTextProcessing 的 InverseNormalizer；不可用返回 None。
+
+    WeTextProcessing 依赖 pynini，而 pynini 在 Windows 只有源码包、需 MSVC 编译
+    （本机实测无 cl.exe 时安装失败）。所以它是可选增强而非默认：装了就用覆盖面更全的
+    规则库（货币、度量、分数、时间表达的边界情况比自写规则完善），没装就继续走本文件的
+    零依赖实现，功能不降级、只是覆盖窄一点。
+    """
+    global _WTP_NORMALIZER, _WTP_STATE
+    if _WTP_STATE == "unavailable":
+        return None
+    if _WTP_NORMALIZER is not None:
+        return _WTP_NORMALIZER
+    try:
+        from tn.chinese.normalizer import Normalizer
+        _WTP_NORMALIZER = Normalizer()
+        _WTP_STATE = "ready"
+        return _WTP_NORMALIZER
+    except Exception:
+        _WTP_STATE = "unavailable"
+        return None
+
+
+def wtp_available():
+    """WeTextProcessing 后端是否可用（供调用方决定提示语，不触发加载失败噪音）"""
+    return _load_wtp() is not None
+
+
+def normalize_legacy(text):
+    """零依赖规则实现（原 normalize 的语义，保留作为兜底与对照基线）"""
     if not text:
         return text
     out = _PCT_RE.sub(_sub_pct, text)
@@ -181,9 +213,37 @@ def normalize(text):
     return out
 
 
+def normalize(text, backend="auto"):
+    """对一段文本做 ITN；不匹配的地方原样保留。text 为空返回空。
+
+    backend: auto=有 WeTextProcessing 就用、否则自写规则(默认)；wtp=强制
+    WeTextProcessing(不可用时抛错)；legacy=强制自写规则。
+    """
+    if not text:
+        return text
+    if backend in ("auto", "wtp"):
+        norm = _load_wtp()
+        if norm is not None:
+            try:
+                return norm.normalize(text)
+            except Exception:
+                if backend == "wtp":
+                    raise
+                # wtp 运行期出错时回落自写规则，不让一个异常吞掉整段 ITN
+                return normalize_legacy(text)
+        if backend == "wtp":
+            raise RuntimeError("WeTextProcessing 不可用（需 pynini，Windows 下需 MSVC 编译）")
+    return normalize_legacy(text)
+
+
 if __name__ == "__main__":
     import sys
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    for line in (sys.argv[1:] or [sys.stdin.read()]):
-        print(normalize(line))
+    argv = sys.argv[1:]
+    backend = "auto"
+    if argv and argv[0].startswith("--backend="):
+        backend = argv[0].split("=", 1)[1]
+        argv = argv[1:]
+    for line in (argv or [sys.stdin.read()]):
+        print(normalize(line, backend=backend))

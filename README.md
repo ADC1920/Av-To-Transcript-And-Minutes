@@ -33,10 +33,16 @@ python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输
 - **一条命令全自动**：拆轨 → 分离 → 说话人分离 → 转写 → 排版成 docx
 - **双产出模式**：`转写文稿-<名>.docx`（普通音视频）／`会议原文-<名>.docx`（会议，带 `[分:秒] 说话人N：` 标签）
 - **说话人分离双引擎**：
-  - `pyannote`（community-1，会议场景默认）——分割模型原生处理**重叠语音**，实测真实 28 分钟会议从 35 个假说话人收敛到 2 个
+  - `pyannote`（community-1，会议场景默认）——分割模型原生处理**重叠语音**，实测真实 28 分钟会议从 35 个假说话人收敛到 2 个；支持 `--num-speakers` / `--min-speakers` / `--max-speakers` 下发人数约束（最便宜的精度提升）；重叠区间单独标记进 `overlaps` 字段而不强行归给某一人
   - `campp`（VAD + cam++ 声纹聚类）——轻量，单人/访谈素材够用
+  - **长音频分块**：超过 15 分钟自动分块分析（`--pyannote-chunk-s` 可调，0 关闭），块间带 30 秒重叠做说话人标签映射，内存峰值只与块长相关而非总时长
+- **声纹库双引擎通用**：`--speaker-db` 原先只有 campp 可用，现在 pyannote 路径会在已定段边界上补算声纹，两条路线都能跨文件复用说话人身份
 - **字幕与纠错**：`--srt` 出字级时间戳字幕；`--replace` 确定性专名纠错（比 `--hotwords` 偏置可靠）；`--replace-file` / `--replace-save` 纠错词典读取与回写（本次纠错条目自动并入词典，下次自动带上）；`--names` 说话人真名映射；`--asr-extra` 透传其余引擎参数
-- **断点续跑**：转写（最贵环节）结果按参数指纹缓存——阈值 / 热词 / 人名 / 字幕 / **识别引擎** / 额外 ASR 参数任一不同即互不复用，**切换识别引擎不会误用旧结果**
+- **字幕对齐后端可选**：`--align-engine auto|fa-zh|native`——`native` 用 Qwen3-ForcedAligner-0.6B，覆盖 11 种语言；`fa-zh` 是中文专用的 38M 模型。默认 auto（有 Qwen 对齐器就用，没有回落 fa-zh）。**中文以外素材必须用 native**，fa-zh 会产出错位时间戳
+- **补字幕不重转**：字幕已移出缓存键。先跑转写、事后加 `--srt`，只补一遍对齐（实测 15.3s → 9.0s），不会重跑最贵的识别环节
+- **ITN 后端可选**：`--itn-backend auto|wtp|legacy`——装了 WeTextProcessing 就走它（货币/度量/分数表达更全），没装继续用零依赖自写规则
+- **质量基准**：`benchmark_quality.py` 跑 DER（说话人分离错误率，pyannote.metrics 标准实现）与 CER（字错误率），支持与历史基线对比，回答"这次改动到底变好还是变坏"
+- **断点续跑**：转写（最贵环节）结果按参数指纹缓存——阈值 / 热词 / 人名 / **识别引擎** / 额外 ASR 参数任一不同即互不复用，**切换识别引擎不会误用旧结果**；字幕与对齐后端**不进**缓存键（它们只影响字幕，不影响文本），要字幕时走只补对齐的通道
 - **完成判定与补排版**：md 与 docx 齐备才算完成；首次运行缺 `article-format` 时只出 md，补装后重跑自动只补 docx，无需 `--force` 全量重跑
 - **批量容错与可观测**：单个文件失败只计一次失败并继续（素材损坏、缺 ffmpeg/demucs 都不中断整批）；无音轨素材单独归类提示；批量打印 `[i/N]` 计数与每个素材用时，收尾给总耗时与均值；`--log` 把运行输出落到 `<输出目录>/run.log`
 - **跑前自检与提示**：跑前查显存，可用量低于 4 GB 时提示先停占卡程序或用 `--no-separate`；转写只得到 1 个说话人且用的是默认 campp 时，提示可改用 `--meeting` 或 pyannote 重跑
@@ -104,8 +110,13 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 | 参数 | 说明 |
 | --- | --- |
 | `--meeting` | 产出会议原文（带时间戳+说话人标签）而非普通转写文稿 |
-| `--srt` | 额外产出 `.srt` 字幕（字级时间戳） |
+| `--srt` | 额外产出 `.srt` 字幕（字级时间戳）；事后加不会重转，只补对齐 |
+| `--align-engine auto\|fa-zh\|native` | 字幕对齐后端：`auto` 有 Qwen 对齐器就用否则 fa-zh；`native`=Qwen3-ForcedAligner（多语言）；`fa-zh`=中文专用 |
 | `--diarize-engine auto\|pyannote\|campp` | 说话人分离引擎（`auto`=会议用 pyannote，其余 campp） |
+| `--num-speakers N` | 已知说话人数（pyannote）：人数确定时最准，如两人对谈填 2 |
+| `--min-speakers N` / `--max-speakers N` | 人数区间（pyannote）：人数不确定时用上限挡住过度切分 |
+| `--pyannote-chunk-s N` | pyannote 分块时长上限秒（默认 900，0 关闭）：长素材降内存峰值 |
+| `--itn-backend auto\|wtp\|legacy` | ITN 后端：`auto` 有 WeTextProcessing 就用否则自写规则 |
 | `--asr-engine qwen\|aed\|auto\|cloud` | 识别引擎：`qwen`（默认，多语言）／`aed`（中英粤更准）／`auto` 按语言路由／`cloud` 阿里云百炼云端引擎；**换引擎自动用新缓存重转** |
 | `--no-diarize` | 单人素材跳过说话人分离直接整段转写（更快；云端 message 引擎走整文件一次调用）；与 `--meeting` 互斥 |
 | `--replace "错=>对,错2=>对2"` | 识别后确定性替换，专名纠错比 `--hotwords` 可靠（同音异字配 `--asr-extra "--fuzzy"`） |
@@ -164,16 +175,20 @@ av-to-transcript-and-minutes/
 ├── hotwords.example.txt             # 热词表示例（复制为 hotwords.txt 自动加载）
 ├── replace_dict.example.txt         # 纠错词典示例（复制为 replace_dict.txt 自动加载）
 ├── requirements.txt
+├── benchmark_quality.py             # 质量基准：DER（分离错误率）+ CER（字错误率）
 ├── skills/
 │   ├── funasr-transcribe/
 │   │   ├── SKILL.md                 # 转写技能（Agent 调用规范）
 │   │   └── scripts/
 │   │       ├── qwen_asr.py          # 转写引擎：Qwen3-ASR + pyannote/cam++ + 字幕/纠错
+│   │       ├── itn_zh.py            # 中文逆文本正则化（WeTextProcessing 可选后端）
 │   │       ├── firered_mem_patch.py # AED 引擎分块注意力与显存补丁（v2.1）
 │   │       ├── transcribe.py        # 简化入口
 │   │       ├── diarize.py           # 说话人分离（FunASR 路线）
-│   │       ├── test_qwen_asr_units.py       # 引擎单元测试
-│   │       └── test_firered_mem_patch.py    # AED 显存补丁单测
+│   │       ├── test_qwen_asr_units.py        # 引擎单元测试
+│   │       ├── test_split_and_cluster.py     # 静音点切分与声纹质心
+│   │       ├── test_pyannote_chunking.py     # 分块规划与重叠区间 API
+│   │       └── test_firered_mem_patch.py     # AED 显存补丁单测
 │   └── meeting-notes-expert/
 │       └── SKILL.md                 # 总结整理技能（七节模板，会议/通用双场景）
 └── LICENSE
@@ -189,7 +204,51 @@ python test_pipeline_e2e.py
 
 # 引擎单元测试（切句/时间戳/碎段合并/超长切分/小簇吸收等纯逻辑）
 python skills/funasr-transcribe/scripts/test_qwen_asr_units.py
+
+# 超长段静音点切分与声纹质心（零依赖）
+python skills/funasr-transcribe/scripts/test_split_and_cluster.py
+
+# pyannote 分块规划与重叠区间 API
+python skills/funasr-transcribe/scripts/test_pyannote_chunking.py
+
+# 质量基准自检（CER/编辑距离；DER 需 pyannote.metrics）
+python benchmark_quality.py --selftest
 ```
+
+### 质量基准（DER / CER）
+
+合成素材只能验证"管道不炸"，验不出"转得准不准"。改任何一项（切分策略、说话人数、
+声纹库、对齐后端）之前，先攒几份带人工标注的真实素材做基线，否则无法判断改动是变好还是变坏。
+
+标注放在素材同目录，命名 `<素材名>.ref.json`：
+
+```json
+{
+  "speakers": [
+    {"start_ms": 0,    "end_ms": 5200, "spk": "张三"},
+    {"start_ms": 5200, "end_ms": 9000, "spk": "李四"}
+  ],
+  "text": "这里是完整正确文本，用于算 CER（可省略）"
+}
+```
+
+```bash
+# 评测单份（自动跑管线再比对）
+python benchmark_quality.py 会议录音.m4a --report 基线.json
+
+# 改完代码后对比，看是改善还是退步
+python benchmark_quality.py 会议录音.m4a --report 新.json --compare 基线.json
+```
+
+DER 用 pyannote.metrics 的标准实现（0.25 秒 collar 容差），CER 自写（中文按字、英文按词，
+标点与全半角不计入）。`--no-run` 可只比对已有产物，跳过重跑。
+
+2026-10-28 对标公开方案批次实测：
+- 补字幕通道：首跑 15.3s（含分离+识别），事后加 `--srt` 只补对齐 9.0s，缓存文件数不变（字幕未进键），第三次运行正确跳过
+- pyannote 新参数：`--num-speakers` + 分块（`--pyannote-chunk-s 3`）实跑通过，分块映射正确合并跨块说话人，重叠区间写入 `overlaps` 字段 1 处
+- 声纹库在 pyannote 路径建库成功（此前被硬性跳过）
+- 单测新增三层：`test_split_and_cluster.py`（含抓到的采样索引/毫秒混用缺陷）、`test_pyannote_chunking.py`（锁住 `get_overlap()` 返回 Timeline 可迭代、无 `itersegments` 的实测 API）、`benchmark_quality.py --selftest`
+- 全部 7 组单测 + e2e 19 项断言 ALL PASS
 
 2026-10-01 健壮性改动后实测：`test_pipeline_e2e.py` 17 项断言 **ALL PASS**（自动合成 TTS 视频走完整链路，37 秒）。
 
@@ -220,15 +279,21 @@ Demucs 子进程 `HF_HUB_OFFLINE=1`（离线环境省约 30 秒 HuggingFace 重�
 - **噪声门（必需）**：Demucs 在静音段输出低电平伪影，会让下游 VAD 失效（整段连成一块、说话人分离报废）。链路在分离与转写之间插入 `agate` 噪声门恢复段间真静音。
 - **三层声纹防护**（cam++ 引擎）：碎段合并（<400ms）→ 超长段切分（>60s，保批量转写吞吐）→ 小簇吸收（<5s 的碎簇并入最相似大簇）。
 - **pyannote 优先**：实测真实会议抢话交叠场景，pyannote 分离质量显著优于声纹聚类路线。
+- **切点吸附静音**：超长段切分不再纯等分——在每个理想切点前后搜 50ms 窗的最低能量位置，把切点移到声门闭合处。实测等分点常落在词中间，接缝处出现残字或重复；吸附后跨句截断明显减少。纯函数无音频时退化为等分（保持可测）。
+- **分块降内存**：pyannote 整段波形按时长线性占内存（16k 单声道 float32 约 230MB/小时，再复制一份翻倍）。超 15 分钟自动分块，块间留 30 秒重叠，用重叠区的回合重合量把各块局部标签并到全局标签——不映射就会凭空多出说话人。
+- **重叠不强行归属**：`get_overlap()` 的区间单独写进 `overlaps` 字段。抢话段交给两人中任意一个都是错的，标记出来比二选一诚实。
 - **torchcodec 规避**：pyannote 引入的 torchcodec 与静态 FFmpeg 不兼容；链路用 soundfile 预载波形绕过，建议 `pip uninstall torchcodec`。
 - **AED 显存三层防护**（v2.1）：FireRedASR2-AED 引擎经 `firered_mem_patch.py` 分块注意力（softmax 按行独立，数学等价）+ 时长感知分批（`AED_BATCH_BUDGET_S`）+ OOM 拆批/静音点二分兜底，再配 bf16（`use_half=True`）与 decoder 三角 mask 缓存；实测 4×107s 批量峰值显存 11.8GB → 3.5GB、推理提速 3 倍（不改官方源码，monkey-patch 可还原）。
 
 **已知限制**
 
-- 会议**抢话极严重**时说话人分离仍可能过切（实测 35 簇 → 2 簇已大幅改善，但不保证 100% 准确）
-- 说话人编号在不同次运行间可能互换（可用 `--names` 固定映射）
+- 会议**抢话极严重**时说话人分离仍可能过切（实测 35 簇 → 2 簇已大幅改善，但不保证 100% 准确）；重叠区间只做标记，不拆分同一时段的双人文本
+- 说话人编号在不同次运行间可能互换（可用 `--names` 固定映射；`--speaker-db` 可跨文件复用身份）
 - FireRedASR2-AED 为可选备选引擎，需另行下载模型与代码（v2.1 起长音频已优化，见上）
+- Qwen3-ForcedAligner 需单独下载（约 1.2GB）；未下载时字幕回落到中文专用的 fa-zh，非中文素材会产出错位时间戳
+- WeTextProcessing 依赖 pynini，Windows 下需 MSVC 编译；装不上时 ITN 用自写规则，覆盖窄一些但不影响可用性
 - 输出 docx 的排版规范依赖 `article-format` 技能（未安装时产出标准 docx，无规范排版）
+- 质量基准需要人工标注的真实素材；没有基线时，各项优化的效果只能靠主观判断
 
 ---
 

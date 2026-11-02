@@ -27,7 +27,11 @@
   --asr-engine cloud      换云端引擎 qwen-audio-3.1-asr-message（免显存;换子模型加 --asr-extra "--cloud-model omni|filetrans"）
   --no-separate           纯人声素材跳过 Demucs 分离，直接转写（更快）
   --names "0=张三,1=李四"  固定说话人姓名（先听一段确认谁是谁）
-  --srt                   额外产出字级时间戳字幕
+  --srt                   额外产出字级时间戳字幕（事后加不重转，只补对齐）
+  --align-engine native   多语言字幕对齐（Qwen3-ForcedAligner，需下载）；auto/fa-zh 见 --help
+  --num-speakers N        已知说话人数（pyannote 引擎，最准的人数控法）
+  --pyannote-chunk-s N    pyannote 分块时长（长素材降内存峰值，默认 900，0 关闭）
+  --itn-backend auto      ITN 后端（有 WeTextProcessing 就用，否则自写规则）
   --asr-engine aed        换识别引擎（中/英/粤更准）；换引擎会自动用新缓存重转，不复用旧结果
   --replace "错=>对"       确定性专名纠错（同音异字可配 --asr-extra "--fuzzy"），比热词偏置可靠
   --replace-file [词典.txt]  纠错词典（每行 "错=>对"）；未指定=自动加载根目录 replace_dict.txt；裸写=根目录 replace_dict.txt
@@ -355,12 +359,17 @@ def probe_audio_codec(video: Path) -> str:
 def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=None,
                    srt=False, engine=None, extra=None, tag=None, single=False,
                    dict_hash=None) -> str:
-    """转写缓存文件名：任一影响结果的配置不同 → 缓存不同。
+    """转写缓存文件名：任一影响识别文本的配置不同 → 缓存不同。
+
     识别引擎（qwen/aed）输出的文本不同，是缓存键的必需维度——漏掉它会让人以为换了引擎、
-    实际拿到的是旧引擎结果；热词、人名、字幕、额外 ASR 参数同理不可与默认结果混用。
+    实际拿到的是旧引擎结果；热词、人名、额外 ASR 参数同理不可与默认结果混用。
     tag 用于同一目录内存在多份待转写音频的场景（声道分轨），缺了它两路会命中同一份缓存、
     转出完全相同的文本（实测踩过）。
-    dict_hash = 纠错词典内容哈希：词典更新后旧缓存不再复用（否则新词条对已缓存素材不生效）。"""
+    dict_hash = 纠错词典内容哈希：词典更新后旧缓存不再复用（否则新词条对已缓存素材不生效）。
+
+    srt 刻意不进缓存键：字幕只影响 sentences 字段，lines 的文本完全相同。把 srt 计入键
+    会让"先转写、后补字幕"变成整套重转，白烧最贵的识别环节。需要字幕而缓存里没有时，
+    走 --align-only 只补对齐（见 call_asr）。参数 srt 保留仅为向后兼容调用签名。"""
     parts = []
     if tag:
         parts.append(str(tag))
@@ -378,8 +387,6 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
         parts.append("人名" + hashlib.sha256(names.encode("utf-8")).hexdigest()[:6])
     if dict_hash:
         parts.append("词典" + dict_hash)
-    if srt:
-        parts.append("字幕")
     if extra:
         parts.append("扩展" + hashlib.sha256(" ".join(extra).encode("utf-8")).hexdigest()[:6])
     return "转写结果" + ("_" + "_".join(parts) if parts else "") + ".json"
@@ -405,6 +412,39 @@ def audio_fingerprint(path: Path) -> str:
         return ""
 
 
+def _align_srt_only(vocals: Path, cache_json: Path, opts: dict):
+    """缓存已有转写、但没有字幕时，只补一遍对齐（--align-only），不重跑识别。
+
+    补字幕的本质只是时间对齐，识别文本完全复用缓存。把这条路径单独开出来，
+    才能让 srt 安全地移出缓存键：不然"先前跑过没字幕、现在要字幕"就得整套重转。
+    补出的 sentences 写回缓存，下次直接命中，不会每次重算。
+    """
+    raw_srt = vocals.with_suffix(".srt")
+    cmd = [sys.executable, str(asr_script()), str(vocals),
+           "--align-only", str(cache_json)]
+    align_engine = opts.get("align_engine")
+    if align_engine:
+        cmd += ["--align-engine", align_engine]
+    if opts.get("language"):
+        cmd += ["--language", str(opts["language"])]
+    if opts.get("max_line"):
+        cmd += ["--max-line", str(opts["max_line"])]
+    print(f"[补字幕] {vocals.name}：缓存已有转写，只跑对齐不重转", file=sys.stderr)
+    try:
+        run_child(cmd, verbose=bool(opts.get("verbose")), env=child_env())
+    except subprocess.CalledProcessError:
+        # 对齐失败不该让整份素材判失败：转写成果是有效的，只是没字幕
+        print(f"[补字幕] {vocals.name}：对齐失败，本次产出无字幕（转写结果不受影响）",
+              file=sys.stderr)
+        return _read_json(cache_json)
+    payload = _read_json(cache_json)
+    if payload and raw_srt.exists():
+        keep = vocals.parent / (vocals.stem + ".srt")
+        if raw_srt != keep:
+            shutil.move(str(raw_srt), str(keep))
+    return payload
+
+
 def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     """调 qwen_asr.py 转写（默认 --diarize：说话人分离；opts.no_diarize=True 跳过），返回结构化 JSON。
     opts 键：threshold / diarize_engine / hotwords / names / srt / engine（识别引擎）/ no_diarize
@@ -419,11 +459,31 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     缓存读失败（写缓存时被杀、磁盘满留下半截 json）按未命中处理并重转，不让一份
     坏缓存把这份素材永久卡死；写缓存一律先写 .tmp 再 os.replace，避免留下半截文件。"""
     extra = list(opts.get("extra") or [])
+    # 纯字幕参数不进缓存键：它们只影响 sentences/.srt，不影响 lines 的文本。
+    # 计入键会让"换对齐后端"或"调字幕字数"变成整套重转；正确做法是命中缓存后补对齐通道。
+    SUBTITLE_ONLY_ARGS = {"--align-engine", "--max-line"}
+    key_extra = []
+    _skip = False
+    for tok in extra:
+        if _skip:
+            _skip = False
+            continue
+        if tok in SUBTITLE_ONLY_ARGS:
+            _skip = True
+            continue
+        key_extra.append(tok)
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
-        opts.get("names"), bool(opts.get("srt")), opts.get("engine"), extra, tag,
+        opts.get("names"), bool(opts.get("srt")), opts.get("engine"), key_extra, tag,
         single=bool(opts.get("no_diarize")), dict_hash=opts.get("dict_hash"))
     source_fp = audio_fingerprint(vocals)
+
+    def _need_srt(payload):
+        """本素材要字幕、而缓存里没有 sentences 时，补一次对齐（不重转）"""
+        if not opts.get("srt") or (payload or {}).get("sentences"):
+            return payload
+        return _align_srt_only(vocals, cache_json, opts)
+
     if cache_json.exists() and not force:
         payload = _read_json(cache_json)
         if payload is not None:
@@ -431,9 +491,9 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
             if not cached_fp:
                 payload["_source_fp"] = source_fp
                 _write_json(cache_json, payload)
-                return payload
+                return _need_srt(payload)
             if cached_fp == source_fp:
-                return payload
+                return _need_srt(payload)
             print(f"[缓存] {vocals.name} 源音频已变化（指纹 {cached_fp}→{source_fp}），重转",
                   file=sys.stderr)
         else:
@@ -532,7 +592,11 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     out_stem = f"会议原文-{stem}" if (meeting or opts.get("split_channels")) else f"转写文稿-{stem}"
     md_path = stem_dir / f"{out_stem}.md"
     docx_path = stem_dir / f"{out_stem}.docx"
-    if md_path.exists() and not force:
+    srt_path = stem_dir / f"{out_stem}.srt"
+    # 要字幕但字幕还没出：不能直接 skip，交给下面命中缓存后走"只补对齐"通道。
+    # 否则 --srt 在已处理素材上完全无声失效（首次运行后补字幕永远拿不到文件）。
+    needs_srt = bool(opts.get("srt")) and not srt_path.exists()
+    if md_path.exists() and not force and not needs_srt:
         # md 已在：docx 齐备或排版技能缺失才算完成；只差 docx（首跑时技能未装）则只补排版，
         # 不重跑分离与转写——旧行为要到 --force 全量重跑，连 Demucs 一起白烧
         if docx_path.exists() or article_skill() is None:
@@ -540,6 +604,8 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
         print(f"[补排版] {stem}：md 已在，仅补 article-format docx")
         render_docx(md_path, docx_path, stem_dir, bool(opts.get("verbose")))
         return "redocx"
+    if needs_srt and md_path.exists():
+        print(f"[补字幕] {stem}：md 已在，仅补字幕（复用缓存转写，不重跑分离与识别）")
     vocals = stem_dir / "人声.wav"
     # demucs 在静音段输出低电平伪影（非真静音），VAD 能量门限会失效切不出段——
     # 先过噪声门：低于 -40dB 归零、人声直通，恢复段间真静音（实测 VAD 1 段 → 2 段）
@@ -549,6 +615,19 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
         run_child(["ffmpeg", "-y", "-i", str(vocals), "-af",
                    "agate=threshold=-40dB:ratio=99:attack=2:release=100",
                    str(vocals_asr)], env=child_env())
+
+    # 纯补字幕：只跑对齐，不动 md/docx（转写内容没变，重写 md 会覆盖用户可能已手工修改的稿）
+    if needs_srt and md_path.exists() and vocals_asr.exists():
+        payload = call_asr(vocals_asr, opts, force=False)
+        raw_srt = vocals_asr.with_suffix(".srt")
+        if raw_srt.exists():
+            raw_srt.replace(srt_path)
+        if srt_path.exists():
+            print(f"[补字幕] {stem}：字幕已生成 {srt_path.name}")
+            return "resrt"
+        print(f"[补字幕] {stem}：未能产出字幕（对齐器不可用或音频过短）", file=sys.stderr)
+        return "skip"
+
     print(f"[转写] {stem}：说话人分离转写中（首次较慢；命中缓存直接复用）")
     # 降噪评估：粗估信噪比并给建议。不自动开降噪——实测白噪声场景无收益甚至更差，
     # 只在真实低信噪素材上才值得试，所以给提示而不是替用户决定。
@@ -680,6 +759,13 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
     else:
         # --no-separate 只产出「人声.wav」（无背景音），完成判定要对齐实际产物
         all_done = (stem_dir / "人声.wav").exists() if no_separate else separated
+    # 要字幕而字幕还没出时不算完成：否则 --srt 在已处理素材上完全失效（补字幕永远被 skip 挡住）。
+    # 字幕是独立产物，不该由 md 的存在与否决定它的生命周期。
+    if do_asr and opts.get("srt"):
+        srt_done = ((stem_dir / f"{out_stem}.srt").exists()
+                    or (opts.get("flat") and (media.parent / f"{out_stem}.srt").exists()))
+        if not srt_done:
+            all_done = False
     if all_done and not force:
         if opts.get("clean"):
             removed = clean_intermediates(stem_dir)
@@ -762,7 +848,9 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
     # 3) 人声转文字 + 文章/纪要排版（--no-asr 可跳过）
     if do_asr:
         result = transcribe_and_write_article(stem_dir, media.stem, force, meeting, opts)
-        if opts.get("clean") and result in ("done", "redocx"):
+        # resrt=只补字幕：不触发 --flat 的目录清理（md/docx 早就摊出去了或本就在原位），
+        # 但 --clean 该照做，否则补字幕顺带留下的中间件会一直占盘
+        if opts.get("clean") and result in ("done", "redocx", "resrt"):
             removed = clean_intermediates(stem_dir)
             if removed:
                 print(f"[清理] {media.stem}：移除中间件 {len(removed)} 个（--clean）")
@@ -799,6 +887,22 @@ def main():
     ap.add_argument("--diarize-engine", choices=["campp", "pyannote", "auto"], default="auto",
                     help="说话人分离引擎：auto=会议自动用 pyannote（重叠语音更准），其余用 campp；"
                          "campp=轻量声纹聚类；pyannote=分割模型（需已装）")
+    ap.add_argument("--num-speakers", type=int, default=None,
+                    help="已知说话人数（pyannote 引擎）：精确人数最准，如两人对谈就填 2")
+    ap.add_argument("--min-speakers", type=int, default=None,
+                    help="说话人数下限（pyannote 引擎），配合 --max-speakers 挡住过度切分")
+    ap.add_argument("--max-speakers", type=int, default=None,
+                    help="说话人数上限（pyannote 引擎）；人数不确定时用它，比让模型自由推断稳")
+    ap.add_argument("--pyannote-chunk-s", type=int, default=None,
+                    help="pyannote 单块时长上限秒（默认 900，0=不分块）：长素材分块显著降内存峰值")
+    ap.add_argument("--pyannote-overlap-s", type=int, default=None,
+                    help="pyannote 块间重叠秒（默认 30）：供跨块说话人标签映射，太小会多认出说话人")
+    ap.add_argument("--align-engine", choices=["auto", "fa-zh", "native"], default="auto",
+                    help="字幕对齐后端：auto=有 Qwen3-ForcedAligner 就用、否则 fa-zh（默认）；"
+                         "fa-zh=中文专用；native=多语言（需先下载 Qwen3-ForcedAligner-0.6B）")
+    ap.add_argument("--itn-backend", choices=["auto", "wtp", "legacy"], default="auto",
+                    help="ITN 后端：auto=装了 WeTextProcessing 就用、否则自写规则（默认）；"
+                         "wtp=强制 WeTextProcessing；legacy=自写零依赖规则")
     ap.add_argument("--threshold", type=float, default=None,
                     help="声纹聚类阈值（仅 campp 引擎，默认 0.75）：单人素材被误切成多人时调低试 0.6~0.65；"
                          "配合 --force 生效，不同配置存独立缓存")
@@ -920,7 +1024,13 @@ def main():
                       ("--replace-save", replace_save_arg),
                       ("--language", args.language), ("--speaker-db", speaker_db_arg),
                       ("--max-line", args.max_line), ("--merge-gap", args.merge_gap),
-                      ("--vad", args.vad)):
+                      ("--vad", args.vad),
+                      # 说话人数只影响分离结果，必须进缓存键（不同人数=不同 lines）
+                      ("--num-speakers", args.num_speakers),
+                      ("--min-speakers", args.min_speakers),
+                      ("--max-speakers", args.max_speakers),
+                      ("--pyannote-chunk-s", args.pyannote_chunk_s),
+                      ("--pyannote-overlap-s", args.pyannote_overlap_s)):
         if val is not None:
             extra += [flag, str(val)]
     if args.speaker_db == "auto":
@@ -929,8 +1039,13 @@ def main():
         extra.append("--denoise")
     if args.itn:
         extra.append("--itn")
+        if args.itn_backend and args.itn_backend != "auto":
+            extra += ["--itn-backend", args.itn_backend]
     if args.emotion:
         extra.append("--emotion")
+    if args.align_engine and args.align_engine != "auto":
+        # 对齐后端只影响字幕，不进缓存键（否则换后端要重转），但补字幕通道要用
+        extra += ["--align-engine", args.align_engine]
     if args.asr_extra:
         extra += split_asr_extra(args.asr_extra)
     for bad in RESERVED_ASR_ARGS:
@@ -942,7 +1057,10 @@ def main():
             "extra": extra, "verbose": args.verbose, "clean": args.clean,
             "flat": args.flat, "dict_hash": dict_hash,
             "demucs_model": args.demucs_model, "split_channels": args.split_channels,
-            "no_diarize": args.no_diarize}
+            "no_diarize": args.no_diarize,
+            # 供 _align_srt_only 补字幕时透传（不进缓存键）
+            "align_engine": args.align_engine, "language": args.language,
+            "max_line": args.max_line}
 
     # 日志落盘：终端与 run.log 双写，批量跑完还能回溯
     log_path = None
@@ -959,7 +1077,7 @@ def main():
 
     total = len(medias)
     run_t0 = time.time()
-    ok = skip = fail = novoice = redocx = invalid = 0
+    ok = skip = fail = novoice = redocx = resrt = invalid = 0
     for idx, v in enumerate(medias, 1):
         item_t0 = time.time()
         print(f"\n[{idx}/{total}] {v.name}")
@@ -976,6 +1094,9 @@ def main():
             elif r == "redocx":
                 redocx += 1
                 print(f"[补排版] {v.name} → {out_dir / v.stem}")
+            elif r == "resrt":
+                resrt += 1
+                print(f"[补字幕] {v.name} → {out_dir / v.stem}")
             else:
                 ok += 1
                 print(f"[完成] {v.name} → {out_dir / v.stem}")
@@ -1002,7 +1123,7 @@ def main():
         print(f"    用时 {time.time() - item_t0:.1f} 秒（{idx}/{total}）")
 
     elapsed = time.time() - run_t0
-    print(f"\n汇总：完成 {ok} / 补排版 {redocx} / 无人声 {novoice} / 跳过 {skip} / 失败 {fail}"
+    print(f"\n汇总：完成 {ok} / 补排版 {redocx} / 补字幕 {resrt} / 无人声 {novoice} / 跳过 {skip} / 失败 {fail}"
           + (f" / 无音轨 {invalid}" if invalid else "")
           + f"，输出目录：{out_dir}")
     if total:
