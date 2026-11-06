@@ -323,16 +323,17 @@ _article_skill_cache = None
 
 def article_skill() -> Path:
     """定位「全局文章排版规范」技能脚本目录（article-format，惰性查找）：
-    环境变量 ARTICLE_SKILL_DIR → 常见技能安装位置；找不到时返回 None（跳过排版，产出标准 docx）"""
+    环境变量 ARTICLE_SKILL_DIR → ZCode 技能根 → 共享 .agents → 仓库 skills/ →
+    Claude / 旧 ZCode 路径兜底；找不到时返回 None（跳过排版，产出标准 docx）"""
     global _article_skill_cache
     if _article_skill_cache is not None:
         return _article_skill_cache or None
     env = os.environ.get("ARTICLE_SKILL_DIR")
     cands = ([Path(env)] if env else []) + [
-        Path.home() / ".zcode" / "skills" / "article-format" / "scripts",
         Path.home() / ".agents" / "skills" / "article-format" / "scripts",
+        SCRIPT_DIR / "skills" / "article-format" / "scripts",
         Path.home() / ".claude" / "skills" / "article-format" / "scripts",
-        SCRIPT_DIR / "skills" / "article-format" / "scripts"]
+        Path.home() / ".zcode" / "skills" / "article-format" / "scripts"]
     for c in cands:
         if (c / "md2docx.py").is_file():
             _article_skill_cache = c
