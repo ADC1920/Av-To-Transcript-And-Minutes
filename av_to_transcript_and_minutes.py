@@ -234,7 +234,7 @@ def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
             except OSError:
                 pass
     if not moved:
-        print(f"[提示] {media.stem}：未产出 docx/srt/vtt，跳过平铺清理以免删掉 md 成稿"
+        print(f"[提示] {media.stem}：未产出 docx/字幕/说话人日志，跳过平铺清理以免删掉 md 成稿"
               f"（工作目录保留：{stem_dir}）", file=sys.stderr)
         return
     shutil.rmtree(stem_dir, ignore_errors=True)

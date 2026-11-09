@@ -1,0 +1,13 @@
+# 文本一律 LF 存储与检出：仓库是 Windows + Linux 双端（CI 跑 Linux），
+# CRLF 混入会让 diff 与脚本行为都变得不可预测。
+* text=auto eol=lf
+
+# 二进制/音频不得当文本处理（即使被误加入库也不要改写字节）
+*.wav binary
+*.mp3 binary
+*.m4a binary
+*.flac binary
+*.png binary
+*.jpg binary
+*.docx binary
+*.pyc binary
