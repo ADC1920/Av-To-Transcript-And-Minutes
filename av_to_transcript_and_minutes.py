@@ -222,7 +222,7 @@ def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
     此时 md 是本次唯一成果，直接 rmtree 会把它一并删掉（实测：未装排版技能 + --flat
     → 只剩中间件也没了，稿子凭空消失）。"""
     moved = []
-    for ext in (".docx", ".srt", ".vtt"):
+    for ext in (".docx", ".srt", ".vtt", ".rttm"):
         src_file = stem_dir / f"{out_stem}{ext}"
         if src_file.exists():
             target = media.parent / f"{out_stem}{ext}"
@@ -348,6 +348,25 @@ MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
 # 源音轨编码 → 无损 copy 时的容器扩展名（codec 名不带点；aac 之外的冷门编码落 mka 万能容器）
 AUDIO_EXT = {"aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
              "opus": ".opus", "vorbis": ".ogg", "ac3": ".ac3", "eac3": ".eac3"}
+
+# FireRedVAD 权重目录（与 qwen_asr.py 的 FIRERED_VAD_DIR 同源）
+FIRERED_VAD_DIR = Path.home() / ".cache" / "fireredvad" / "FireRedVAD" / "VAD"
+
+
+def resolve_vad_arg(vad, diarize: bool) -> str:
+    """把 --vad auto 解析成具体后端名，供子进程与缓存键共用同一份口径。
+
+    与 qwen_asr.resolve_vad_backend 同源：分离链路用 fsmn（段边界即声纹聚类单元，
+    实测碎段会拉高 DER），纯分段链路（--no-diarize）用 FireRedVAD（只当识别批边界，
+    边界越准越快，实测 8.5s → 0.37s）。这里只查权重文件是否存在，不 import
+    fireredvad——主脚本不加载识别栈的重依赖，缺包时由子进程报错。
+    """
+    if vad and vad != "auto":
+        return vad
+    if not (FIRERED_VAD_DIR / "model.pth.tar").is_file():
+        return "fsmn"
+    return "fsmn" if diarize else "firered"
+
 
 
 def probe_audio_codec(video: Path) -> str:
@@ -508,17 +527,24 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     extra = list(opts.get("extra") or [])
     # 纯字幕参数不进缓存键：它们只影响 sentences/.srt，不影响 lines 的文本。
     # 计入键会让"换对齐后端"或"调字幕字数"变成整套重转；正确做法是命中缓存后补对齐通道。
-    SUBTITLE_ONLY_ARGS = {"--align-engine", "--max-line"}
+    SUBTITLE_ONLY_ARGS = {"--align-engine", "--max-line", "--min-dur", "--max-cps"}
+    # 与升级前默认等价的取值也不进键：旧缓存是按 fsmn 跑的、键里没有 --vad，
+    # 新版恒显式下发解析结果，把 fsmn 计进键等于让所有历史缓存失效、白烧一次全量重转。
+    KEY_EQUIV = {("--vad", "fsmn")}
     key_extra = []
-    _skip = False
-    for tok in extra:
-        if _skip:
-            _skip = False
-            continue
-        if tok in SUBTITLE_ONLY_ARGS:
-            _skip = True
+    i = 0
+    while i < len(extra):
+        tok = extra[i]
+        nxt = extra[i + 1] if i + 1 < len(extra) else None
+        if tok in SUBTITLE_ONLY_ARGS or (tok, nxt) in KEY_EQUIV:
+            i += 2
             continue
         key_extra.append(tok)
+        if nxt is not None and not nxt.startswith("--"):
+            key_extra.append(nxt)
+            i += 2
+        else:
+            i += 1
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
         opts.get("names"), bool(opts.get("srt")), opts.get("engine"), key_extra, tag,
@@ -628,6 +654,71 @@ def transcript_md(payload: dict, stem: str) -> str:
     return f"# 转写文稿：{stem}\n\n" + "\n\n".join(paras) + "\n"
 
 
+def write_rttm(lines, path: Path, uri: str) -> int:
+    """写 RTTM 说话人日志，返回写入行数。
+
+    格式（dscore / pyannote.metrics / meeteval 都直接读）：
+      SPEAKER <文件标识> 1 <起点秒> <时长秒> <NA> <NA> <说话人> <NA> <NA>
+    由主管线自己写而不是转存子进程的产物：缓存命中时子进程根本没跑，而 lines 一定
+    在 payload 里，一份数据源才能让"首次运行"和"补文件"两条路径都成立。
+    """
+    rows = []
+    for l in lines or []:
+        if l.get("spk") is None:
+            continue
+        start = max(0.0, int(l.get("start_ms", 0)) / 1000.0)
+        end = max(start, int(l.get("end_ms", 0)) / 1000.0)
+        if end - start <= 0:
+            continue
+        label = str(l.get("spk_name") or f"spk{l['spk']}")
+        label = re.sub(r"\s+", "_", label) or f"spk{l['spk']}"
+        rows.append(f"SPEAKER {uri} 1 {start:.3f} {end - start:.3f} <NA> <NA> {label} <NA> <NA>")
+    path.write_text("".join(r + "\n" for r in rows), encoding="utf-8")
+    return len(rows)
+
+
+def _fmt_dur(ms) -> str:
+    """毫秒 -> 人读时长（1小时03分05秒 / 3分05秒）"""
+    s = max(0, int(ms)) // 1000
+    h, r = divmod(s, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}小时{m:02d}分{s:02d}秒" if h else f"{m}分{s:02d}秒"
+
+
+def speaker_summary(payload: dict) -> str:
+    """会议原文顶部的发言概览：谁在场、各说了多久、什么时候开口。
+
+    为什么放在原文里而不是另出报告：提炼纪要的人是拿着这份 md 工作的，
+    "谁占了 60% 的发言、谁只说了两句"是会直接改变纪要权重与责任归属判断的
+    信息，放在同一份文本里才不会被漏读。只用列表不用表格——article-format
+    的 md 转 docx 对列表最稳。
+    """
+    lines = [l for l in (payload.get("lines") or []) if (l.get("text") or "").strip()]
+    if len({(l.get("spk_name") or l.get("spk")) for l in lines}) < 2:
+        return ""      # 单人素材没有对比意义，不占版面
+    agg = {}
+    for l in lines:
+        key = l.get("spk_name") or f"说话人{l.get('spk')}"
+        d = agg.setdefault(key, {"n": 0, "ms": 0,
+                                 "first": int(l.get("start_ms", 0)),
+                                 "last": int(l.get("end_ms", 0))})
+        d["n"] += 1
+        d["ms"] += max(0, int(l.get("end_ms", 0)) - int(l.get("start_ms", 0)))
+        d["first"] = min(d["first"], int(l.get("start_ms", 0)))
+        d["last"] = max(d["last"], int(l.get("end_ms", 0)))
+    total = sum(d["ms"] for d in agg.values()) or 1
+    rows = ["## 发言概览", ""]
+    for key, d in sorted(agg.items(), key=lambda kv: -kv[1]["ms"]):
+        rows.append(f"- {key}：{d['n']} 段，累计 {_fmt_dur(d['ms'])}，"
+                    f"占 {d['ms'] * 100 // total}%（{_fmt_dur(d['first'])} 起，"
+                    f"至 {_fmt_dur(d['last'])}）")
+    ov = payload.get("overlaps") or []
+    if ov:
+        ms = sum(max(0, int(o.get("end_ms", 0)) - int(o.get("start_ms", 0))) for o in ov)
+        rows.append(f"- 重叠语音（两人以上同时说话）：{len(ov)} 处，累计 {_fmt_dur(ms)}")
+    return "\n".join(rows) + "\n\n"
+
+
 def meeting_md(payload: dict, stem: str) -> str:
     """会议模式：会议原文——按时间顺序完整转写，每段带 [分:秒] 时间戳与说话人标签
     （pyannote 分离可靠后恢复标签；--names 提供人名映射时显示真实姓名）
@@ -640,7 +731,7 @@ def meeting_md(payload: dict, stem: str) -> str:
         if text:
             body.append(f"[{m:02d}:{s:02d}] {name}：{text}")
     joined = "\n\n".join(body) if body else "（未检测到语音）"
-    return f"# 会议原文：{stem}\n\n{joined}\n"
+    return f"# 会议原文：{stem}\n\n{speaker_summary(payload)}{joined}\n"
 
 
 def render_docx(md_path: Path, docx_path: Path, stem_dir: Path, verbose: bool = False) -> bool:
@@ -674,11 +765,14 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     docx_path = stem_dir / f"{out_stem}.docx"
     srt_path = stem_dir / f"{out_stem}.srt"
     vtt_path = stem_dir / f"{out_stem}.vtt"
+    rttm_path = stem_dir / f"{out_stem}.rttm"
     # 要字幕但字幕还没出：不能直接 skip，交给下面命中缓存后走"只补对齐"通道。
     # 否则 --srt 在已处理素材上完全无声失效（首次运行后补字幕永远拿不到文件）。
     # srt 与 vtt 各自独立判定：只缺 vtt 时要补一次对齐，不能因为 srt 在就跳过。
+    # rttm 不依赖对齐，补它的成本是纯文本写盘（缓存里有 lines 就够）。
     needs_srt = ((opts.get("srt") and not srt_path.exists())
-                 or (opts.get("vtt") and not vtt_path.exists()))
+                 or (opts.get("vtt") and not vtt_path.exists())
+                 or (opts.get("rttm") and not rttm_path.exists()))
     if md_path.exists() and not force and not needs_srt:
         # md 已在：docx 齐备或排版技能缺失才算完成；只差 docx（首跑时技能未装）则只补排版，
         # 不重跑分离与转写——旧行为要到 --force 全量重跑，连 Demucs 一起白烧
@@ -688,7 +782,10 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
         render_docx(md_path, docx_path, stem_dir, bool(opts.get("verbose")))
         return "redocx"
     if needs_srt and md_path.exists():
-        print(f"[补字幕] {stem}：md 已在，仅补字幕（复用缓存转写，不重跑分离与识别）")
+        wants = [n for n, w in (("字幕", opts.get("srt") or opts.get("vtt")),
+                                ("说话人日志", opts.get("rttm"))) if w]
+        print(f"[补文件] {stem}：md 已在，仅补{'/'.join(wants) or '附属产物'}"
+              f"（复用缓存转写，不重跑分离与识别）")
     vocals = stem_dir / "人声.wav"
     # demucs 在静音段输出低电平伪影（非真静音），VAD 能量门限会失效切不出段——
     # 先过噪声门：低于 -40dB 归零、人声直通，恢复段间真静音（实测 VAD 1 段 → 2 段）
@@ -702,11 +799,16 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     # 纯补字幕：只跑对齐，不动 md/docx（转写内容没变，重写 md 会覆盖用户可能已手工修改的稿）
     if needs_srt and md_path.exists() and vocals_asr.exists():
         payload = call_asr(vocals_asr, opts, force=False)
+        if opts.get("rttm") and not rttm_path.exists():
+            n = write_rttm(payload.get("lines"), rttm_path, out_stem)
+            print(f"[补文件] {stem}：RTTM 说话人日志已生成（{n} 行）")
         raw_srt = vocals_asr.with_suffix(".srt")
         if raw_srt.exists():
             raw_srt.replace(srt_path)
         if srt_path.exists():
             print(f"[补字幕] {stem}：字幕已生成 {srt_path.name}")
+            return "resrt"
+        if rttm_path.exists() and not opts.get("srt") and not opts.get("vtt"):
             return "resrt"
         print(f"[补字幕] {stem}：未能产出字幕（对齐器不可用或音频过短）", file=sys.stderr)
         return "skip"
@@ -739,6 +841,14 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     if not md_body:
         return "novoice"
     md_path.write_text(md_body, encoding="utf-8")
+    # rttm 直接从 payload.lines 写（不转存子进程产物）：缓存命中时子进程没跑，
+    # lines 却是每次都有的，一份数据源覆盖"首次运行"与"事后补文件"两条路径
+    if opts.get("rttm"):
+        n = write_rttm(payload.get("lines"), rttm_path, out_stem)
+        if n:
+            print(f"[说话人日志] {stem}：RTTM 已生成（{n} 行）→ {rttm_path.name}")
+        else:
+            print(f"[提示] {stem}：本次结果没有说话人标签，未写 RTTM", file=sys.stderr)
     # qwen_asr 产出的字幕转移到本次输出名（srt 与 vtt 各自独立搬运）
     for ext, want in ((".srt", opts.get("srt")), (".vtt", opts.get("vtt"))):
         if not want:
@@ -845,12 +955,18 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
     else:
         # --no-separate 只产出「人声.wav」（无背景音），完成判定要对齐实际产物
         all_done = (stem_dir / "人声.wav").exists() if no_separate else separated
-    # 要字幕而字幕还没出时不算完成：否则 --srt 在已处理素材上完全失效（补字幕永远被 skip 挡住）。
-    # 字幕是独立产物，不该由 md 的存在与否决定它的生命周期。
-    if do_asr and opts.get("srt"):
-        srt_done = ((stem_dir / f"{out_stem}.srt").exists()
-                    or (opts.get("flat") and (media.parent / f"{out_stem}.srt").exists()))
-        if not srt_done:
+    # 要求了附属产物而它还没出时不算完成：否则 --srt/--vtt/--rttm 在已处理素材上会完全失效
+    # （补文件永远被 skip 挡住）。它们是独立产物，不该由 md 是否存在决定其生命周期。
+    # 三种产物各自判定：只缺 vtt 或只缺 rttm 都要放行，不能因为 srt 在就判完成。
+    if do_asr:
+        for ext, want in ((".srt", opts.get("srt")), (".vtt", opts.get("vtt")),
+                          (".rttm", opts.get("rttm"))):
+            if not want:
+                continue
+            if (stem_dir / f"{out_stem}{ext}").exists():
+                continue
+            if opts.get("flat") and (media.parent / f"{out_stem}{ext}").exists():
+                continue
             all_done = False
     if all_done and not force:
         if opts.get("clean"):
@@ -1003,6 +1119,13 @@ def main():
     ap.add_argument("--vtt", action="store_true",
                     help="额外产出 .vtt 字幕（WebVTT，HTML5 video 的 track 与视频平台直接可用）；"
                          "与 --srt 共用一次对齐，可同时开")
+    ap.add_argument("--rttm", action="store_true",
+                    help="额外产出 .rttm 说话人日志（RTTM 标准格式：pyannote.metrics / meeteval / "
+                         "dscore 可直接读，外部复核分离结果不用再写转换脚本）")
+    ap.add_argument("--min-dur", type=int, default=None,
+                    help="字幕最短显示时长 ms（默认 700；语速快时避免一闪而过，0=不补）")
+    ap.add_argument("--max-cps", type=float, default=None,
+                    help="字幕最大阅读速度 字/秒（默认 12；超出按字数拉长显示，0=只按最小时长兜底）")
     ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto", "cloud"], default="qwen",
                     help="识别引擎：qwen=Qwen3-ASR-1.7B（默认，多语言）；aed=FireRedASR2-AED（中/英/粤更准）；"
                          "auto=按 --language 路由（中/英/粤走 aed，其余走 qwen）；"
@@ -1017,15 +1140,16 @@ def main():
     ap.add_argument("--emotion", action="store_true",
                     help="emotion2vec 整段情绪分析（8 类情绪写入结果 json 的 emotions 字段；不做笑声/掌声事件检测）")
     ap.add_argument("--speaker-db", nargs="?", const="auto", default=None,
-                    help="声纹库：跨文件复用说话人身份（仅 campp 引擎可用）。裸写或 auto=输出目录 "
-                         "speaker_db.json（有则复用无则建库、命中自动更新）；也可给显式 JSON 路径")
+                    help="声纹库：跨文件复用说话人身份（campp 与 pyannote 两条路径都支持）。裸写或 "
+                         "auto=输出目录 speaker_db.json（有则复用无则建库、命中自动更新）；也可给显式 JSON 路径")
     ap.add_argument("--replace", default=None,
                     help="专名/错词确定性纠错（如 '小蜜=>小米,开饭时间=>开放时间'）——"
                          "比 --hotwords 的 prompt 偏置可靠；变更后自动用新缓存重转")
     ap.add_argument("--denoise", action="store_true",
                     help="转写前跑 ZipEnhancer 降噪（仅真实含 BGM/强噪素材；干净素材不加更好）")
-    ap.add_argument("--vad", choices=["fsmn", "firered"], default=None,
-                    help="VAD 切段后端（默认 fsmn；firered 误报更低，需已装 fireredvad）")
+    ap.add_argument("--vad", choices=["auto", "fsmn", "firered"], default="auto",
+                    help="VAD 切段后端：auto=按用途自动选（分离链路 fsmn、--no-diarize 长音频 firered，"
+                         "装了 FireRedVAD 才换）；fsmn=FunASR 内置；firered=FireRedVAD（误报更低）")
     ap.add_argument("--language", default=None,
                     help="强制语言（zh/en/yue/ja 等代码），默认自动检测")
     ap.add_argument("--max-line", type=int, default=None,
@@ -1108,12 +1232,17 @@ def main():
         except OSError:
             dict_hash = None
     # 额外 ASR 参数：显式项 + --asr-extra 合并，统一进命令行与缓存键
+    # VAD 后端先在这里解析成确定名字：子进程的 auto 会按它自己的 --diarize 判断，
+    # 而管线这里还知道 no_diarize，两处判断口径必须统一在管线这一侧，否则
+    # "子进程实际用 firered、缓存键却记 auto"会让换后端后继续复用旧结果。
+    vad_arg = resolve_vad_arg(args.vad, diarize=not args.no_diarize)
     extra = []
     for flag, val in (("--replace", args.replace), ("--replace-file", replace_file_arg),
                       ("--replace-save", replace_save_arg),
                       ("--language", args.language), ("--speaker-db", speaker_db_arg),
                       ("--max-line", args.max_line), ("--merge-gap", args.merge_gap),
-                      ("--vad", args.vad),
+                      ("--min-dur", args.min_dur), ("--max-cps", args.max_cps),
+                      ("--vad", vad_arg),
                       # 说话人数只影响分离结果，必须进缓存键（不同人数=不同 lines）
                       ("--num-speakers", args.num_speakers),
                       ("--min-speakers", args.min_speakers),
@@ -1147,6 +1276,8 @@ def main():
             "flat": args.flat, "dict_hash": dict_hash,
             "demucs_model": args.demucs_model, "split_channels": args.split_channels,
             "no_diarize": args.no_diarize,
+            # rttm 只由主管线写（不进 ASR 子进程：它的产物会在工作目录里重复一份）
+            "rttm": args.rttm,
             # 供 _align_srt_only 补字幕时透传（不进缓存键）
             "align_engine": args.align_engine, "language": args.language,
             "max_line": args.max_line}

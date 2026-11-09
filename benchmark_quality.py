@@ -13,6 +13,16 @@
     ],
     "text": "完整正确文本（用于 CER，可省略）"
   }
+  要算 cpWER 时给每段加 text：
+      {"start_ms": 0, "end_ms": 5200, "spk": "张三", "text": "这一段他说的原话"}
+  只有时间轴没有逐段文本时不报 cpWER——按时长把全文摊到各人头上，会把标注本身的
+  位置误差算成模型错误，那个数字比没有更糟。
+
+三个指标各管一件事，必须一起看：
+  DER（0.25s 容差）  谁在什么时候说，边界微抖不计错——通行口径，可与论文对齐
+  DER（无容差）      同一份预测的边界精度；与上面那个的差值变大 = 边界被弄粗了
+  cpWER             把每个人的话拼成一串再比字，同时惩罚"归属错"与"识别错"，
+                    比 DER 更贴近"这份稿子能不能直接用"
 
 用法：
   # 评测单份素材（会自动跑管线出转写结果，再比对）
@@ -37,6 +47,7 @@ import re
 import subprocess
 import sys
 import unicodedata
+from itertools import permutations
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -103,8 +114,13 @@ def cer(ref_text, hyp_text):
 
 # ---------------- DER ----------------
 
-def der_from_segments(ref_segments, hyp_segments):
-    """用 pyannote.metrics 算 DER。返回 (der, detail dict) 或 (None, {"reason": ...})"""
+def der_from_segments(ref_segments, hyp_segments, collar=0.25):
+    """用 pyannote.metrics 算 DER。返回 (der, detail dict) 或 (None, {"reason": ...})
+
+    collar 默认 0.25 秒（论文通行口径）：段边界抖动不计错误。传 0 得到"无容差"
+    版本——两个数字一起看才有信息量：容差内一致、无容差变差，说明边界精度在退化，
+    而 0.25 秒容差会把这类退化吃掉。只报一个数容易把"更准"和"更粗"看成一回事。
+    """
     try:
         from pyannote.core import Annotation, Segment
         from pyannote.metrics.diarization import DiarizationErrorRate
@@ -127,7 +143,7 @@ def der_from_segments(ref_segments, hyp_segments):
         return None, {"reason": "参考或预测为空"}
     # collar 是构造参数而非调用参数（pyannote.metrics 4.x）：0.25s 容差让段边界的
     # 微抖动不计错误，这是 DER 评测的通行做法；传错位置会 TypeError。
-    metric = DiarizationErrorRate(collar=0.25)
+    metric = DiarizationErrorRate(collar=collar)
     value = metric(ref, hyp)
     comp = metric[:]
     return float(value), {
@@ -136,6 +152,54 @@ def der_from_segments(ref_segments, hyp_segments):
         "confusion_s": round(float(comp.get("confusion", 0.0)), 2),
         "total_s": round(float(comp.get("total", 0.0)), 2),
     }
+
+
+def cpwer(ref_segs, hyp_segs):
+    """cpWER（concatenated minimum-permutation WER）：说话人归属对了没有。
+
+    DER 只看"这段时间谁在说"，说话人 A 的内容被标成 B、另一段反过来错标，
+    DER 会算两次混淆；cpWER 先把同一个人所有内容拼成一串再比字，问的是
+    "如果把标签按最优置换对上，每个人说的话错了几个字"——它同时惩罚归属错误
+    和识别错误，是会议场景里比 DER 更贴近实际可用性的数字（meet eval 的口径）。
+
+    要求参考标注带逐段文本：ref_segs 的元素需有 text 字段；只有时间轴没有文本时
+    返回 None（用时长按比例摊全文会把标注噪声算成模型错误，不如不算）。
+    """
+    if not ref_segs or not any((s.get("text") or "").strip() for s in ref_segs):
+        return None
+    if not hyp_segs:
+        return None
+    ref_by, hyp_by = {}, {}
+    for s in ref_segs:
+        ref_by.setdefault(str(s.get("spk")), []).append(s)
+    for s in hyp_segs:
+        if s.get("spk") is not None:
+            hyp_by.setdefault(str(s.get("spk")), []).append(s)
+    ref_keys = list(ref_by)
+    hyp_keys = list(hyp_by)
+    if not ref_keys or not hyp_keys:
+        return None
+    ref_txt = {k: "".join((x.get("text") or "") for x in ref_by[k]) for k in ref_keys}
+    hyp_txt = {k: "".join((x.get("text") or "") for x in hyp_by[k]) for k in hyp_keys}
+    total_ref = sum(len(_norm_units(t)) for t in ref_txt.values())
+    if total_ref == 0:
+        return None
+    # 人数很少（会议通常 2-6 人），穷举全排列就是最优解，不必写匈牙利算法
+    n = max(len(ref_keys), len(hyp_keys))
+    if n > 7:
+        return None      # 7! 已是 5040，再大人数远超实际场景，放弃最优解
+    best = None
+    for perm in permutations(range(n)):
+        err = 0
+        for i, hk in enumerate(hyp_keys):
+            j = perm[i] if i < len(perm) else i
+            rk = ref_keys[j] if j < len(ref_keys) else None
+            h = _norm_units(hyp_txt.get(hk, ""))
+            r = _norm_units(ref_txt.get(rk, "")) if rk is not None else []
+            err += edit_distance(r, h)
+        if best is None or err < best:
+            best = err
+    return best / total_ref if best is not None else None
 
 
 # ---------------- 取预测结果 ----------------
@@ -154,11 +218,12 @@ def find_hyp_json(media: Path) -> Path:
 
 
 def load_hyp(path: Path):
-    """读管线产物：lines 里带 spk/start_ms/end_ms/text，正是 DER/CER 需要的两项输入"""
+    """读管线产物：lines 里带 spk/start_ms/end_ms/text，正是 DER/CER/cpWER 需要的三项输入"""
     payload = json.loads(path.read_text(encoding="utf-8"))
     lines = payload.get("lines") or []
     segs = [{"start_ms": l.get("start_ms", 0), "end_ms": l.get("end_ms", 0),
-             "spk": l.get("spk_name") or l.get("spk")} for l in lines]
+             "spk": l.get("spk_name") or l.get("spk"), "text": l.get("text") or ""}
+            for l in lines]
     text = "".join(l.get("text") or "" for l in lines)
     if not text and payload.get("text"):
         text = payload["text"]
@@ -197,6 +262,12 @@ def evaluate_one(media: Path, ref_path: Path, hyp_path=None, run=True, extra_arg
         d, detail = der_from_segments(ref_segs, hyp_segs)
         result["der"] = None if d is None else round(d, 4)
         result["der_detail"] = detail
+        # 无容差对照：与 0.25s collar 版一起看，才分得清"更准"和"边界更粗"
+        d0, _ = der_from_segments(ref_segs, hyp_segs, collar=0.0)
+        result["der_nocollar"] = None if d0 is None else round(d0, 4)
+        c = cpwer(ref_segs, hyp_segs)
+        if c is not None:
+            result["cpwer"] = round(c, 4)
         result["ref_speakers"] = len({str(s.get("spk")) for s in ref_segs})
         result["hyp_speakers"] = len({str(s.get("spk")) for s in hyp_segs if s.get("spk") is not None})
     return result
@@ -221,6 +292,13 @@ def aggregate(results):
         out["der_mean"] = round(sum(ders) / len(ders), 4)
         out["der_min"] = round(min(ders), 4)
         out["der_max"] = round(max(ders), 4)
+    # 无容差 DER：与 der_mean 的差值是"边界精度"的量尺，差值变大说明改动把边界弄粗了
+    d0s = [r["der_nocollar"] for r in results if r.get("der_nocollar") is not None]
+    if d0s:
+        out["der_nocollar_mean"] = round(sum(d0s) / len(d0s), 4)
+    cpw = [r["cpwer"] for r in results if r.get("cpwer") is not None]
+    if cpw:
+        out["cpwer_mean"] = round(sum(cpw) / len(cpw), 4)
     return out
 
 
@@ -277,6 +355,33 @@ def selftest():
                  {"start_ms": 3000, "end_ms": 6000, "spk": "B"}]
         d2, _ = der_from_segments(segs, wrong)
         check("错标一人 DER>0", d2 is not None and d2 > 0.2, d2)
+        d0, _ = der_from_segments(segs, segs, collar=0.0)
+        check("无容差同输入仍为 0", d0 is not None and abs(d0) < 1e-6, d0)
+        # 边界抖动 0.1 秒：容差内（0.25s）不计错误，无容差版必须能看见
+        shift = [{"start_ms": 100, "end_ms": 3000, "spk": "A"},
+                 {"start_ms": 3000, "end_ms": 6000, "spk": "B"}]
+        dc, _ = der_from_segments(segs, shift)
+        dn, _ = der_from_segments(segs, shift, collar=0.0)
+        check("容差内抖动不计错误", dc is not None and abs(dc) < 1e-6, dc)
+        check("无容差能看见边界抖动", dn is not None and dn > 0, dn)
+
+    print("[4] cpWER（说话人归属 + 文字错误一起算）")
+    ref_txt = [{"start_ms": 0, "end_ms": 3000, "spk": "A", "text": "今天天气很好"},
+               {"start_ms": 3000, "end_ms": 6000, "spk": "B", "text": "明天可能下雨"}]
+    check("完全一致为 0",
+          cpwer(ref_txt, [dict(s) for s in ref_txt]) == 0.0,
+          cpwer(ref_txt, ref_txt))
+    # 两人标签互换：拼串后按最优置换仍能对上，cpWER 应仍为 0（这正是它与 DER 的分工）
+    swapped = [{"start_ms": 0, "end_ms": 3000, "spk": "X", "text": "今天天气很好"},
+               {"start_ms": 3000, "end_ms": 6000, "spk": "Y", "text": "明天可能下雨"}]
+    check("标签可置换（不惩罚纯改名）", cpwer(ref_txt, swapped) == 0.0, cpwer(ref_txt, swapped))
+    # 两人内容被并到一个标签下：拼串后无法靠置换救回，必须被惩罚
+    merged = [{"start_ms": 0, "end_ms": 3000, "spk": "X", "text": "今天天气很好"},
+              {"start_ms": 3000, "end_ms": 6000, "spk": "X", "text": "明天可能下雨"}]
+    v = cpwer(ref_txt, merged)
+    check("两人内容并成一人被惩罚", v is not None and v > 0.4, v)
+    check("缺逐段文本返回 None",
+          cpwer([{"start_ms": 0, "end_ms": 3000, "spk": "A"}], swapped) is None)
 
     print()
     if fails:
@@ -354,6 +459,10 @@ def main():
                 parts.append(f"CER {r['cer']:.2%}")
             if r.get("der") is not None:
                 parts.append(f"DER {r['der']:.2%}")
+                if r.get("der_nocollar") is not None:
+                    parts.append(f"DER(无容差) {r['der_nocollar']:.2%}")
+                if r.get("cpwer") is not None:
+                    parts.append(f"cpWER {r['cpwer']:.2%}")
                 parts.append(f"说话人 参考{r.get('ref_speakers')}/预测{r.get('hyp_speakers')}")
             print("  " + "  ".join(parts) if parts else "  无可比指标（标注缺 speakers 或 text）")
 

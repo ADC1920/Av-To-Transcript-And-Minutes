@@ -30,6 +30,8 @@ jobs:
         run: python skills/funasr-transcribe/scripts/test_cache_fingerprint.py
       - name: 超长段切分与声纹质心单测（零依赖，仅 numpy）
         run: python skills/funasr-transcribe/scripts/test_split_and_cluster.py
+      - name: VAD 自动选择 / 字幕硬切 / 阅读速度 / RTTM / 发言概览单测（零依赖）
+        run: python skills/funasr-transcribe/scripts/test_v25_upgrade_units.py
       - name: pyannote 分块与重叠区间单测（无 pyannote 时自动跳过）
         run: python skills/funasr-transcribe/scripts/test_pyannote_chunking.py
       - name: 基准脚本自检（CER/编辑距离；DER 需 pyannote.metrics，缺则跳过）

@@ -62,11 +62,17 @@ check("gap=0 紧邻同人也合", len(m3) == 1, f"got {len(m3)}")
 print("[5] subtitle_units 字幕细分(含对齐数据)")
 units = [{"start_ms": 0, "end_ms": 4000, "text": "你好世界。再见。", "spk": 0, "spk_name": "张三"}]
 aligns = [{"tokens": ["你", "好", "世", "界", "再", "见"], "ts": [[100, 300], [300, 500], [500, 700], [700, 900], [2500, 2700], [2700, 2900]]}]
-subs = subtitle_units(units, aligns, 28)
+subs = subtitle_units(units, aligns, 28, min_dur=0, max_cps=0)   # 关掉阅读速度补足，验原始边界
 check("切 2 条字幕", len(subs) == 2, f"got {subs}")
 check("条1边界贴字级时间戳", subs[0]["start_ms"] == 100 and subs[0]["end_ms"] == 900, f"got {subs[0]}")
 check("条2边界", subs[1]["start_ms"] == 2500 and subs[1]["end_ms"] == 2900, f"got {subs[1]}")
 check("说话人带名", subs[0]["spk_name"] == "张三", f"got {subs[0]}")
+# 默认档：短短语 400ms 不够读，必须被补到最小时长（这条钉住 v2.5 的阅读速度行为）
+subs_speed = subtitle_units(units, aligns, 28)
+check("默认档补足最小时长", subs_speed[1]["end_ms"] - subs_speed[1]["start_ms"] >= 700,
+      f"got {subs_speed[1]}")
+check("补时长不改文案与起点", subs_speed[1]["start_ms"] == 2500
+      and subs_speed[1]["text"] == "再见。", f"got {subs_speed[1]}")
 subs2 = subtitle_units(units, None, 28)
 check("无对齐=整段一条", len(subs2) == 1 and subs2[0]["start_ms"] == 0, f"got {subs2}")
 # 相邻重叠收敛

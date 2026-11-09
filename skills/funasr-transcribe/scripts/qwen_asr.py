@@ -50,7 +50,7 @@
 #   python qwen_asr.py 录音.m4a --engine cloud --cloud-model omni   # 云端 qwen3.8-omni-flash（全模态转写,纯文本）
 #   python qwen_asr.py --engine cloud --cloud-model filetrans --cloud-url <公网音频URL> --diarize
 #                                                        # 云端异步转写（仅公网 URL;自带说话人分离+字级时间戳）
-import argparse, atexit, json, os, shutil, sys, tempfile, time
+import argparse, atexit, json, os, re, shutil, sys, tempfile, time
 from pathlib import Path
 import numpy as np
 
@@ -478,7 +478,7 @@ def run_cloud_message(args, out_json, out_srt, matcher, t2s, itn_fn, log, t0, au
                "audio": str(Path(os.path.realpath(args.audio))),
                "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "text": u["text"]} for u in units]}
     if args.srt or getattr(args, "vtt", False):
-        subs = subtitle_units(units, aligns if good else None, args.max_line)
+        subs = subtitle_units(units, aligns if good else None, args.max_line, args.min_dur, args.max_cps)
         payload["sentences"] = subs
         write_subtitles(subs, args, out_srt, use_speaker=False)
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -559,6 +559,37 @@ def run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, lo
         + (f", 字幕: {out_srt}" if args.srt else ""))
 
 # ---------------- VAD / 对齐 / 字幕 ----------------
+
+def vad_backend_available(name):
+    """VAD 后端可用性。firered 需权重与包同时在；fsmn 由 funasr 自带（权重缺失时由 funasr 自己报错）。"""
+    if name != "firered":
+        return True
+    if not (FIRERED_VAD_DIR / "model.pth.tar").is_file():
+        return False
+    try:
+        import fireredvad  # noqa: F401  只在探测，真正加载在 run_vad 里
+    except Exception:
+        return False
+    return True
+
+
+def resolve_vad_backend(choice, for_diarization=False):
+    """auto -> 按用途选后端：分离链路用 fsmn，纯分段链路用 FireRedVAD（装了才换）。
+
+    为什么要分用途：VAD 在两处角色不同。
+      · cam++ 分离链路：VAD 段就是要聚类的声纹单元，段越碎、声纹越不稳。同一段 25 秒
+        双人合成素材实测 fsmn 4 段 4.53% DER，FireRedVAD 9 段 7.23% DER——边界更准
+        却因为段被切碎、聚类粒度变差而整体更差。这条链路保持 fsmn。
+      · --no-diarize 长音频分段：VAD 只用来定识别批边界，不参与聚类；此时边界越准、
+        耗时越短越好，同一素材实测 8.5s → 0.37s（含两侧模型加载），换 FireRedVAD。
+    显式传 fsmn/firered 时一律按用户指定，不做用途判断。
+    """
+    if choice and choice != "auto":
+        return choice
+    if not vad_backend_available("firered"):
+        return "fsmn"
+    return "fsmn" if for_diarization else "firered"
+
 
 def run_vad(audio_path, backend, device):
     """返回 [[start_ms, end_ms], ...]；fsmn 走 funasr，firered 走 fireredvad"""
@@ -731,6 +762,25 @@ def split_sentences(text, max_len):
                 sub_start = i + 1
         if sub_start < ce:
             pieces.append((sub_start, ce))
+    # 硬切兜底：上面只按软标点切，整段没有标点时（识别丢标点的长句很常见）切片
+    # 会一直超过 max_len，字幕就出一行超长文本。这里按字符数补齐硬切，切点优先
+    # 退到最近的空格/软标点，避免把英文单词劈开。
+    if max_len >= 8:
+        hard = []
+        for cs, ce in pieces:
+            cur = cs
+            while ce - cur > max_len:
+                cut = cur + max_len
+                floor = max(cur + max_len * 3 // 4, cur + 1)
+                for j in range(cut, floor, -1):
+                    if text[j - 1] in SOFT_STOP or text[j - 1] == " ":
+                        cut = j
+                        break
+                hard.append((cur, cut))
+                cur = cut
+            if cur < ce:
+                hard.append((cur, ce))
+        pieces = hard
     # 转 plain 区间
     res = []
     for cs, ce in pieces:
@@ -742,7 +792,28 @@ def split_sentences(text, max_len):
     return res
 
 
-def subtitle_units(units, aligns, max_len):
+def enforce_reading_speed(subs, min_dur_ms=700, max_cps=12.0):
+    """按阅读速度补足过短的字幕显示时间，只延长不改文案（原地修改并返回）。
+
+    CPS（每秒字数）是字幕可读性硬指标：中文常规上限 9-12 字/秒。对齐给的是真实
+    发声时长，语速快的人 20 字可能只占 1.2 秒，直接出 SRT 就是闪一下。这里把 end
+    拉到 max(最小时长, 字数/max_cps)，但不越过下一条字幕起点——越过就会时间轴交叉，
+    播放器表现是两条同时挂在屏幕上。max_cps<=0 时只做最小时长兜底。
+    """
+    for i, s in enumerate(subs):
+        start = int(s.get("start_ms", 0))
+        n = sum(1 for c in (s.get("text") or "") if c not in PUNCT)
+        need = int(min_dur_ms)
+        if max_cps > 0 and n:
+            need = max(need, int(n / float(max_cps) * 1000))
+        end = max(int(s.get("end_ms", 0)), start + need)
+        if i + 1 < len(subs):
+            end = min(end, int(subs[i + 1].get("start_ms", end)) - 1)
+        s["end_ms"] = max(end, start + 100, int(s.get("end_ms", 0)))
+    return subs
+
+
+def subtitle_units(units, aligns, max_len, min_dur=700, max_cps=12.0):
     """把输出单元细分为字幕条;units=[{start_ms,end_ms,text,spk,spk_name}],aligns 可为 None
     有 aligns 时按字级时间戳细分并校正边界,无则整段一条"""
     subs = []
@@ -761,6 +832,7 @@ def subtitle_units(units, aligns, max_len):
                 seg_e = ct[min(max(b - 1, 0), len(ct) - 1)][1]
             subs.append({"start_ms": seg_s, "end_ms": seg_e, "text": sent,
                          "spk": u.get("spk"), "spk_name": u.get("spk_name")})
+    subs = enforce_reading_speed(subs, min_dur, max_cps)
     # 相邻字幕时间收敛:上一条 end 不晚于下一条 start
     for i in range(len(subs) - 1):
         if subs[i]["end_ms"] > subs[i + 1]["start_ms"]:
@@ -822,6 +894,31 @@ def write_subtitles(subs, args, out_srt, use_speaker):
         write_vtt(subs, out_vtt, use_speaker)
         written.append(out_vtt)
     return written
+
+
+def write_rttm(lines, path, uri=None):
+    """RTTM：说话人分离的标准交换格式（dscore / pyannote.metrics / meeteval 都直接读）。
+
+    为什么值得单独出：本项目自己的 DER 走 pyannote.metrics，但外部复核、与论文数字
+    对齐、或把分离结果交给别的工具链时，标准格式是唯一不用再写一次转换的通道，
+    而它的成本只是几行文本。字段含义：
+      SPEAKER <文件标识> 1 <起点秒> <时长秒> <NA> <NA> <说话人> <NA> <NA>
+    说话人标签不能含空白（RTTM 以空白分列），人名里的空格换成下划线。
+    """
+    uri = uri or path.stem
+    rows = []
+    for l in lines or []:
+        if l.get("spk") is None:
+            continue
+        start = max(0.0, int(l.get("start_ms", 0)) / 1000.0)
+        end = max(start, int(l.get("end_ms", 0)) / 1000.0)
+        if end - start <= 0:
+            continue
+        label = l.get("spk_name") or f"spk{l['spk']}"
+        label = re.sub(r"\s+", "_", str(label)) or f"spk{l['spk']}"
+        rows.append(f"SPEAKER {uri} 1 {start:.3f} {end - start:.3f} <NA> <NA> {label} <NA> <NA>")
+    path.write_text("".join(r + "\n" for r in rows), encoding="utf-8")
+    return len(rows)
 
 
 def merge_short_segments(segments, min_ms, gap_ms):
@@ -1536,7 +1633,7 @@ def run_align_only(args, src, log, t0, audio_path, out_json, out_srt):
     del fa, qwen_aligner
     gc_cuda()
 
-    subs = subtitle_units(units, aligns, args.max_line)
+    subs = subtitle_units(units, aligns, args.max_line, args.min_dur, args.max_cps)
     if not subs:
         sys.exit("对齐未产出可用字幕")
     payload["sentences"] = subs
@@ -1564,13 +1661,21 @@ def main():
     ap.add_argument("--vtt", action="store_true",
                     help="额外输出 .vtt 字幕（WebVTT，HTML5 <track> 与视频平台直接可用）；与 --srt 同源同成本")
     ap.add_argument("--max-line", type=int, default=28, help="单条字幕最大字数(默认28)")
+    ap.add_argument("--min-dur", type=int, default=700,
+                    help="字幕最短显示时长ms(默认700;语速快时避免一闪而过,0=不补)")
+    ap.add_argument("--max-cps", type=float, default=12.0,
+                    help="字幕最大阅读速度 字/秒(默认12;超过则按字数拉长显示时长,0=只按最小时长兜底)")
+    ap.add_argument("--rttm", action="store_true",
+                    help="额外输出 .rttm 说话人日志(RTTM 标准格式,pyannote.metrics/meeteval/dscore 可直接读)")
     ap.add_argument("--names", default=None, help="说话人重命名,如 '0=张三,1=李四'")
     ap.add_argument("--merge-gap", type=int, default=800, help="相邻同说话人合并间隔阈值ms(默认800,设0关闭)")
     ap.add_argument("--min-seg", type=int, default=400,
                     help="过短语音段并入相邻段的阈值ms(默认400,0=关闭;碎段声纹不稳易造假说话人)")
     ap.add_argument("--max-unit", type=int, default=60000,
                     help="发言块时长上限ms,超出强制切分(默认60000,0=关闭;超长块单次自回归转写极慢)")
-    ap.add_argument("--vad", choices=["fsmn", "firered"], default="fsmn", help="VAD 后端(默认 fsmn;firered 需已装 fireredvad)")
+    ap.add_argument("--vad", choices=["auto", "fsmn", "firered"], default="auto",
+                    help="VAD 后端(默认 auto=装了 FireRedVAD 就用它:边界更准、耗时约为 fsmn 的 1/20;"
+                         "未装回落 fsmn;fsmn/firered 为强制指定)")
     ap.add_argument("--diarize-engine", choices=["campp", "pyannote"], default="campp",
                     help="说话人分离引擎: campp=VAD+cam++声纹聚类(默认,轻量); "
                          "pyannote=community-1 分割模型(原生处理重叠语音,会议抢话场景更准; 需已装 pyannote.audio)")
@@ -1618,7 +1723,7 @@ def main():
     ap.add_argument("--speaker-db", nargs="?", const="auto", default=None,
                     help="声纹库 JSON 路径:跨文件复用说话人身份,命中已知声纹时直接显示库中姓名;"
                          "裸写或 auto=用音频同目录 speaker_db.json(有则复用无则自动建库、命中后更新)"
-                         "(仅 campp 引擎可用;pyannote 路径不产声纹向量)")
+                         "(campp 与 pyannote 两条路径都可用:pyannote 按已定段边界补算声纹向量)")
     ap.add_argument("--speaker-db-save", action="store_true",
                     help="把本次识别到的说话人声纹写入 --speaker-db 指定的库(同名覆盖;auto 模式自动保存,无需此参)")
     ap.add_argument("--speaker-db-threshold", type=float, default=0.75,
@@ -1654,6 +1759,20 @@ def main():
             if not lang:
                 print("[提示] --engine auto 未指定 --language，保守使用 qwen；"
                       "若素材是中/英/粤，加 --language zh 可自动切到更准的 AED", file=sys.stderr)
+
+    # --vad auto：就地解析成具体后端。解析必须发生在任何 run_vad 调用之前，
+    # 且结果要能被上层当作缓存键的一部分（管线会显式下发解析后的名字，不依赖这里）。
+    if args.vad == "auto":
+        used = resolve_vad_backend("auto", for_diarization=bool(args.diarize))
+        hint = ""
+        if used == "fsmn" and vad_backend_available("firered"):
+            hint = "（分离链路的段边界直接决定声纹聚类粒度，实测 fsmn 更稳；" \
+                   "--no-diarize 长音频会自动改用 FireRedVAD）"
+        elif used == "fsmn":
+            hint = "（未装 FireRedVAD；可用 modelscope download --model xukaituo/FireRedVAD 安装）"
+        if hint:
+            print(f"[提示] VAD 后端自动选择 {used}{hint}", file=sys.stderr)
+        args.vad = used
 
     # 输入路径校验:拒绝 ".."，realpath 规范化
     if ".." in args.audio:
@@ -1884,7 +2003,7 @@ def main():
                        "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "language": u.get("language"),
                                      "text": u["text"]} for u in units]}
             if aligns is not None:
-                payload["sentences"] = subtitle_units(units, aligns, args.max_line)
+                payload["sentences"] = subtitle_units(units, aligns, args.max_line, args.min_dur, args.max_cps)
             out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             if aligns is not None:
                 write_subtitles(payload["sentences"], args, out_srt, use_speaker=False)
@@ -1909,7 +2028,7 @@ def main():
             aligns = None
         fa = None; qwen_aligner = None; gc_cuda()   # 对齐已完成
         if aligns:
-            payload["sentences"] = subtitle_units([u], aligns, args.max_line)
+            payload["sentences"] = subtitle_units([u], aligns, args.max_line, args.min_dur, args.max_cps)
             write_subtitles(payload["sentences"], args, out_srt, use_speaker=False)
         out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"[2] 完成 (总耗时 {time.time()-t0:.0f}s), 结构化结果: {out_json}"
@@ -2098,9 +2217,12 @@ def main():
     if emotions:
         payload["emotions"] = emotions
     if aligns is not None:
-        subs = subtitle_units(units, aligns, args.max_line)
+        subs = subtitle_units(units, aligns, args.max_line, args.min_dur, args.max_cps)
         payload["sentences"] = subs
         write_subtitles(subs, args, out_srt, use_speaker=True)
+    if getattr(args, "rttm", False):
+        n = write_rttm(lines, audio_path.with_suffix(".rttm"), uri=audio_path.stem)
+        log(f"[6b] RTTM 说话人日志 {n} 行: {audio_path.with_suffix('.rttm')}")
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"[6] 结构化结果已保存: {out_json}" + (f", 字幕: {out_srt}" if aligns is not None else "")
         + f"  (总耗时 {time.time()-t0:.0f}s)")
