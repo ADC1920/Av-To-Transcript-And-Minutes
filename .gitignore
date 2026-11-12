@@ -41,6 +41,11 @@ venv/
 .cache/
 models/
 
+# 跨会议索引与 MCP 任务状态（本机数据，含真实会议路径）
+meetings.db
+*.db-journal
+jobs/
+
 # 本地临时产物（测试素材、探针脚本、中间输出）
 .tmp/
 
