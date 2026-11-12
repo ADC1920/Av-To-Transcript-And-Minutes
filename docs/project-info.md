@@ -24,6 +24,55 @@
 | 后处理 | 繁转简、专名纠错、ITN、字幕 | 全本地 |
 | 排版 | article-format 规范 docx | 全本地 |
 | 纪要提炼 | meeting-notes-expert 模板 + 校验器 | 会话内 AI |
+| 运行清单 | `manifest.json`：每素材参数/耗时/状态/产物 | 全本地 |
+| 说话人泳道图 | `tools/speaker_timeline.py` | 全本地 |
+| 跨会议检索 | `tools/meeting_index.py`（SQLite FTS5） | 全本地 |
+| MCP 工具服务 | `tools/mcp_server.py`（job 语义） | 全本地 |
+
+## 常驻转写进程（v2.6）
+
+改造前每个素材起一个 `qwen_asr.py` 子进程，进程内重新加载主引擎；批量 N 个素材即 N 次加载。
+v2.6 起主管线拉起一个常驻子进程（`qwen_asr.py --worker`），用 stdin/stdout 传 JSON 任务，
+模型在进程内按 `(引擎, device)` 缓存，第一份素材加载一次之后复用。
+
+实测：本地 Qwen3-ASR 批量两份素材，首次加载 2 秒，第二份加载耗时 0 秒且返回同一模型对象。
+
+三条边界，改动时不要破坏：
+- worker 的 stdout 是协议通道，日志必须走 stderr；混入日志会解析失败。
+- 单任务的 `SystemExit` 必须转成该项失败，不能中断整批（一份坏素材不该让其余作废）。
+- worker 不可用（启动失败、进程退出、协议不符）时，`call_asr` 回退到逐文件子进程，
+  最坏情形与改造前等价。`--verbose` 强制走逐文件，因为要实时看子进程输出。
+
+## 机器可读产物
+
+| 产物 | 生成方式 | 用途 |
+|---|---|---|
+| `manifest.json` | 每次批量运行自动写 | 报表、索引、MCP 查询；只列实际存在的产物 |
+| `纪要*.json` | `validate_minutes.py --export` | 待办表、决策列表、各节文本，供任务同步与检索 |
+| `*.rttm` | `--rttm` | 标准说话人日志，外部复核工具直读 |
+| `时间轴.html` | `tools/speaker_timeline.py` | 说话人泳道图 |
+
+## MCP 工具面
+
+`tools/mcp_server.py` 暴露 8 个工具：`transcribe_start/status/result/cancel/list`、
+`search_meetings`、`index_meetings`、`render_timeline`。
+
+job 状态落 `~/.av2m/jobs/<job_id>/job.json`（可用 `AV2M_JOBS` 覆盖），进程重启后仍可查。
+幂等键 = 输入内容哈希 + 参数哈希，同一份文件同一份参数重复提交直接复用。
+
+参数只接受白名单（`_ALLOWED_OPTIONS`）：拼错的键直接拒，不静默忽略——
+静默忽略比报错更危险，agent 会以为生效了。
+
+## 跨会议检索
+
+`tools/meeting_index.py`，索引落 `~/.av2m/meetings.db`（可用 `AV2M_INDEX` 覆盖）。
+
+分词器用 **trigram** 而不是 unicode61：中文没有词边界，unicode61 会把整句当一个大 token，
+「销售数据」这类子串查询永远命中不了；trigram 按三字滑窗建索引，任意长度 ≥3 的中文子串都能匹配。
+两字及以下的词 trigram 覆盖不到，退到 LIKE 子串扫描（会议量级可接受）。
+
+先用 FTS5 而不是向量库的理由：会议检索的典型查询是专名、人名、项目名，关键词命中率高、
+结果可解释、零额外依赖。向量检索等有真实查询日志再评估。
 
 ## 调研导航
 

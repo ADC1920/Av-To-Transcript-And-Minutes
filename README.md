@@ -72,8 +72,10 @@ winget install ffmpeg            # Windows
 # apt install ffmpeg            # Linux
 # brew install ffmpeg           # macOS
 
-# Python 依赖
-pip install -r requirements.txt
+# Python 依赖（二选一）
+uv sync                          # 推荐：按 uv.lock 装出可复现的版本组合
+# pip install -r requirements.txt  # 不想装 uv 时用（只给版本区间）
+
 # GPU 加速：先按 https://pytorch.org 安装对应 CUDA 版本的 torch
 
 # 若报 libtorchcodec 加载失败（pyannote 引入的库与静态 FFmpeg 不兼容）：
@@ -185,8 +187,41 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 | `会议原文-<名>.md/.docx` | 会议模式成稿（`[00:00] 说话人N：文本`） |
 | `会议原文-<名>.srt` | 字幕（`--srt`，含说话人标记） |
 | `会议原文-<名>.rttm` | 说话人日志（`--rttm`，RTTM 标准格式，可直接喂 pyannote.metrics / meeteval / dscore） |
+| `manifest.json` | 运行清单（每次批量一份）：每个素材的参数、耗时、状态与**实际存在**的产物路径，供报表、索引与 MCP 查询读取 |
 
 **结构化总结**由 AI Agent 读取「会议原文」后按 [meeting-notes-expert](skills/meeting-notes-expert/SKILL.md) 模板提炼成七节式总结（基本信息 / 结论 / 关键决策或要点 / 行动事项 / 待定与开放问题 / 上期回顾 / 内容详情）——这一步是理解性工作，交给会话内的 AI 完成。会议场景产出 `会议纪要-<名>.docx`，讲座、访谈、播客等其他场景产出 `总结-<名>.docx`。
+
+纪要除文档外可再导出一份机器可读的 JSON（待办表、决策列表、各节文本），供任务同步与跨会议检索：
+
+```bash
+python skills/meeting-notes-expert/scripts/validate_minutes.py 会议纪要-x.docx --export 会议纪要-x.json
+```
+
+---
+
+## 🧰 工具（tools/）
+
+| 工具 | 用途 |
+| --- | --- |
+| `speaker_timeline.py` | 把转写结果 / 会议原文 / RTTM 渲染成说话人泳道图 HTML，一屏看清谁在何时说了多久 |
+| `meeting_index.py` | 跨会议检索：SQLite FTS5 索引与查询（`add` / `search` / `stats`），中文按 trigram 子串匹配 |
+| `mcp_server.py` | MCP 工具服务：`transcribe_start/status/result/cancel/list`、`search_meetings`、`index_meetings`、`render_timeline` |
+
+```bash
+# 泳道图
+python tools/speaker_timeline.py out/会议原文-x.json -o 时间轴.html
+
+# 跨会议检索（索引落 ~/.av2m/meetings.db，可用 AV2M_INDEX 覆盖）
+python tools/meeting_index.py add out/
+python tools/meeting_index.py search 胚布 白配检测 --speaker 张三
+
+# MCP 服务（stdio，需 pip install mcp 或 uv sync --extra mcp）
+python tools/mcp_server.py
+```
+
+MCP 工具按 job 语义设计：`transcribe_start` 立即返回 `job_id` 不阻塞，同一份文件加同一份参数重复提交直接复用（按内容哈希幂等）；状态落磁盘，进程重启后仍可查。这样 agent 不必记十几个命令行参数，参数校验收敛到工具契约里。
+
+**模型常驻**：批量处理时管线拉起一个常驻转写子进程，主引擎只在第一份素材加载一次（实测第二份起加载耗时 0 秒），N 个素材省掉 N-1 次权重加载。常驻进程异常时自动回退逐文件子进程，最坏情形与改造前等价。
 
 ---
 
@@ -198,8 +233,17 @@ Av-To-Transcript-And-Minutes/
 ├── test_pipeline_e2e.py             # 端到端回归（自动合成素材，17 项断言）
 ├── hotwords.example.txt             # 热词表示例（复制为 hotwords.txt 自动加载）
 ├── replace_dict.example.txt         # 纠错词典示例（复制为 replace_dict.txt 自动加载）
-├── requirements.txt
+├── requirements.txt                 # 兼容入口（不想装 uv 时用）
+├── pyproject.toml                   # 依赖真相源；uv lock 生成 uv.lock 锁定具体版本
+├── uv.lock
 ├── benchmark_quality.py             # 质量基准：DER（分离错误率）+ CER（字错误率）
+├── tools/
+│   ├── speaker_timeline.py          # 说话人泳道图（JSON/docx/RTTM → HTML）
+│   ├── meeting_index.py             # 跨会议检索（SQLite FTS5）
+│   └── mcp_server.py                # MCP 工具服务（job 语义）
+├── tests/
+│   ├── test_quality_baseline.py     # 质量门槛（DER/CER/重叠）
+│   └── test_tools_units.py          # tools 工具纯逻辑自检（35 项）
 ├── skills/
 │   ├── funasr-transcribe/
 │   │   ├── SKILL.md                 # 转写技能（Agent 调用规范）

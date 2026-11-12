@@ -1,0 +1,49 @@
+[project]
+name = "av-to-transcript-and-minutes"
+version = "2.6.0"
+description = "音视频 → 转写文稿 / 会议纪要：拆轨、人声分离、说话人分离、转写、字幕、ITN、docx 一条命令"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.0,<3.0",
+    "torchaudio>=2.0,<3.0",
+    "transformers>=4.45,<6.0",
+    "funasr>=1.1,<2.0",
+    "librosa",
+    "soundfile",
+    "numpy",
+    "scikit-learn",
+    "opencc-python-reimplemented",
+    "demucs>=4.0,<5.0",
+    "pyannote.audio>=4.0,<5.0",
+    "python-docx",
+    "lxml",
+]
+
+[project.optional-dependencies]
+# 专名纠错拼音模糊匹配（--fuzzy）
+fuzzy = ["pypinyin", "rapidfuzz"]
+# 云端识别通道（--asr-engine cloud 的 message 子模型）
+cloud = ["dashscope", "requests"]
+# MCP 工具服务（tools/mcp_server.py 依赖官方 Python SDK）
+mcp = ["mcp"]
+
+[tool.uv]
+# 本仓库是脚本集合不是可安装包：uv 只负责按本文件解析并锁定依赖，不构建 wheel。
+# 需要锁文件是为了回答「这个环境到底装的哪一版」——requirements.txt 只给区间，
+# 而几处已知坑（torch/torchaudio 版本不同步、transformers 大版本改返回结构）
+# 只有具体版本号才能复现与定位。
+package = false
+
+# torch 与 torchaudio 必须来自 CUDA 索引：PyPI 上的同名包是 CPU 版，
+# 装上去 GPU 直接不可用（静默退化成 CPU，转写慢十倍且 AED 时间戳失效）。
+# 官方 CUDA 索引只有 cu130，torch 与 torchaudio 版本号本就不同步（2.13 / 2.11）。
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+torchaudio = [{ index = "pytorch-cu130" }]

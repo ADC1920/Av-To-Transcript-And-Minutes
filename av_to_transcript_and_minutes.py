@@ -533,6 +533,101 @@ def _align_srt_only(vocals: Path, cache_json: Path, opts: dict):
     return payload
 
 
+class AsrWorker:
+    """常驻 ASR 子进程：一次加载模型，批量素材复用。
+
+    改造前每个素材起一个 qwen_asr 子进程，每次都重载主引擎（Qwen3-ASR 3.8GB）。
+    批量 N 个素材即 N 次加载，而加载耗时与显存占用都与素材数无关，纯属重复支出。
+    这里拉起一个 worker 用 stdin/stdout 传 JSON 任务，模型在进程内常驻。
+
+    worker 不可用时（崩溃、超时、协议不符）由调用方回退到逐文件子进程，
+    保证这次优化最坏情况等价于改造前，不会引入新的失败面。"""
+
+    def __init__(self, script: Path, verbose: bool = False):
+        self.script = script
+        self.verbose = verbose
+        self.proc = None
+        self.broken = False
+        self.jobs = 0
+
+    def _start(self):
+        if self.proc is not None or self.broken:
+            return self.proc
+        try:
+            # stderr 直接继承父进程：worker 的进度/告警/引擎加载日志要进终端与 run.log，
+            # 只有协议应答走 stdout 管道（stdout 是协议通道，混入日志会解析失败）
+            self.proc = subprocess.Popen(
+                [sys.executable, str(self.script), "--worker"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                env=child_env(), bufsize=1)
+        except OSError as e:
+            print(f"[提示] 常驻转写进程启动失败，回退逐文件模式：{e}", file=sys.stderr)
+            self.broken = True
+            self.proc = None
+        return self.proc
+
+    def run(self, audio: Path, argv: list):
+        """执行一次转写；返回 (ok, error, stdout)。worker 不可用时返回 None 交给调用方回退。"""
+        proc = self._start()
+        if proc is None or proc.poll() is not None:
+            self.broken = True
+            return None
+        try:
+            proc.stdin.write(json.dumps({"audio": str(audio), "args": argv},
+                                        ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.broken = True
+            return None
+        line = proc.stdout.readline()
+        if not line:
+            # worker 在任务中途死掉：标记不可用，让调用方回退重跑这一份
+            print("[提示] 常驻转写进程已退出，本份回退逐文件模式", file=sys.stderr)
+            self.broken = True
+            return None
+        try:
+            resp = json.loads(line)
+        except ValueError:
+            self.broken = True
+            return None
+        self.jobs += 1
+        return bool(resp.get("ok")), resp.get("error"), resp.get("stdout") or ""
+
+    def close(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.write(json.dumps({"op": "shutdown"}) + "\n")
+            self.proc.stdin.flush()
+            self.proc.wait(timeout=10)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        finally:
+            self.proc = None
+
+
+_worker = None
+
+
+def asr_worker(script: Path, verbose: bool = False):
+    """进程内单例：整批素材共用一个常驻转写进程"""
+    global _worker
+    if _worker is None or _worker.script != script:
+        _worker = AsrWorker(script, verbose=verbose)
+    return _worker
+
+
+def shutdown_asr_worker():
+    global _worker
+    if _worker is not None:
+        _worker.close()
+        _worker = None
+
+
 def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     """调 qwen_asr.py 转写（默认 --diarize：说话人分离；opts.no_diarize=True 跳过），返回结构化 JSON。
     opts 键：threshold / diarize_engine / hotwords / names / srt / engine（识别引擎）/ no_diarize
@@ -621,7 +716,17 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     if not opts.get("no_diarize"):
         cmd.append("--diarize")
     cmd += ["--job-config", str(cfg_path)] + extra
-    run_child(cmd, verbose=bool(opts.get("verbose")), env=child_env())
+    # 优先走常驻 worker：批量场景下模型只加载一次；worker 不可用时回退逐文件子进程，
+    # 最坏情形与改造前等价。verbose 模式必须走逐文件（要实时看子进程输出）。
+    # cmd[3:] 是音频路径之后的参数；音频单独传，避免 worker 侧重复拼一个位置参数。
+    res = None
+    if not opts.get("verbose"):
+        res = asr_worker(asr_script()).run(vocals, cmd[3:])
+    if res is None:
+        run_child(cmd, verbose=bool(opts.get("verbose")), env=child_env())
+    elif not res[0]:
+        cfg_path.unlink(missing_ok=True)
+        raise RuntimeError(f"转写失败：{res[1]}")
     cfg_path.unlink(missing_ok=True)
     # 补写源指纹：下次命中时据此判断素材是否被换过
     payload = _read_json(raw_json) or {"lines": []}
@@ -629,6 +734,35 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     _write_json(cache_json, payload)
     raw_json.unlink(missing_ok=True)
     return payload
+
+
+def manifest_item(media: Path, out_dir: Path, status: str, detail, seconds: float) -> dict:
+    """一条素材的处理记录。产物按实际存在列出，不按预期列出——
+    清单的价值在于「这份成稿确实在磁盘上」，写预期产物就等于失去核对能力。
+    `--flat` 模式下成稿落在素材同目录，故两处都查。"""
+    stem_dir = out_dir / media.stem
+    stem = media.stem
+    names = (f"会议原文-{stem}", f"转写文稿-{stem}")
+    artifacts = []
+    for base in names:
+        for ext in (".md", ".docx", ".srt", ".vtt", ".rttm"):
+            for cand in (stem_dir / f"{base}{ext}", media.parent / f"{base}{ext}"):
+                if cand.is_file():
+                    artifacts.append(str(cand))
+                    break
+    for extra in ("speaker_db.json",):
+        p = stem_dir / extra
+        if p.is_file():
+            artifacts.append(str(p))
+    item = {"source": str(media), "status": status, "seconds": seconds,
+            "artifacts": artifacts}
+    if detail:
+        item["error"] = str(detail)
+    try:
+        item["source_bytes"] = media.stat().st_size
+    except OSError:
+        pass
+    return item
 
 
 def _read_json(path: Path):
@@ -1356,13 +1490,16 @@ def main():
     total = len(medias)
     run_t0 = time.time()
     ok = skip = fail = novoice = redocx = resrt = invalid = 0
+    items = []
     for idx, v in enumerate(medias, 1):
         item_t0 = time.time()
         print(f"\n[{idx}/{total}] {v.name}")
+        status, detail = "failed", None
         try:
             r = separate_one(v, out_dir, args.force, do_asr=not args.no_asr,
                              meeting=args.meeting, opts=opts,
                              no_separate=args.no_separate)
+            status = r
             if r == "skip":
                 skip += 1
                 print(f"[跳过] {v.name}（已处理过，--force 可重跑）")
@@ -1381,6 +1518,8 @@ def main():
         except AudioTrackMissing as e:
             # 素材本身没有音轨（或音频损坏）：不算处理失败，单独归类
             invalid += 1
+            status = "no_audio_track"
+            detail = str(e)
             print(f"[无音轨] {v.name}：{e}")
         except subprocess.CalledProcessError as e:
             fail += 1
@@ -1397,8 +1536,12 @@ def main():
         except Exception as e:
             # 兜底：缺 ffmpeg/demucs（FileNotFoundError）、缓存 JSON 损坏等不再中断整批
             fail += 1
-            print(f"[失败] {v.name}：{type(e).__name__}: {e}")
-        print(f"    用时 {time.time() - item_t0:.1f} 秒（{idx}/{total}）")
+            status = "failed"
+            detail = f"{type(e).__name__}: {e}"
+            print(f"[失败] {v.name}：{detail}")
+        seconds = round(time.time() - item_t0, 1)
+        print(f"    用时 {seconds} 秒（{idx}/{total}）")
+        items.append(manifest_item(v, out_dir, status, detail, seconds))
 
     elapsed = time.time() - run_t0
     print(f"\n汇总：完成 {ok} / 补排版 {redocx} / 补字幕 {resrt} / 无人声 {novoice} / 跳过 {skip} / 失败 {fail}"
@@ -1407,6 +1550,29 @@ def main():
     if total:
         print(f"耗时：总计 {elapsed:.1f} 秒，平均 {elapsed / total:.1f} 秒/个（{total} 个素材）")
 
+    # 运行清单：把本次结果写成机器可读的一份记录，供后续索引、报表与 MCP 查询使用。
+    # 写盘失败不影响已产出的成稿，只提示一行。
+    try:
+        manifest = {
+            "schema_version": 1,
+            "run_started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run_t0)),
+            "duration_seconds": round(elapsed, 1),
+            "output_dir": str(out_dir),
+            "summary": {"completed": ok, "redocx": redocx, "resrt": resrt, "novoice": novoice,
+                        "skipped": skip, "failed": fail, "no_audio_track": invalid},
+            "options": {k: opts.get(k) for k in ("engine", "diarize_engine", "hotwords",
+                                                 "names", "demucs_model", "no_diarize")
+                        if opts.get(k) not in (None, False)},
+            "items": items,
+        }
+        (out_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[清单] 已写入 {out_dir / 'manifest.json'}")
+    except OSError as e:
+        print(f"[提示] 运行清单写入失败（不影响成稿）：{e}", file=sys.stderr)
+
+    shutdown_asr_worker()
+
     if log_handle is not None:
         print(f"===== 运行结束 {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
         # 先恢复原始流再关闭文件，避免 close 后仍有输出落在已关闭的句柄上
@@ -1414,7 +1580,6 @@ def main():
         sys.stderr = sys.stderr.streams[0]
         log_handle.close()
         print(f"[日志] 已写入 {log_path}")
-
 
 if __name__ == "__main__":
     main()

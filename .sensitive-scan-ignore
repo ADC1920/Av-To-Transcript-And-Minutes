@@ -6,3 +6,8 @@
 # qwen_asr.py 中的 dashscope 密钥赋值语句：SDK 标准写法，值由 load 函数
 # 从环境变量或注册表读取，源码内不含字面量
 skills/funasr-transcribe/scripts/qwen_asr.py   cred.assignment
+
+# uv.lock 由 uv 生成，内容只有包名、版本与 PyPI 的 sha256 哈希。
+# 手机号/内网 IP/银行卡号等规则的命中都是哈希或版本号里数字排列的巧合，
+# 不是真实数据；该文件不应手工编辑（改了就与解析结果不一致），故整体豁免。
+uv.lock   *

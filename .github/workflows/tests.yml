@@ -21,7 +21,9 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tools/*.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
+      - name: tools 工具单测（清单/MCP 参数/索引/泳道图，零依赖）
+        run: python tests/test_tools_units.py
       - name: ITN 单测（零依赖）
         run: python skills/funasr-transcribe/scripts/test_itn_zh.py
       - name: cloud 引擎单测（全 mock，零网络）
