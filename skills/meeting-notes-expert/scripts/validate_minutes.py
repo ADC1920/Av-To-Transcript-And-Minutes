@@ -477,12 +477,35 @@ def selftest():
     return 0 if ok else 1
 
 
+def export_structured(path):
+    """把纪要解析成机器可读结构：基本信息 / 各节文本 / 待办表 / 决策列表。
+
+    纪要到这一步之前只是给人看的文档，下游（任务同步、跨会议检索、报表）
+    拿不到任何字段。这里复用校验器已有的解析逻辑，不新增第二套解析器——
+    两套解析器必然漂移，而校验器已经覆盖 md 与 docx 两种输入。"""
+    blocks = parse_md(path.read_text(encoding="utf-8", errors="replace")) \
+        if path.suffix.lower() == ".md" else parse_docx(path)
+    basic, sections, _ = split_sections(blocks)
+    action_items, _header = collect_action_items(sections.get("待办事项") or [])
+    decisions = collect_decisions(sections.get("关键决策") or [])
+    return {
+        "schema_version": 1,
+        "source_file": str(path),
+        "basic_info": basic,
+        "sections": {k: section_text(v) for k, v in sections.items()},
+        "action_items": action_items,
+        "decisions": decisions,
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="结构化总结结构校验与源文核对（会议版章节名）")
     ap.add_argument("file", nargs="?", help="纪要 md/docx")
     ap.add_argument("--source", default=None, help="源材料文本（转写稿/笔记）")
     ap.add_argument("--strict", action="store_true", help="WARN 也判失败")
     ap.add_argument("--json", dest="json_path", default=None, help="结果落 JSON")
+    ap.add_argument("--export", default=None, metavar="JSON",
+                    help="导出结构化纪要（基本信息/各节/待办表/决策列表）到指定 JSON")
     ap.add_argument("--selftest", action="store_true")
     ns = ap.parse_args(argv)
     if ns.selftest:
@@ -493,6 +516,12 @@ def main(argv=None):
     if not path.is_file():
         print(f"文件不存在：{path}")
         return 2
+    if ns.export:
+        data = export_structured(path)
+        Path(ns.export).write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+        print(f"结构化纪要已导出：{ns.export}"
+              f"（待办 {len(data['action_items'])} 条，决策 {len(data['decisions'])} 条）")
     source = Path(ns.source).read_text(encoding="utf-8", errors="replace") if ns.source else None
     rc, results = validate(path, source, ns.strict)
     for level, name, detail in results:
