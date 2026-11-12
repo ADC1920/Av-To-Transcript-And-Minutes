@@ -267,8 +267,21 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
                            "timestamp": r.get("timestamp"), "confidence": r.get("confidence")})
         return parsed
     import torch
+    import soundfile as sf
+    # 传 numpy 波形而非文件路径：路径形式会让 processor 内部用 torchcodec 解码，
+    # 而 torchcodec 与静态 FFmpeg 不兼容（装 pyannote.audio 时会一并引入），
+    # 报 libtorchcodec_core*.dll 加载失败。numpy 形式直接进特征提取，绕开这条依赖。
+    audio_inputs = []
+    for p in audio_paths:
+        data, sr = sf.read(str(p), dtype="float32", always_2d=False)
+        if data.ndim > 1:
+            data = data.mean(axis=1)          # 多声道混成单声道，与 processor 内部行为一致
+        if sr != 16000:
+            import librosa
+            data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+        audio_inputs.append(data)
     inputs = processor.apply_transcription_request(
-        audio=audio_paths, language=language, prompt=hotwords, return_tensors="pt")
+        audio=audio_inputs, language=language, prompt=hotwords, return_tensors="pt")
     inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
     # 音频特征 extractor 输出 float32,与 bf16 模型权重对齐(实测 conv 层要求同型)
     if "input_features" in inputs and torch.is_tensor(inputs["input_features"]):
