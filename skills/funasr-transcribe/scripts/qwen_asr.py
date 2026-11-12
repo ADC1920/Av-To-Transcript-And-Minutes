@@ -69,6 +69,7 @@ FIRERED_VAD_DIR = Path(os.path.expanduser("~")) / ".cache" / "fireredvad" / "Fir
 PYANNOTE_DIR = Path.home() / ".cache" / "modelscope" / "models" / \
     "pyannote--speaker-diarization-community-1" / "snapshots" / "master"
 AUTO_SEGMENT_S = 60  # 超过此时长自动走 VAD 分段批量转写(实测比整段自回归快约 20%,且每段语言独立检测)
+VAD_MAX_END_SILENCE_MS = 800  # VAD 断句静音阈值(funasr 配置默认值);显式传值以关闭 1.4.19 的动态静音
 AED_BATCH_BUDGET_S = 240  # AED 单次前向的批内总音频时长预算(bf16 后显存余量足,120→240 换吞吐)
 AED_MIN_SPLIT_S = 10.0    # OOM 兜底重试时单段最短时长,短于此不再二分
 AED_MAX_SPLIT_DEPTH = 2   # OOM 兜底二分深度上限(2 → 最小拆到原段 1/4)
@@ -619,7 +620,12 @@ def run_vad(audio_path, backend, device):
             vad_wav.unlink(missing_ok=True)
         return [[int(round(s * 1000)), int(round(e * 1000))] for s, e in result["timestamps"]]
     from funasr import AutoModel
-    vad = AutoModel(model="fsmn-vad", device=device, disable_update=True)
+    # 必须显式传 max_end_silence_time：funasr 1.4.19 起 fsmn-vad 默认启用「动态静音阈值」
+    # （model.py:1012 `dynamic_silence = max_end_silence_time is None`），阈值随累计语音时长
+    # 逐步放宽，实测 32 秒素材里 1.5 秒静音切不开，整段被判成一个语音段——下游「段数<2 跳过
+    # 聚类」于是静默退化成单说话人，会议原文丢失全部说话人标签。显式传值时动态逻辑自动关闭。
+    vad = AutoModel(model="fsmn-vad", device=device, disable_update=True,
+                    max_end_silence_time=VAD_MAX_END_SILENCE_MS)
     return [[int(s), int(e)] for s, e in vad.generate(input=str(audio_path))[0]["value"]]
 
 
@@ -1728,7 +1734,8 @@ def main():
                     help="把本次识别到的说话人声纹写入 --speaker-db 指定的库(同名覆盖;auto 模式自动保存,无需此参)")
     ap.add_argument("--speaker-db-threshold", type=float, default=0.75,
                     help="声纹库命中阈值(余弦相似度,默认 0.75;同人被认成新人的话调低)")
-    ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
+    ap.add_argument("--device", default=None,
+                    help="推理设备,默认自动选(cuda 可用则 cuda:0,否则 cpu);无 N 卡或装的是 CPU 版 torch 时自动走 cpu")
     ap.add_argument("--job-config", default=None,
                     help="任务配置 JSON 路径（供管线脚本透传参数；与命令行同名参数等价）")
     ap.add_argument("--align-only", default=None, metavar="JSON",
@@ -1748,6 +1755,17 @@ def main():
                 sys.exit(f"任务配置含未知项: {k}")
             setattr(args, k, v)
 
+    # 设备自动选择：--device 未显式给出时按 torch 实际能力定。装的是 CPU 版 torch 时
+    # torch.cuda.is_available() 为 False，若照旧传 cuda:0，funasr/pyannote 会直接抛错
+    # （实测：--engine cloud + --meeting 时识别在云端，但分离仍在本地，崩在设备选择上）
+    if not args.device:
+        args.device = "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                args.device = "cuda:0"
+        except ImportError:
+            pass  # torch 未装=只能走纯云端通道（omni/filetrans）
     # --engine auto：按语言路由。中/英/粤在 AED 上实测更准、嘈杂素材更稳；其余语言
     # （尤其日文，AED 会输出中文乱码）留在 Qwen。未指定语言时无法预知，保守走 Qwen。
     if args.engine == "auto":

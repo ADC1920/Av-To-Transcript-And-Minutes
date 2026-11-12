@@ -324,16 +324,16 @@ _article_skill_cache = None
 def article_skill() -> Path:
     """定位「全局文章排版规范」技能脚本目录（article-format，惰性查找）：
     环境变量 ARTICLE_SKILL_DIR → ZCode 技能根 → 共享 .agents → 仓库 skills/ →
-    Claude / 旧 ZCode 路径兜底；找不到时返回 None（跳过排版，产出标准 docx）"""
+    Claude 路径兜底；找不到时返回 None（跳过排版，产出标准 docx）"""
     global _article_skill_cache
     if _article_skill_cache is not None:
         return _article_skill_cache or None
     env = os.environ.get("ARTICLE_SKILL_DIR")
     cands = ([Path(env)] if env else []) + [
+        Path.home() / ".zcode" / "skills" / "article-format" / "scripts",
         Path.home() / ".agents" / "skills" / "article-format" / "scripts",
         SCRIPT_DIR / "skills" / "article-format" / "scripts",
-        Path.home() / ".claude" / "skills" / "article-format" / "scripts",
-        Path.home() / ".zcode" / "skills" / "article-format" / "scripts"]
+        Path.home() / ".claude" / "skills" / "article-format" / "scripts"]
     for c in cands:
         if (c / "md2docx.py").is_file():
             _article_skill_cache = c
@@ -367,6 +367,15 @@ def resolve_vad_arg(vad, diarize: bool) -> str:
         return "fsmn"
     return "fsmn" if diarize else "firered"
 
+
+
+def pyannote_available() -> bool:
+    """pyannote.audio 是否可用。只探包导入，不碰模型权重（权重缺失会由 run_pyannote 自己报错）。"""
+    try:
+        import pyannote.audio  # noqa: F401  只在探测，真正加载在 qwen_asr 侧
+    except Exception:
+        return False
+    return True
 
 
 def probe_audio_codec(video: Path) -> str:
@@ -1014,6 +1023,13 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
             run_child(["ffmpeg", "-y", "-i", str(media)] + ch_args + ["-ar", "44100",
                        str(vocals_out)], env=child_env())
     elif force or not separated or not same_model:
+        # demucs 未装时立即给出可读结论。否则 subprocess 只会抛 FileNotFoundError
+        # [WinError 2]，看不出缺的是 demucs 还是 ffmpeg，整批素材都记成「失败」。
+        # 抛 RuntimeError 而非 sys.exit：SystemExit 会穿透批量循环的兜底 except，
+        # 直接终止整批（其它素材连试都不试）。
+        if shutil.which("demucs") is None:
+            raise RuntimeError("找不到 demucs 命令：请先 pip install demucs，"
+                               "或对纯人声素材加 --no-separate 跳过人声分离")
         # 分离前对原始素材粗估信噪比（分位法；校准：纯人声 25.9 dB、人声+0.15 粉噪 14.6 dB），
         # 明显纯净时提示可 --no-separate 省 Demucs。只提示不自动跳——判据是相对估计，
         # 误判的代价是转写变差，宁多跑一次分离（与已证伪的「人声/背景音能量差」判据不同）。
@@ -1060,6 +1076,21 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
             flatten_outputs(stem_dir, media, out_stem)
         return result
     return "done"
+
+
+def env_default(name: str, choices: tuple, fallback: str) -> str:
+    """参数默认值可由环境变量指定（取值非法时回落 fallback 并提示）。
+
+    让「本机只走云端」这类机器级偏好通过 ASR_ENGINE=cloud 生效，而不改公开仓库
+    的离线默认值；命令行显式传参优先级更高。"""
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return fallback
+    if v in choices:
+        return v
+    print(f"[提示] 环境变量 {name}={v} 不在 {choices} 中，已按默认 {fallback} 处理",
+          file=sys.stderr)
+    return fallback
 
 
 def main():
@@ -1126,11 +1157,13 @@ def main():
                     help="字幕最短显示时长 ms（默认 700；语速快时避免一闪而过，0=不补）")
     ap.add_argument("--max-cps", type=float, default=None,
                     help="字幕最大阅读速度 字/秒（默认 12；超出按字数拉长显示，0=只按最小时长兜底）")
-    ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto", "cloud"], default="qwen",
+    ap.add_argument("--asr-engine", choices=["qwen", "aed", "auto", "cloud"],
+                    default=env_default("ASR_ENGINE", ("qwen", "aed", "auto", "cloud"), "qwen"),
                     help="识别引擎：qwen=Qwen3-ASR-1.7B（默认，多语言）；aed=FireRedASR2-AED（中/英/粤更准）；"
                          "auto=按 --language 路由（中/英/粤走 aed，其余走 qwen）；"
                          "cloud=阿里云百炼（默认 qwen-audio-3.1-asr-message，需 DASHSCOPE_API_KEY，免显存；"
-                         "换子模型加 --asr-extra \"--cloud-model omni|filetrans\"）")
+                         "换子模型加 --asr-extra \"--cloud-model omni|filetrans\"）；"
+                         "可用环境变量 ASR_ENGINE 改本机默认值")
     ap.add_argument("--itn", action="store_true",
                     help="中文逆文本正则化：三百二十万元->320万元、百分之八十->80%%，"
                          "二零二六年十月十五日->2026年10月15日（自写规则，零依赖）")
@@ -1201,9 +1234,20 @@ def main():
     if not medias:
         sys.exit("没找到视频/音频文件")
 
-    # auto：会议模式走 pyannote（重叠语音更准），其余走 campp（轻量）
-    diarize_engine = ("pyannote" if args.meeting else None) \
-        if args.diarize_engine == "auto" else args.diarize_engine
+    # auto：会议模式走 pyannote（重叠语音更准），其余走 campp（轻量）。
+    # pyannote 未安装时回落 campp 并提示——否则 --meeting 会在子进程里
+    # ModuleNotFoundError 崩掉，整批素材失败，看起来像转写本身出问题。
+    if args.diarize_engine == "auto":
+        if args.meeting and pyannote_available():
+            diarize_engine = "pyannote"
+        elif args.meeting:
+            diarize_engine = "campp"
+            print("[提示] 未安装 pyannote.audio，说话人分离回落到 campp 声纹聚类；"
+                  "抢话严重的会议可装 pyannote 后获得更准的分割", file=sys.stderr)
+        else:
+            diarize_engine = None
+    else:
+        diarize_engine = args.diarize_engine
     # auto 持久化文件：声纹库仍放输出目录（跨素材共享）；纠错词典与热词表改放管线根目录固定位置
     # ——平铺模式（--flat）会删除整个工作子目录，词典放输出目录会被一并删掉、积累失效。
     speaker_db_arg = str(out_dir / "speaker_db.json") if args.speaker_db == "auto" else args.speaker_db
