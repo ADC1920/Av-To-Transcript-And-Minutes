@@ -237,10 +237,10 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
     AED 引擎: 忽略 language/hotwords（模型无此接口）；输出无标点,经 ct-punc 补；时间戳由 AED 原生提供；
               aed_ctx 提供时走 OOM 兜底（空结果自动拆小重试）"""
     if engine == "aed":
+        uttids = [f"u{i}" for i in range(len(audio_paths))]
         if aed_ctx is not None:
             results = aed_transcribe_oom_safe(model, audio_paths, aed_ctx)
         else:
-            uttids = [f"u{i}" for i in range(len(audio_paths))]
             results = model.transcribe(uttids, list(audio_paths))
         # AED 内部异常时会返回空列表或短列表（feat_extractor/beam search 失败均如此），
         # 必须补齐到与输入等长（缺失项记空文本），否则下游 zip 截断会漏赋字段
@@ -662,13 +662,19 @@ def aed_aligns_from(parsed):
 
 
 def aed_ts_usable(parsed):
-    """AED 原生时间戳是否可用: 时间戳数 == 文本去标点字符数(补标点致长度不等是正常的)"""
+    """AED 原生时间戳是否可用。
+
+    判据是「时间戳 tokens 拼接后覆盖文本」，不是「个数相等」——AED 会把连续英文
+    当成一个 token（实测「tiktok」1 个时间戳对 6 个字符），按字符数比必然失配，
+    而失配会触发回落 fa-zh，fa-zh 在长音频上又可能抛
+    `ValueError: time_stamp is missing a retained token timestamp`，整段失败。
+    """
     for p in parsed:
         ts = p.get("timestamp") or []
         text = p.get("transcription") or ""
         if not ts:
             return False
-        if len(ts) != sum(1 for c in text if c not in PUNCT):
+        if "".join(str(t[0]) for t in ts) != "".join(c for c in text if c not in PUNCT):
             return False
     return True
 
@@ -737,18 +743,26 @@ def align_batch_qwen(model, processor, wav_paths, texts, language=None, batch=8)
 
 
 def char_times(text, tokens, ts, base_ms, fallback_start, fallback_end):
-    """去标点字符序 -> [(start_ms,end_ms)];token 数与字符数一致时按序映射,否则按跨度均分兜底"""
+    """去标点字符序 -> [(start_ms,end_ms)]。
+
+    优先按「token 展开」映射：AED 会把连续英文当成一个 token（「tiktok」1 个时间戳
+    对 6 个字符），按 token/字符个数相等判断会误判失配。这里把每个 token 的时间跨度
+    按字符数均分给它的字符，时间轴仍然准确。tokens 与文本对不上时才整段均分兜底。
+    """
     plain_len = sum(1 for c in text if c not in PUNCT)
     if plain_len <= 0:
         return []
-    if len(ts) == plain_len:
-        out, k = [], 0
-        for c in text:
-            if c in PUNCT:
-                continue
-            out.append((int(ts[k][0]) + base_ms, int(ts[k][1]) + base_ms))
-            k += 1
+    plain_chars = [c for c in text if c not in PUNCT]
+    if tokens and len(ts) == len(tokens) and "".join(str(t) for t in tokens) == "".join(plain_chars):
+        out = []
+        for tok, (s, e) in zip(tokens, ts):
+            n = max(1, len(str(tok)))
+            for k in range(n):
+                out.append((int(s) + base_ms + (int(e) - int(s)) * k // n,
+                            int(s) + base_ms + (int(e) - int(s)) * (k + 1) // n))
         return out
+    if len(ts) == plain_len:
+        return [(int(ts[k][0]) + base_ms, int(ts[k][1]) + base_ms) for k in range(plain_len)]
     # 兜底:在给定跨度内均分(对齐 token 与文本不匹配时,保时间轴合理)
     span = max(1, fallback_end - fallback_start)
     return [(fallback_start + span * i // plain_len, fallback_start + span * (i + 1) // plain_len)
