@@ -107,8 +107,22 @@ def resolve_model_path():
     return str(MS_CACHE) if MS_CACHE.is_dir() else REPO_ID
 
 
+# 进程级模型缓存：批量清单模式（--batch-manifest）在同一进程内处理多个素材，
+# 主引擎按 device 常驻，第 2 个素材起不再重载几 GB 权重。单文件调用时缓存生命周期
+# 就是进程本身，行为与改动前等价；返回值里的加载耗时按 0 报，便于区分「命中缓存」。
+_MODEL_CACHE = {}
+
+
+def _cache_get(key):
+    return _MODEL_CACHE.get(key)
+
+
 def load_model(device):
     """引擎 1(默认): Qwen3-ASR-1.7B,transformers 原生直载"""
+    key = ("qwen", str(device))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit[0], hit[1], 0.0
     import torch
     from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
     t0 = time.time()
@@ -117,12 +131,17 @@ def load_model(device):
         resolve_model_path(), dtype=torch.bfloat16)
     model.to(device)
     model.eval()
+    _MODEL_CACHE[key] = (model, processor)
     return model, processor, time.time() - t0
 
 
 def load_aed_model(device):
     """引擎 2: FireRedASR2-AED（中文/英文/粤语实测优于 Qwen3-ASR；不支持日文；输出无标点）"""
     import sys
+    key = ("aed", str(device))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit[0], None, 0.0
     if not (AED_MODEL_DIR / "model.pth.tar").is_file():
         sys.exit(f"FireRedASR2-AED 模型不存在: {AED_MODEL_DIR}\n"
                  f"下载: python -c \"from modelscope import snapshot_download; "
@@ -142,6 +161,7 @@ def load_aed_model(device):
     )
     model = FireRedAsr2.from_pretrained("aed", str(AED_MODEL_DIR), cfg)
     print(f"[info] {firered_mem_patch.apply()}", file=sys.stderr)
+    _MODEL_CACHE[key] = (model, None)
     return model, None, time.time() - t0
 
 
@@ -1684,7 +1704,52 @@ def run_align_only(args, src, log, t0, audio_path, out_json, out_srt):
     return 0
 
 
+def run_worker():
+    """常驻 worker：stdin 逐行收 JSON 任务，同进程串行执行，模型只加载一次。
+
+    管线批量处理时由父进程拉起一次，N 个素材省掉 N-1 次主引擎加载
+    （Qwen3-ASR 单次 3.8GB 权重）。协议一行一个 JSON：
+      请求 {"audio": "<路径>", "args": ["--diarize", ...]}
+      应答 {"ok": bool, "error": str|null, "stdout": "<该任务的标准输出>"}
+    单任务失败不回传致命错误、不中断循环：批处理里一份坏素材不该让其余全部作废。"""
+    import contextlib
+    import io
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+        except ValueError as e:
+            print(json.dumps({"ok": False, "error": f"清单不是合法 JSON: {e}", "stdout": ""}),
+                  ensure_ascii=False, flush=True)
+            continue
+        if job.get("op") == "shutdown":
+            break
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                run_single([job.get("audio") or ""] + list(job.get("args") or []))
+            resp = {"ok": True, "error": None, "stdout": buf.getvalue()}
+        except SystemExit as e:
+            # sys.exit 是本脚本的常规报错出口（参数错/模型缺失/无语音段），
+            # 在 worker 里必须转成单项失败，否则第一份坏素材就终结整批
+            resp = {"ok": False,
+                    "error": str(e) if not isinstance(e.code, int) else f"退出码 {e.code}",
+                    "stdout": buf.getvalue()}
+        except Exception as e:
+            resp = {"ok": False, "error": f"{type(e).__name__}: {e}", "stdout": buf.getvalue()}
+        print(json.dumps(resp, ensure_ascii=False), flush=True)
+
+
 def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--worker":
+        return run_worker()
+    run_single(argv)
+
+
+def run_single(argv=None):
     ap = argparse.ArgumentParser(description="Qwen3-ASR 本地转写（可说话人分离/字幕/专名纠错）")
     ap.add_argument("audio", help="音频文件路径(mp3/m4a/wav/flac/ogg/webm)")
     ap.add_argument("--diarize", action="store_true", help="启用说话人分离(fsmn-vad + cam++ + 聚类);长音频不加此参也会自动分段提速")
@@ -1775,7 +1840,7 @@ def main():
     ap.add_argument("--align-only", default=None, metavar="JSON",
                     help="只做字幕对齐：读已有转写结果 JSON，产出 .srt 并补写 sentences 字段，"
                          "不重新跑识别。补字幕时可省掉最贵的转写环节")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     # 任务配置合并：仅覆盖命令行未显式给出的项（命令行优先）
     if args.job_config:
