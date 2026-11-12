@@ -35,3 +35,15 @@ mcp = ["mcp"]
 # 而几处已知坑（torch/torchaudio 版本不同步、transformers 大版本改返回结构）
 # 只有具体版本号才能复现与定位。
 package = false
+
+# torch 与 torchaudio 必须来自 CUDA 索引：PyPI 上的同名包是 CPU 版，
+# 装上去 GPU 直接不可用（静默退化成 CPU，转写慢十倍且 AED 时间戳失效）。
+# 官方 CUDA 索引只有 cu130，torch 与 torchaudio 版本号本就不同步（2.13 / 2.11）。
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+torchaudio = [{ index = "pytorch-cu130" }]
