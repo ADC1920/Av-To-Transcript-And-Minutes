@@ -69,6 +69,7 @@ FIRERED_VAD_DIR = Path(os.path.expanduser("~")) / ".cache" / "fireredvad" / "Fir
 PYANNOTE_DIR = Path.home() / ".cache" / "modelscope" / "models" / \
     "pyannote--speaker-diarization-community-1" / "snapshots" / "master"
 AUTO_SEGMENT_S = 60  # 超过此时长自动走 VAD 分段批量转写(实测比整段自回归快约 20%,且每段语言独立检测)
+VAD_MAX_END_SILENCE_MS = 800  # VAD 断句静音阈值(funasr 配置默认值);显式传值以关闭 1.4.19 的动态静音
 AED_BATCH_BUDGET_S = 240  # AED 单次前向的批内总音频时长预算(bf16 后显存余量足,120→240 换吞吐)
 AED_MIN_SPLIT_S = 10.0    # OOM 兜底重试时单段最短时长,短于此不再二分
 AED_MAX_SPLIT_DEPTH = 2   # OOM 兜底二分深度上限(2 → 最小拆到原段 1/4)
@@ -209,6 +210,10 @@ def analyze_emotion(audio_path, device):
 
     能力边界（勿夸大）：它做的是 8 类情绪识别（开心/难过/厌恶/中立/生气/惊讶/害怕/兴奋），
     **不是音频事件检测**——笑声、掌声这类事件它识别不了，那需要另装事件检测模型。
+
+    显存随时间增长：整段音频一次性进模型，没有 VAD 分段。实测 RTX 4060 8GB 上，
+    8.5 秒素材峰值 0.77GB，5 分钟到 2.8GB，10 分钟直接 OOM（要分配 3.66GB 时无可用）。
+    所以长素材开 --emotion 会静默丢掉情绪标签，只能靠 stderr 的 warn 看出来。
     """
     try:
         from funasr import AutoModel
@@ -217,8 +222,11 @@ def analyze_emotion(audio_path, device):
         pairs = sorted(zip(r[0]["labels"], r[0]["scores"]), key=lambda x: -x[1])[:3]
         return [{"label": str(l), "score": round(float(s), 4)} for l, s in pairs]
     except Exception as e:
-        print(f"[warn] emotion2vec 分析失败，跳过情绪标注: {type(e).__name__}: {str(e)[:120]}",
-              file=sys.stderr)
+        msg = f"{type(e).__name__}: {str(e)[:120]}"
+        if "out of memory" in str(e).lower():
+            msg += ("（显存不足：emotion2vec 整段推理不分段，长素材峰值随时长上涨。"
+                    "可对长素材去掉 --emotion，或裁短后单独跑情绪）")
+        print(f"[warn] emotion2vec 分析失败，跳过情绪标注: {msg}", file=sys.stderr)
         return None
 
 
@@ -229,10 +237,10 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
     AED 引擎: 忽略 language/hotwords（模型无此接口）；输出无标点,经 ct-punc 补；时间戳由 AED 原生提供；
               aed_ctx 提供时走 OOM 兜底（空结果自动拆小重试）"""
     if engine == "aed":
+        uttids = [f"u{i}" for i in range(len(audio_paths))]
         if aed_ctx is not None:
             results = aed_transcribe_oom_safe(model, audio_paths, aed_ctx)
         else:
-            uttids = [f"u{i}" for i in range(len(audio_paths))]
             results = model.transcribe(uttids, list(audio_paths))
         # AED 内部异常时会返回空列表或短列表（feat_extractor/beam search 失败均如此），
         # 必须补齐到与输入等长（缺失项记空文本），否则下游 zip 截断会漏赋字段
@@ -259,8 +267,21 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
                            "timestamp": r.get("timestamp"), "confidence": r.get("confidence")})
         return parsed
     import torch
+    import soundfile as sf
+    # 传 numpy 波形而非文件路径：路径形式会让 processor 内部用 torchcodec 解码，
+    # 而 torchcodec 与静态 FFmpeg 不兼容（装 pyannote.audio 时会一并引入），
+    # 报 libtorchcodec_core*.dll 加载失败。numpy 形式直接进特征提取，绕开这条依赖。
+    audio_inputs = []
+    for p in audio_paths:
+        data, sr = sf.read(str(p), dtype="float32", always_2d=False)
+        if data.ndim > 1:
+            data = data.mean(axis=1)          # 多声道混成单声道，与 processor 内部行为一致
+        if sr != 16000:
+            import librosa
+            data = librosa.resample(data, orig_sr=sr, target_sr=16000)
+        audio_inputs.append(data)
     inputs = processor.apply_transcription_request(
-        audio=audio_paths, language=language, prompt=hotwords, return_tensors="pt")
+        audio=audio_inputs, language=language, prompt=hotwords, return_tensors="pt")
     inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
     # 音频特征 extractor 输出 float32,与 bf16 模型权重对齐(实测 conv 层要求同型)
     if "input_features" in inputs and torch.is_tensor(inputs["input_features"]):
@@ -619,7 +640,12 @@ def run_vad(audio_path, backend, device):
             vad_wav.unlink(missing_ok=True)
         return [[int(round(s * 1000)), int(round(e * 1000))] for s, e in result["timestamps"]]
     from funasr import AutoModel
-    vad = AutoModel(model="fsmn-vad", device=device, disable_update=True)
+    # 必须显式传 max_end_silence_time：funasr 1.4.19 起 fsmn-vad 默认启用「动态静音阈值」
+    # （model.py:1012 `dynamic_silence = max_end_silence_time is None`），阈值随累计语音时长
+    # 逐步放宽，实测 32 秒素材里 1.5 秒静音切不开，整段被判成一个语音段——下游「段数<2 跳过
+    # 聚类」于是静默退化成单说话人，会议原文丢失全部说话人标签。显式传值时动态逻辑自动关闭。
+    vad = AutoModel(model="fsmn-vad", device=device, disable_update=True,
+                    max_end_silence_time=VAD_MAX_END_SILENCE_MS)
     return [[int(s), int(e)] for s, e in vad.generate(input=str(audio_path))[0]["value"]]
 
 
@@ -636,13 +662,19 @@ def aed_aligns_from(parsed):
 
 
 def aed_ts_usable(parsed):
-    """AED 原生时间戳是否可用: 时间戳数 == 文本去标点字符数(补标点致长度不等是正常的)"""
+    """AED 原生时间戳是否可用。
+
+    判据是「时间戳 tokens 拼接后覆盖文本」，不是「个数相等」——AED 会把连续英文
+    当成一个 token（实测「tiktok」1 个时间戳对 6 个字符），按字符数比必然失配，
+    而失配会触发回落 fa-zh，fa-zh 在长音频上又可能抛
+    `ValueError: time_stamp is missing a retained token timestamp`，整段失败。
+    """
     for p in parsed:
         ts = p.get("timestamp") or []
         text = p.get("transcription") or ""
         if not ts:
             return False
-        if len(ts) != sum(1 for c in text if c not in PUNCT):
+        if "".join(str(t[0]) for t in ts) != "".join(c for c in text if c not in PUNCT):
             return False
     return True
 
@@ -711,18 +743,26 @@ def align_batch_qwen(model, processor, wav_paths, texts, language=None, batch=8)
 
 
 def char_times(text, tokens, ts, base_ms, fallback_start, fallback_end):
-    """去标点字符序 -> [(start_ms,end_ms)];token 数与字符数一致时按序映射,否则按跨度均分兜底"""
+    """去标点字符序 -> [(start_ms,end_ms)]。
+
+    优先按「token 展开」映射：AED 会把连续英文当成一个 token（「tiktok」1 个时间戳
+    对 6 个字符），按 token/字符个数相等判断会误判失配。这里把每个 token 的时间跨度
+    按字符数均分给它的字符，时间轴仍然准确。tokens 与文本对不上时才整段均分兜底。
+    """
     plain_len = sum(1 for c in text if c not in PUNCT)
     if plain_len <= 0:
         return []
-    if len(ts) == plain_len:
-        out, k = [], 0
-        for c in text:
-            if c in PUNCT:
-                continue
-            out.append((int(ts[k][0]) + base_ms, int(ts[k][1]) + base_ms))
-            k += 1
+    plain_chars = [c for c in text if c not in PUNCT]
+    if tokens and len(ts) == len(tokens) and "".join(str(t) for t in tokens) == "".join(plain_chars):
+        out = []
+        for tok, (s, e) in zip(tokens, ts):
+            n = max(1, len(str(tok)))
+            for k in range(n):
+                out.append((int(s) + base_ms + (int(e) - int(s)) * k // n,
+                            int(s) + base_ms + (int(e) - int(s)) * (k + 1) // n))
         return out
+    if len(ts) == plain_len:
+        return [(int(ts[k][0]) + base_ms, int(ts[k][1]) + base_ms) for k in range(plain_len)]
     # 兜底:在给定跨度内均分(对齐 token 与文本不匹配时,保时间轴合理)
     span = max(1, fallback_end - fallback_start)
     return [(fallback_start + span * i // plain_len, fallback_start + span * (i + 1) // plain_len)
@@ -1728,7 +1768,8 @@ def main():
                     help="把本次识别到的说话人声纹写入 --speaker-db 指定的库(同名覆盖;auto 模式自动保存,无需此参)")
     ap.add_argument("--speaker-db-threshold", type=float, default=0.75,
                     help="声纹库命中阈值(余弦相似度,默认 0.75;同人被认成新人的话调低)")
-    ap.add_argument("--device", default="cuda:0", help="推理设备,无 N 卡用 cpu")
+    ap.add_argument("--device", default=None,
+                    help="推理设备,默认自动选(cuda 可用则 cuda:0,否则 cpu);无 N 卡或装的是 CPU 版 torch 时自动走 cpu")
     ap.add_argument("--job-config", default=None,
                     help="任务配置 JSON 路径（供管线脚本透传参数；与命令行同名参数等价）")
     ap.add_argument("--align-only", default=None, metavar="JSON",
@@ -1748,6 +1789,17 @@ def main():
                 sys.exit(f"任务配置含未知项: {k}")
             setattr(args, k, v)
 
+    # 设备自动选择：--device 未显式给出时按 torch 实际能力定。装的是 CPU 版 torch 时
+    # torch.cuda.is_available() 为 False，若照旧传 cuda:0，funasr/pyannote 会直接抛错
+    # （实测：--engine cloud + --meeting 时识别在云端，但分离仍在本地，崩在设备选择上）
+    if not args.device:
+        args.device = "cpu"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                args.device = "cuda:0"
+        except ImportError:
+            pass  # torch 未装=只能走纯云端通道（omni/filetrans）
     # --engine auto：按语言路由。中/英/粤在 AED 上实测更准、嘈杂素材更稳；其余语言
     # （尤其日文，AED 会输出中文乱码）留在 Qwen。未指定语言时无法预知，保守走 Qwen。
     if args.engine == "auto":

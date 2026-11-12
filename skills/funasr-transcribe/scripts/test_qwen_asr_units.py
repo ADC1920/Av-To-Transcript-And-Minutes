@@ -89,10 +89,17 @@ mm2 = build_matcher({}, fuzzy=False)
 check("空词典=None", mm2 is None)
 
 print("[7] AED 原生时间戳可用性判定")
-ts8 = [("开", 0.1, 0.2)] * 8
-check("补标点后仍可用(去标点=8)", aed_ts_usable([{"timestamp": ts8, "transcription": "开放时间，早上九点。"}]) is True)
+# 判据是 token 拼接等于文本，不是个数相等；逐个 token 与文本字符对齐
+txt8 = "开放时间，早上九点。"
+ts8 = [(c, 0.1 * i, 0.1 * (i + 1)) for i, c in enumerate(c for c in txt8 if c not in PUNCT)]
+check("补标点后仍可用", aed_ts_usable([{"timestamp": ts8, "transcription": txt8}]) is True)
 check("时间戳缺失=不可用", aed_ts_usable([{"timestamp": None, "transcription": "大家好"}]) is False)
-check("数量不符=不可用", aed_ts_usable([{"timestamp": ts8[:2], "transcription": "大家好"}]) is False)
+check("内容不符=不可用", aed_ts_usable([{"timestamp": ts8[:2], "transcription": "大家好"}]) is False)
+# 多字符 token：AED 把连续英文当一个 token（tiktok 1 个时间戳对 6 个字符）
+ts_multi = [("叫", 0.0, 0.2), ("tiktok", 0.2, 0.8), ("嘛", 0.8, 1.0)]
+check("多字符 token 可用", aed_ts_usable([{"timestamp": ts_multi, "transcription": "叫tiktok嘛"}]) is True)
+ct = char_times("叫tiktok嘛", ["叫", "tiktok", "嘛"], [[0, 200], [200, 800], [800, 1000]], 0, 0, 1000)
+check("多字符 token 按时间均分", len(ct) == 8 and ct[1] == (200, 300) and ct[6] == (700, 800), f"got {ct}")
 al = aed_aligns_from([{"timestamp": [("开", 0.1, 0.25), ("放", 0.25, 0.4)], "transcription": "开放"}])
 check("秒->毫秒换算", al[0]["ts"] == [[100, 250], [250, 400]] and al[0]["tokens"] == ["开", "放"], f"got {al}")
 
