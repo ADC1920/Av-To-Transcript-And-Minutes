@@ -378,6 +378,19 @@ def pyannote_available() -> bool:
     return True
 
 
+def find_tool(name: str):
+    """定位外部命令：优先当前解释器同目录（venv 的 Scripts/bin），再回落 PATH。
+
+    用 venv 里的 python 跑管线时，venv 的 Scripts 通常不在 PATH 里，
+    shutil.which("demucs") 会返回 None，即使 demucs 就装在同一 venv 中。
+    """
+    exe_dir = Path(sys.executable).parent
+    for cand in (exe_dir / f"{name}.exe", exe_dir / name):
+        if cand.is_file():
+            return str(cand)
+    return shutil.which(name)
+
+
 def probe_audio_codec(video: Path) -> str:
     return run_output(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -1027,9 +1040,10 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
         # [WinError 2]，看不出缺的是 demucs 还是 ffmpeg，整批素材都记成「失败」。
         # 抛 RuntimeError 而非 sys.exit：SystemExit 会穿透批量循环的兜底 except，
         # 直接终止整批（其它素材连试都不试）。
-        if shutil.which("demucs") is None:
+        if find_tool("demucs") is None:
             raise RuntimeError("找不到 demucs 命令：请先 pip install demucs，"
                                "或对纯人声素材加 --no-separate 跳过人声分离")
+        demucs_bin = find_tool("demucs")
         # 分离前对原始素材粗估信噪比（分位法；校准：纯人声 25.9 dB、人声+0.15 粉噪 14.6 dB），
         # 明显纯净时提示可 --no-separate 省 Demucs。只提示不自动跳——判据是相对估计，
         # 误判的代价是转写变差，宁多跑一次分离（与已证伪的「人声/背景音能量差」判据不同）。
@@ -1046,7 +1060,7 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
         # demucs 的进度条有实际参考价值，始终实时透传（不捕获）
         # HF_HUB_OFFLINE=1：demucs 默认先试 HuggingFace 元数据（不可达时重试约 30 秒才失败回落
         # 官方源）；离线模式使其立即失败并直接走 dl.fbaipublicfiles.com 兜底，省等待
-        run_child(["demucs", "-n", demucs_model, "--two-stems=vocals",
+        run_child([demucs_bin, "-n", demucs_model, "--two-stems=vocals",
                    "-o", str(tmp), str(media)], verbose=True,
                   env=child_env(HF_HUB_OFFLINE="1"))
         # demucs 固定输出 vocals.wav / no_vocals.wav，移入输出目录时改成自说明中文名

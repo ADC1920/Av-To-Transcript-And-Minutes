@@ -210,6 +210,10 @@ def analyze_emotion(audio_path, device):
 
     能力边界（勿夸大）：它做的是 8 类情绪识别（开心/难过/厌恶/中立/生气/惊讶/害怕/兴奋），
     **不是音频事件检测**——笑声、掌声这类事件它识别不了，那需要另装事件检测模型。
+
+    显存随时间增长：整段音频一次性进模型，没有 VAD 分段。实测 RTX 4060 8GB 上，
+    8.5 秒素材峰值 0.77GB，5 分钟到 2.8GB，10 分钟直接 OOM（要分配 3.66GB 时无可用）。
+    所以长素材开 --emotion 会静默丢掉情绪标签，只能靠 stderr 的 warn 看出来。
     """
     try:
         from funasr import AutoModel
@@ -218,8 +222,11 @@ def analyze_emotion(audio_path, device):
         pairs = sorted(zip(r[0]["labels"], r[0]["scores"]), key=lambda x: -x[1])[:3]
         return [{"label": str(l), "score": round(float(s), 4)} for l, s in pairs]
     except Exception as e:
-        print(f"[warn] emotion2vec 分析失败，跳过情绪标注: {type(e).__name__}: {str(e)[:120]}",
-              file=sys.stderr)
+        msg = f"{type(e).__name__}: {str(e)[:120]}"
+        if "out of memory" in str(e).lower():
+            msg += ("（显存不足：emotion2vec 整段推理不分段，长素材峰值随时长上涨。"
+                    "可对长素材去掉 --emotion，或裁短后单独跑情绪）")
+        print(f"[warn] emotion2vec 分析失败，跳过情绪标注: {msg}", file=sys.stderr)
         return None
 
 
