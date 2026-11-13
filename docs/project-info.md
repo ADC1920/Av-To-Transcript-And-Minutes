@@ -76,6 +76,9 @@ job 状态落 `~/.av2m/jobs/<job_id>/job.json`（可用 `AV2M_JOBS` 覆盖），
 
 ## 调研导航
 
+- 同类项目与模型格局（第一轮，v2.5 前）：`docs/landscape-2026-11.md`
+- 优化路线与优先级（v2.6 依据）：`docs/optimization-roadmap-2026-11.md`
+- 第二轮复核（v2.6 后，含调研论断对账与新增否决项）：`docs/landscape-2026-11-r2.md`
 - 云端引擎接口细节：`skills/funasr-transcribe/scripts/qwen_asr.py` 头部注释（含三通道实测记录）
 - 说话人分离算法：同文件 `run_vad` / cam++ 聚类段
 - 纪要模板与校验规则：`skills/meeting-notes-expert/SKILL.md` 与 `references/minutes-schema.json`

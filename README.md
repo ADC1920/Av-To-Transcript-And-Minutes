@@ -94,6 +94,18 @@ export ASR_ENGINE=cloud              # 之后不带 --asr-engine 也默认走云
 python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 ```
 
+用 `uv` 时直接 `uv sync --extra cloud`，比上面逐条装更省事。
+
+`filetrans` 子模型只接受公网 URL，本地文件需先传到对象存储：脚本 `scripts/oss_upload_bridge.py` 负责压缩、上传并生成签名 URL，除 `dashscope` 外还要 `oss2`（`uv sync --extra cloud` 已含）。凭据只从环境变量读取，不落盘：
+
+```bash
+setx OSS_ACCESS_KEY_ID "<AccessKeyId>"       # Windows；Linux/macOS 用 export
+setx OSS_ACCESS_KEY_SECRET "<AccessKeySecret>"
+setx OSS_BUCKET "<Bucket名>"
+setx OSS_ENDPOINT "oss-cn-beijing.aliyuncs.com"   # 换成 Bucket 实际地域
+python scripts/oss_upload_bridge.py 会议录音.m4a --run --srt
+```
+
 `ASR_ENGINE` 只改本机默认值，不影响仓库的离线默认；命令行显式传 `--asr-engine qwen` 仍可临时切回本地。单人素材加 `--no-diarize` 可再省掉本地分离依赖。
 
 两条与依赖缺失有关的实测行为：

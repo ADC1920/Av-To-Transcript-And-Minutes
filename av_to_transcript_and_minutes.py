@@ -372,6 +372,9 @@ def resolve_vad_arg(vad, diarize: bool) -> str:
 def pyannote_available() -> bool:
     """pyannote.audio 是否可用。只探包导入，不碰模型权重（权重缺失会由 run_pyannote 自己报错）。"""
     try:
+        # 探测本身也会触发 pyannote 的遥测初始化，故先关掉再导入。
+        # 遥测出厂默认开启并上报 otel.pyannote.ai，与本项目「完全离线」承诺冲突。
+        os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
         import pyannote.audio  # noqa: F401  只在探测，真正加载在 qwen_asr 侧
     except Exception:
         return False

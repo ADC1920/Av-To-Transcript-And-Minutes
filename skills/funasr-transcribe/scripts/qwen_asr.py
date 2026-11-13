@@ -85,10 +85,19 @@ PYANNOTE_MIN_CHUNK_S = 30  # 块长下限(秒)：实测 10s 块内 pyannote 把�
 # 转写结果 JSON 的 schema 版本。lines 结构一旦改动就升这个号；读取方（主脚本缓存复用、
 # benchmark_quality.py）按版本决定能否消费，版本不认识就按未命中处理重转，
 # 避免旧缓存字段对不上时静默丢信息。改字段请同步 SCHEMA_VERSION 与 _schema_ok。
+# 例外：纯新增的可选字段不升版本（如 lines.confidence）。升版本会让全部旧缓存失效、
+# 素材全量重转，代价是数小时 GPU；而缺一个可选字段只是「读不到该字段」，下游 .get 已兜底。
+# 判断界线是「旧数据会不会被误读成新语义」——会，才升。
 SCHEMA_VERSION = 1
 # Qwen3 强制对齐模型（--align-engine native 时用；与 ASR 主模型分开，需另行下载约 1.2GB）
 ALIGNER_MS = Path(os.path.expanduser("~")) / ".cache" / "modelscope" / "models" / \
     "Qwen--Qwen3-ForcedAligner-0.6B" / "snapshots" / "master"
+
+# pyannote 遥测默认开启（telemetry/metrics.py 的 CONFIG["metrics_enabled"] 出厂为 true），
+# 会把文件时长、说话人数量、pipeline 类名上报到 otel.pyannote.ai。本项目承诺「完全离线」，
+# 故显式关闭。必须在任何 pyannote 导入之前设置：该模块在 import 时读环境变量，
+# 晚于导入再改就无效。本文件对 pyannote 的导入都在函数内，模块级设置来得及。
+os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
 PUNCT = set("，。！？；：、,.!?;:…—～~「」『』“”‘’（）()《》〈〉【】[]\"'· \t\n\r")
 HARD_STOP = "。！？；!?;"
 SOFT_STOP = "，,、：:"
@@ -769,6 +778,23 @@ def align_batch_qwen(model, processor, wav_paths, texts, language=None, batch=8)
             audio=chunk_a, transcript=chunk_t, language=chunk_l)
         inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v)
                   for k, v in inputs.items()}
+        # encoder 硬性要求 mel 帧数是 n_window*2（本模型 50*2=100）的整数倍，
+        # 而 processor 的 feature_extractor pad_to_multiple_of 为 None，单条音频
+        # 会得到任意帧数（实测 30s 素材 853 帧），直接前向必抛 ValueError。
+        # 这里按需右侧补零，mask 同步补 0（补的部分不算有效帧，不影响注意力）。
+        feats = inputs.get("input_features")
+        if feats is not None:
+            chunk_len = getattr(model.config.audio_config, "n_window", 50) * 2
+            pad = (-feats.shape[-1]) % chunk_len
+            if pad:
+                feats = torch.nn.functional.pad(feats, (0, pad))
+                mask = inputs.get("input_features_mask")
+                if mask is not None:
+                    inputs["input_features_mask"] = torch.nn.functional.pad(mask, (0, pad))
+            # 特征 extractor 输出 float32，而模型权重是 bf16；conv 层要求两者同型，
+            # 不转就抛 "Input type (float) and bias type (BFloat16) should be the same"。
+            # ASR 主路径（transcribe_batch）已有同样处理，对齐路径原先漏了。
+            inputs["input_features"] = feats.to(model.dtype)
         with torch.inference_mode():
             logits = model(**inputs).logits
         return processor.decode_forced_alignment(
@@ -2091,10 +2117,12 @@ def run_single(argv=None):
                     use_fa = True
             else:
                 if args.align_engine == "native":
+                    # local_dir 必须指到最终目录本身。指到上一级（models/）时 ModelScope
+                    # 会把 11 个模型文件平铺进该级，污染与其他模型的共享缓存目录。
                     sys.exit(f"Qwen3-ForcedAligner 模型不存在: {ALIGNER_MS}\n"
                              f"下载: python -c \"from modelscope import snapshot_download; "
                              f"snapshot_download('Qwen/Qwen3-ForcedAligner-0.6B', "
-                             f"local_dir=r'{ALIGNER_MS.parents[2]}')\"")
+                             f"local_dir=r'{ALIGNER_MS}')\"")
                 use_fa = True
                 log("[1b] 未找到 Qwen3-ForcedAligner，回落 fa-zh 中文对齐")
         else:
@@ -2371,6 +2399,10 @@ def run_single(argv=None):
         u["text"] = p["transcription"]
         u["language"] = p.get("language")
         u["spk_name"] = names.get(u["spk"]) or db_names.get(u["spk"])
+        # 置信度：AED 引擎原生返回，Qwen 与云端通道没有（为 None）。
+        # 只在有值时下发，避免给 lines 塞一堆 null 干扰下游判断。
+        if p.get("confidence") is not None:
+            u["confidence"] = p["confidence"]
     aligns = None
     if use_aed and all(p.get("timestamp") for p in parsed):
         if all(len(p["timestamp"]) == len(p["transcription"]) for p in parsed):
@@ -2405,7 +2437,8 @@ def run_single(argv=None):
         text = u["text"]
         print(f"{label} [{mm1:02d}:{ss1:02d}-{mm2:02d}:{ss2:02d}] {text}")
         lines.append({"spk": u["spk"], "spk_name": u["spk_name"], "start_ms": s_ms, "end_ms": e_ms,
-                      "text": text, "language": u.get("language")})
+                      "text": text, "language": u.get("language"),
+                      **({"confidence": u["confidence"]} if u.get("confidence") is not None else {})})
 
     emotions = analyze_emotion(audio_path, args.device) if args.emotion else None
     if emotions:
