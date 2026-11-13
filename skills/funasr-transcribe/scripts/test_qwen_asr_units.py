@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from qwen_asr import (split_sentences, char_times, fmt_srt_ts, merge_by_speaker,
                       subtitle_units, PUNCT, apply_replace, build_matcher,
-                      aed_ts_usable, aed_aligns_from,
+                      aed_ts_usable, aed_aligns_from, align_batch,
                       merge_short_segments, split_long_segments, absorb_tiny_clusters)
 import numpy as np
 
@@ -103,6 +103,41 @@ check("多字符 token 按时间均分", len(ct) == 8 and ct[1] == (200, 300) an
 al = aed_aligns_from([{"timestamp": [("开", 0.1, 0.25), ("放", 0.25, 0.4)], "transcription": "开放"}])
 check("秒->毫秒换算", al[0]["ts"] == [[100, 250], [250, 400]] and al[0]["tokens"] == ["开", "放"], f"got {al}")
 
+
+class _BoomModel:
+    """模拟 fa-zh 对某条文本抛 sentence_postprocess 的 ValueError"""
+    def generate(self, input, data_type):
+        wavs, texts = input
+        if any("炸" in t for t in texts):
+            raise ValueError("time_stamp is missing a retained token timestamp")
+        return [{"text": " ".join(t), "timestamp": [[0, 100]] * len(t)} for t in texts]
+
+
+class _EchoModel:
+    """记录收到哪些文本，用于断言空文本没进模型"""
+    def __init__(self):
+        self.seen = []
+
+    def generate(self, input, data_type):
+        wavs, texts = input
+        self.seen.extend(texts)
+        return [{"text": " ".join(t), "timestamp": [[0, 100]] * len(t)} for t in texts]
+
+
+print("[7b] align_batch 空文本与单条失败隔离")
+# 90 分钟真实素材实测：AED 返回短列表后缺失段补成空文本，送进 fa-zh 必抛
+# ValueError 并中断整批，整份素材无字幕。空文本必须在入口拦掉。
+_echo = _EchoModel()
+_mixed = align_batch(_echo, ["a.wav", "b.wav", "c.wav"], ["你好", "", "世界"])
+check("空文本不送模型", _echo.seen == ["你好", "世界"], f"got {_echo.seen}")
+check("空文本回填空 ts", _mixed[1] == {"tokens": [], "ts": []}, f"got {_mixed[1]}")
+check("有文本段保留对齐", len(_mixed[0]["ts"]) == 2 and len(_mixed[2]["ts"]) == 2, f"got {_mixed}")
+# 单条失败只影响该条：坏条退空 ts 走跨度均分，其它条照常产出
+_boom = align_batch(_BoomModel(), ["a.wav", "b.wav", "c.wav"], ["你好", "炸了", "世界"])
+check("坏条不中断整批", _boom[1] == {"tokens": [], "ts": []}, f"got {_boom[1]}")
+check("好条仍产出对齐", len(_boom[0]["ts"]) == 2 and len(_boom[2]["ts"]) == 2, f"got {_boom}")
+check("返回条数与输入等长", len(_boom) == 3, f"got {len(_boom)}")
+
 print("[8] merge_short_segments 碎段并入邻近段")
 ms1 = merge_short_segments([[0, 2000], [2200, 2500], [5000, 6000]], 400, 500)
 check("碎段并入前段", ms1 == [(0, 2500), (5000, 6000)], f"got {ms1}")
@@ -138,6 +173,15 @@ out2 = absorb_tiny_clusters(np.array([[1.0, 0.0], [0.0, 1.0]]), np.array([0, 1])
 check("全为大簇不吸收", out2.tolist() == [0, 1], f"got {out2.tolist()}")
 out3 = absorb_tiny_clusters(emb, np.array([0, 0, 0]), segs_t)
 check("单簇直接返回", out3.tolist() == [0, 0, 0], f"got {out3.tolist()}")
+# 长素材场景：小簇绝对时长已超 5s 但占比极低，仍应被视为假说话人吸收
+# （90 分钟云端实测聚出 18 簇、实际 5 人，12 个假簇时长 9-40s，旧判据全部漏掉）
+emb_long = np.array([[1.0, 0.0], [0.0, 1.0], [0.98, 0.2]])
+segs_long = [[0, 600000], [600000, 1200000], [1200000, 1210000]]  # 第三簇仅 10s / 1210s
+out4 = absorb_tiny_clusters(emb_long, np.array([0, 1, 2]), segs_long)
+check("占比过低的小簇被吸收", out4.tolist()[2] == 0, f"got {out4.tolist()}")
+# 两个簇都占比够大时都保留
+out5 = absorb_tiny_clusters(emb_long, np.array([0, 1, 0]), segs_long)
+check("占比达标的大簇保留", len(set(out5.tolist())) == 2, f"got {out5.tolist()}")
 
 print("[12] ensure_libsndfile_readable 容器兜底")
 import shutil, subprocess as sp, tempfile

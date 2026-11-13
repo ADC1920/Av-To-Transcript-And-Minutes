@@ -700,13 +700,30 @@ def aed_ts_usable(parsed):
 
 
 def align_batch(fa_model, wav_paths, texts):
-    """fa-zh 强制对齐;返回 [{"tokens":[...],"ts":[[s,e],...]}, ...],顺序与输入一致"""
+    """fa-zh 强制对齐;返回 [{"tokens":[...],"ts":[[s,e],...]}, ...],顺序与输入一致
+
+    两处必要的防御，都源自长音频实测：
+    ① 空文本不能送进模型。fa-zh 的 sentence_postprocess 要求每个保留 token 都有
+       时间戳，空文本一个 token 都没有，必抛 `ValueError: time_stamp is missing a
+       retained token timestamp` 并中断整批。AED 返回短列表时缺失段会被补成空文本
+       （见 transcribe_batch），90 分钟素材里这种段几乎必然出现。
+    ② 有文本的段也可能单条失败（噪音段、AED 幻听长文本与音频严重不匹配时，对齐器
+       配不出时间戳同样抛上面那个错）。整批共用一次 generate，一条坏就全批丢；
+       故按条调用并吞掉单条失败，坏条退化成空 ts，由 subtitle_units 走整段兜底。
+       逐条比批量慢，但只在有字幕需求时走，且正确性优先——整批失败等于整份素材无字幕。"""
     out = []
-    for i in range(0, len(wav_paths), 8):
-        chunk_a, chunk_t = wav_paths[i:i + 8], texts[i:i + 8]
-        res = fa_model.generate(input=(chunk_a, chunk_t), data_type=("sound", "text"))
-        for item in res:
+    for wav, text in zip(wav_paths, texts):
+        if not (text or "").strip():
+            out.append({"tokens": [], "ts": []})
+            continue
+        try:
+            res = fa_model.generate(input=([wav], [text]), data_type=("sound", "text"))
+            item = res[0]
             out.append({"tokens": item["text"].split(), "ts": item["timestamp"]})
+        except Exception as e:
+            print(f"[warn] 对齐失败，该段改按跨度均分: {type(e).__name__}: "
+                  f"{str(e)[:100]}（文本前 20 字：{text[:20]}）", file=sys.stderr)
+            out.append({"tokens": [], "ts": []})
     return out
 
 
@@ -731,34 +748,50 @@ def load_aligner(device):
 def align_batch_qwen(model, processor, wav_paths, texts, language=None, batch=8):
     """Qwen3 强制对齐：返回与 align_batch 同构的 [{"tokens","ts"}...]（毫秒）。
     一次前向给整批 logits，decode_forced_alignment 按 word_list 把时间戳配回词。
-    处理失败的单条退化为空 ts，由 char_times 走跨度均分兜底，不阻断整批。"""
+    处理失败的单条退化为空 ts，由 char_times 走跨度均分兜底，不阻断整批。
+    空文本不进批（同 align_batch）：AED 短列表补齐出的空段没有可对齐的词，
+    混在批里会让整批失败退化为均分，把有文本段的字级时间戳一起丢掉。
+    批失败时逐条重试而非整批放弃：整批共用一次前向，一条超长或含异常字符的段
+    就能让同批其余段一起丢掉字级时间戳，代价与收益不成比例。"""
     import torch
-    out = []
+    out = [{"tokens": [], "ts": []} for _ in texts]
     lang = language if isinstance(language, (list, type(None))) else [language] * len(wav_paths)
-    for i in range(0, len(wav_paths), batch):
-        chunk_a, chunk_t = wav_paths[i:i + batch], texts[i:i + batch]
-        chunk_l = (lang[i:i + batch] if isinstance(lang, list)
+    live = [i for i, t in enumerate(texts) if (t or "").strip()]
+
+    def _run_once(idx):
+        chunk_a = [wav_paths[j] for j in idx]
+        chunk_t = [texts[j] for j in idx]
+        chunk_l = ([lang[j] for j in idx] if isinstance(lang, list)
                    else [None] * len(chunk_a))
+        inputs, word_lists = processor.prepare_forced_aligner_inputs(
+            audio=chunk_a, transcript=chunk_t, language=chunk_l)
+        inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v)
+                  for k, v in inputs.items()}
+        with torch.inference_mode():
+            logits = model(**inputs).logits
+        return processor.decode_forced_alignment(
+            logits, inputs["input_ids"], word_lists,
+            timestamp_token_id=model.config.timestamp_token_id)
+
+    for i in range(0, len(live), batch):
+        idx = live[i:i + batch]
         try:
-            inputs, word_lists = processor.prepare_forced_aligner_inputs(
-                audio=chunk_a, transcript=chunk_t, language=chunk_l)
-            inputs = {k: (v.to(model.device) if torch.is_tensor(v) else v)
-                      for k, v in inputs.items()}
-            with torch.inference_mode():
-                logits = model(**inputs).logits
-            decoded = processor.decode_forced_alignment(
-                logits, inputs["input_ids"], word_lists,
-                timestamp_token_id=model.config.timestamp_token_id)
-            for items in decoded:
-                out.append({"tokens": [it["text"] for it in items],
-                            "ts": [[int(round(it["start_time"] * 1000)),
-                                    int(round(it["end_time"] * 1000))] for it in items]})
+            decoded = _run_once(idx)
         except Exception as e:
-            print(f"[warn] Qwen 对齐第 {i // batch + 1} 批失败，该批改按跨度均分: "
+            print(f"[warn] Qwen 对齐第 {i // batch + 1} 批失败，改逐条重试: "
                   f"{type(e).__name__}: {str(e)[:120]}", file=sys.stderr)
-            for t in chunk_t:
-                n = sum(1 for c in t if c not in PUNCT)
-                out.append({"tokens": [], "ts": []})
+            decoded = []
+            for j in idx:
+                try:
+                    decoded.append(_run_once([j])[0])
+                except Exception as e2:
+                    print(f"[warn] 该段对齐失败，改按跨度均分: {type(e2).__name__}: "
+                          f"{str(e2)[:100]}（文本前 20 字：{texts[j][:20]}）", file=sys.stderr)
+                    decoded.append([])
+        for j, items in zip(idx, decoded):
+            out[j] = {"tokens": [it["text"] for it in items],
+                      "ts": [[int(round(it["start_time"] * 1000)),
+                              int(round(it["end_time"] * 1000))] for it in items]}
     return out
 
 
@@ -1145,11 +1178,16 @@ def aed_transcribe_oom_safe(model, audio_paths, ctx, depth=0):
     return ra + rb
 
 
-def absorb_tiny_clusters(embeddings, labels, segments, max_cluster_ms=5000):
+def absorb_tiny_clusters(embeddings, labels, segments, max_cluster_ms=5000, min_share=0.02):
     """把总时长过短的小簇并入声纹最相似的大簇（消除碎段形成的假说话人）。
     背景：数百毫秒级碎段的声纹嵌入不稳定，聚类时易自成簇（实测 23 分钟单人口播
     被切成 15 个假说话人，其中 13 个是 1-3 秒碎块）。这类簇无法承载真实发言人信息，
-    并入后说话人数回归真实。返回重编号后的 labels（numpy 数组）。"""
+    并入后说话人数回归真实。返回重编号后的 labels（numpy 数组）。
+
+    判据要求「绝对时长够 且 占比够」——只看绝对时长会在长素材上失效：
+    90 分钟云端实测聚出 18 个簇（实际 5 人），12 个假簇总时长都在 9-40 秒、
+    全部超过 5 秒阈值，一个都吸收不掉。真实发言人的占比通常远超 2%，
+    低于此的基本是同人被拆或噪音段；两个条件都满足才算真实发言人。"""
     import numpy as np
     labels = np.asarray(labels)
     clusters = sorted(set(labels.tolist()))
@@ -1157,7 +1195,9 @@ def absorb_tiny_clusters(embeddings, labels, segments, max_cluster_ms=5000):
         return labels
     dur = {c: sum(int(e) - int(s) for (s, e), l in zip(segments, labels) if l == c)
            for c in clusters}
-    big = [c for c in clusters if dur[c] > max_cluster_ms]
+    total_ms = sum(dur.values()) or 1
+    big = [c for c in clusters
+           if dur[c] > max_cluster_ms and dur[c] / total_ms >= min_share]
     if not big or len(big) == len(clusters):
         return labels
     centers = {c: embeddings[labels == c].mean(axis=0) for c in big}
@@ -2175,8 +2215,30 @@ def run_single(argv=None):
             for ps, pe in split_long_segments([(s, e)], args.max_unit, audio=audio):
                 segments.append((ps, pe))
                 labels.append(spk_ids[spk])
-        labels = np.array(labels)
+        n_before_merge = len(segments)
+        # 碎段并入同说话人的前一段（pyannote 路径原先完全没做这步，min_seg 在这里无效）：
+        # 90 分钟实测 1221 段里 654 段不足 1 秒，每段都要独立跑一次转写。
+        # 只在「同一说话人 + 相邻」时合并——跨说话人合并会破坏归属，实测 654 个碎段里
+        # 566 个后段是不同人或间隔远，强行并会把两个人合成一个人。
+        if args.min_seg > 0:
+            merged_seg, merged_lab = [], []
+            for (s, e), lab in zip(segments, labels):
+                if (merged_seg and (e - s) < args.min_seg
+                        and merged_lab[-1] == lab
+                        and s - merged_seg[-1][1] <= args.merge_gap
+                        and e - merged_seg[-1][0] <= args.max_unit):
+                    merged_seg[-1][1] = e      # 并入前段尾部，说话人不变
+                else:
+                    merged_seg.append([s, e])
+                    merged_lab.append(lab)
+            segments = [(a, b) for a, b in merged_seg]
+            labels = np.array(merged_lab)
+        else:
+            labels = np.array(labels)
         log(f"[2] pyannote 分离: {len(turns)} 个片段 -> {len(spk_ids)} 个说话人"
+            + (f"（超长切分后 {len(segments)} 段）" if len(segments) != len(turns) else "")
+            + (f"，碎段并入后 {len(segments)} 段（原 {n_before_merge} 段）"
+               if len(segments) != n_before_merge else "")
             + (f"（超长切分后 {len(segments)} 段）" if len(segments) != len(turns) else "")
             + (f"，重叠区间 {len(overlaps)} 处" if overlaps else "")
             + f" (累计 {time.time()-t0:.0f}s)")
@@ -2300,9 +2362,16 @@ def run_single(argv=None):
         elif fa is not None or qwen_aligner is not None:
             aligns = align_units(unit_files, [u["text"] for u in units])
     elif use_cloud and args.cloud_model == "message" and args.srt:
-        if all(p.get("cloud_words") for p in parsed):
-            aligns = [{"tokens": [], "ts": p["cloud_words"]} for p in parsed]
-            log("[4b] 使用云端 message 字级时间戳（跳过 fa-zh）")
+        # 部分段有字级时间戳就用，别要求全部都有：90 分钟素材实测 211 段里有少数段
+        # 云端没回 words，原先 all() 判定直接放弃整份字幕。缺的段回填空 ts，
+        # subtitle_units 会按「整段一条」兜底，其余段仍是字级精确边界。
+        have = sum(1 for p in parsed if p.get("cloud_words"))
+        if have:
+            aligns = [{"tokens": [], "ts": p.get("cloud_words") or []} for p in parsed]
+            log(f"[4b] 使用云端 message 字级时间戳（跳过 fa-zh，{have}/{len(parsed)} 段有）")
+            if have < len(parsed):
+                print(f"[warn] {len(parsed) - have} 段云端未返回字级时间戳，"
+                      f"这些段字幕按整段时长兜底", file=sys.stderr)
         else:
             print("[warn] 云端未返回字级时间戳,本次未产出字幕", file=sys.stderr)
     elif fa is not None or qwen_aligner is not None:
