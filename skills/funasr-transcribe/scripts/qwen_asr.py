@@ -588,9 +588,11 @@ def run_cloud_filetrans(args, out_json, out_srt, matcher, t2s, itn_fn, names, lo
     if matcher or t2s is not None or itn_fn is not None:
         text = "".join(u["text"] for u in units) or text
     print(text)
+    # URL 只记到 query 之前：filetrans 的 URL 常带签名参数（Signature/OSSAccessKeyId），
+    # 那些等价于临时凭据，写进 json 落盘即泄漏。保留主机与对象路径足够回溯来源。
     payload = {"schema_version": SCHEMA_VERSION, "language": args.language, "text": text,
                "engine": CLOUD_MODELS["filetrans"],
-               "audio": str(audio_path), "url": args.cloud_url,
+               "audio": str(audio_path), "url": str(args.cloud_url).split("?")[0],
                "segments": [{k: u[k] for k in ("start_ms", "end_ms", "text", "spk")} for u in units]}
     if args.srt or getattr(args, "vtt", False):
         payload["sentences"] = units
