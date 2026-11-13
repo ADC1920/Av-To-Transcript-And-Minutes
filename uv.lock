@@ -374,6 +374,7 @@ dependencies = [
 [package.optional-dependencies]
 cloud = [
     { name = "dashscope" },
+    { name = "oss2" },
     { name = "requests" },
 ]
 fuzzy = [
@@ -395,6 +396,7 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'mcp'" },
     { name = "numpy" },
     { name = "opencc-python-reimplemented" },
+    { name = "oss2", marker = "extra == 'cloud'" },
     { name = "pyannote-audio", specifier = ">=4.0,<5.0" },
     { name = "pypinyin", marker = "extra == 'fuzzy'" },
     { name = "python-docx" },

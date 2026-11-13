@@ -24,8 +24,9 @@ dependencies = [
 [project.optional-dependencies]
 # 专名纠错拼音模糊匹配（--fuzzy）
 fuzzy = ["pypinyin", "rapidfuzz"]
-# 云端识别通道（--asr-engine cloud 的 message 子模型）
-cloud = ["dashscope", "requests"]
+# 云端识别通道（--asr-engine cloud 的 message / omni 子模型）
+# oss2：filetrans 只接受公网 URL，scripts/oss_upload_bridge.py 靠它上传并签名
+cloud = ["dashscope", "requests", "oss2"]
 # MCP 工具服务（tools/mcp_server.py 依赖官方 Python SDK）
 mcp = ["mcp"]
 
