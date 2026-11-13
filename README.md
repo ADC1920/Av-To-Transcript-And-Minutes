@@ -38,7 +38,8 @@ python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输
   - **长音频分块**：超过 15 分钟自动分块分析（`--pyannote-chunk-s` 可调，0 关闭），块间带 30 秒重叠，跨块用声纹相似度合并说话人标签，内存峰值只与块长相关而非总时长
 - **声纹库双引擎通用**：`--speaker-db` 原先只有 campp 可用，现在 pyannote 路径会在已定段边界上补算声纹，两条路线都能跨文件复用说话人身份
 - **字幕与纠错**：`--srt` 出字级时间戳字幕，`--vtt` 出 WebVTT（HTML5 `<track>` 与视频平台直接可用，与 `--srt` 共用一次对齐可同时开）；`--replace` 确定性专名纠错（比 `--hotwords` 偏置可靠）；`--replace-file` / `--replace-save` 纠错词典读取与回写（本次纠错条目自动并入词典，下次自动带上）；`--names` 说话人真名映射；`--asr-extra` 透传其余引擎参数
-- **字幕对齐后端可选**：`--align-engine auto|fa-zh|native`——`native` 用 Qwen3-ForcedAligner-0.6B，覆盖 11 种语言；`fa-zh` 是中文专用的 38M 模型。默认 auto（有 Qwen 对齐器就用，没有回落 fa-zh）。**中文以外素材必须用 native**，fa-zh 会产出错位时间戳
+- **响度自适应**：转写前粗测整体响度（峰值 + 语音段 RMS），仅当两条同时偏小（峰值 < -6 dBFS 且 RMS < -30 dBFS）才做 EBU R128 归一化（`I=-16 TP=-1.5 LRA=11`）。正常录音不动，避免对已干净的素材引入削波；归一化状态写入缓存键，与未归一化的结果分开缓存
+- **字幕对齐后端可选**：`--align-engine auto|fa-zh|native`——`fa-zh` 是中文专用的 38M 模型，当前实际生效的只有它。`native`（Qwen3-ForcedAligner-0.6B，覆盖 11 语言）代码路径已就绪，但它要求 transformers 上游支持 0.6B 宽度的对齐器，当前 5.16.1 不支持（权重键前缀与隐藏维度都与 1.7B 建出的模型不符），故 auto 会回落 fa-zh。**非中文素材目前仍需注意字幕时间戳**，详见 `docs/landscape-2026-11-r2.md`
 - **补字幕不重转**：字幕已移出缓存键。先跑转写、事后加 `--srt`，只补一遍对齐（实测 15.3s → 9.0s），不会重跑最贵的识别环节
 - **ITN 后端可选**：`--itn-backend auto|wtp|legacy`——装了 WeTextProcessing 就走它（货币/度量/分数表达更全），没装继续用零依赖自写规则
 - **质量基准**：`benchmark_quality.py` 跑 DER（说话人分离错误率，pyannote.metrics 标准实现）与 CER（字错误率），支持与历史基线对比，回答"这次改动到底变好还是变坏"；**v2.5 起同时报无容差 DER 与 cpWER**——前者是边界精度的量尺（与 0.25s 容差版差值变大 = 边界被弄粗），后者把每个人的话拼串比字，同时惩罚"归属错"与"识别错"，比 DER 更贴近"这份稿子能不能直接用"（需参考标注带逐段 `text`）
@@ -174,6 +175,8 @@ python av_to_transcript_and_minutes.py ./素材目录 --meeting --srt \
 | `--replace-save [词典.txt]` | 把本次 `--replace` 纠错条目合并写回词典（裸写=根目录 `replace_dict.txt`），下次 `--replace-file` 裸写即自动带上 |
 | `--itn` | 中文逆文本正则化：三百二十万元 → 320万元、百分之八十 → 80%、二零二六年十月十五日 → 2026年10月15日 |
 | `--asr-engine auto` | 按 `--language` 路由识别引擎（中/英/粤走 AED，其余走 Qwen） |
+| `--dialect NAME` | 声明方言（如 `四川`/`河南`）：配合 `--asr-engine auto` 时改走 Qwen。AED 在方言集上精度明显低于普通话（CER 2.89% vs 方言集均值 11.55%），显式声明可避免被静默路由到 AED |
+| `--watch DIR` | 目录监视：持续扫 DIR，发现新素材（大小稳定后）自动跑完整管线，Ctrl+C 退出。本进程只投递、实际转写起子进程；幂等由管线自身的完成判定与缓存键保证 |
 | `--asr-engine cloud` | 云端识别（默认 message 通道）；换子模型加 `--asr-extra "--cloud-model omni\|filetrans"`；filetrans 需配 `--asr-extra "--cloud-url 公网URL"` |
 | `--demucs-model NAME` | 分离模型：`htdemucs`（默认）／`htdemucs_ft`（质量更好、慢约 4 倍）／`mdx_extra` 等；换模型自动重跑分离 |
 | `--split-channels` | 双人分声道素材按声道分轨转写，声道号即说话人；自动跳过 Demucs 与声纹聚类 |

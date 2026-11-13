@@ -1823,6 +1823,11 @@ def run_single(argv=None):
     ap.add_argument("--diarize", action="store_true", help="启用说话人分离(fsmn-vad + cam++ + 聚类);长音频不加此参也会自动分段提速")
     ap.add_argument("--language", default=None,
                     help="强制语言:代码(zh/en/yue/ja...)或全名(Chinese/English...),默认自动检测")
+    ap.add_argument("--dialect", default=None, metavar="NAME",
+                    help="声明方言以对齐引擎选择:默认按粤语处理(走 AED);"
+                         # argparse 会对 help 做 % 格式化，字面百分号须写成 %%
+                         "AED 覆盖 19 个方言集但精度差异大(普通话 CER 2.89%%,方言集均值 11.55%%),"
+                         "明显非粤语的方言建议改 --engine qwen(其方言覆盖更广)")
     ap.add_argument("--hotwords", default=None, help="热词/上下文,逗号分隔,作为 system prompt 偏置识别")
     ap.add_argument("--replace", default=None, help="专名纠错,如 '开饭时间=>开放时间,小蜜=>小米'（确定性替换）")
     ap.add_argument("--replace-file", nargs="?", const="auto", default=None,
@@ -1938,7 +1943,15 @@ def run_single(argv=None):
     # （尤其日文，AED 会输出中文乱码）留在 Qwen。未指定语言时无法预知，保守走 Qwen。
     if args.engine == "auto":
         lang = (args.language or "").strip().lower()
-        if lang in ("zh", "en", "yue", "chinese", "english", "cantonese"):
+        dialect = (args.dialect or "").strip().lower()
+        # 方言声明优先于语言代码：AED 在方言集上的退化是已知的（普通话 CER 2.89%
+        # vs 方言集均值 11.55%），命中方言时改走方言覆盖更广的 qwen，避免用户
+        # 只写 --language zh 时被静默路由到 AED。
+        if dialect:
+            args.engine = "qwen"
+            print(f"[提示] 已声明方言 {args.dialect}，走 qwen（AED 的方言精度明显低于普通话；"
+                  f"如方言恰为粤语可改 --engine aed）", file=sys.stderr)
+        elif lang in ("zh", "en", "yue", "chinese", "english", "cantonese"):
             args.engine = "aed"
         else:
             args.engine = "qwen"

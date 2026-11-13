@@ -289,6 +289,73 @@ def estimate_snr_db(path: Path):
         return None
 
 
+def measure_loudness(path: Path):
+    """粗测整体响度，用于决定是否要做响度归一化。
+
+    返回 (峰值 dBFS, 语音段 RMS dBFS)；读不到返回 None。
+    峰值取绝对值最大采样，RMS 取 90 分位帧能量（与 estimate_snr_db 同口径，
+    避免被段间静音拉低）。不做 EBU R128 积分响度——那要 ffmpeg loudnorm 跑一遍，
+    而这里只需判断"是否明显偏小"，轻量测量足够，且省掉一次全量解码。
+    """
+    try:
+        import numpy as np
+        import soundfile as sf
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        if data.size == 0:
+            return None
+        mono = data.mean(axis=1)
+        peak = float(np.abs(mono).max())
+        win = max(int(sr * 0.02), 1)
+        n = len(mono) // win
+        if n < 5:
+            return None
+        frames = mono[:n * win].reshape(n, win)
+        rms = np.sqrt((frames ** 2).mean(axis=1))
+        rms = rms[rms > 0]
+        if rms.size < 5:
+            return None
+        speech_rms = float(np.percentile(rms, 90))
+        to_db = lambda v: 20 * math.log10(max(v, 1e-9))
+        return to_db(peak), to_db(speech_rms)
+    except Exception:
+        return None
+
+
+def maybe_normalize_loudness(vocals_asr: Path, stem: str) -> bool:
+    """检测到整体偏小时做 EBU R128 响度归一化，原地替换。
+
+    为什么条件启用而不是默认全开：归一化会改变波形，对已经正常的素材
+    可能引入削波或过度压缩，反而拉低识别率。只在"明显偏小"时动手。
+    判据取两条同时成立：峰值 < -6 dBFS 且语音段 RMS < -30 dBFS。
+    实测安静会议（TTS 素材衰减 20dB）峰值约 -26 dBFS、语音 RMS 约 -38 dBFS，
+    正常录音两者分别在 -1 与 -20 dBFS 附近，间隔足够宽。
+
+    返回 True 表示做了归一化（调用方据此把该状态写进缓存键）。
+    """
+    m = measure_loudness(vocals_asr)
+    if m is None:
+        return False
+    peak_db, rms_db = m
+    if peak_db >= -6.0 or rms_db >= -30.0:
+        return False
+    tmp = vocals_asr.with_suffix(".norm.wav")
+    print(f"[响度] {stem}：峰值 {peak_db:.0f} dBFS / 语音 RMS {rms_db:.0f} dBFS 偏小，"
+          f"做 EBU R128 归一化（I=-16 TP=-1.5 LRA=11）")
+    try:
+        run_child(["ffmpeg", "-y", "-v", "error", "-i", str(vocals_asr), "-af",
+                   "loudnorm=I=-16:TP=-1.5:LRA=11", str(tmp)], env=child_env())
+    except subprocess.CalledProcessError as e:
+        print(f"[warn] 响度归一化失败，沿用原音频: {e}", file=sys.stderr)
+        tmp.unlink(missing_ok=True)
+        return False
+    if not tmp.is_file() or tmp.stat().st_size == 0:
+        print("[warn] 响度归一化未产出文件，沿用原音频", file=sys.stderr)
+        tmp.unlink(missing_ok=True)
+        return False
+    tmp.replace(vocals_asr)
+    return True
+
+
 def decode_16k_mono_tmp(media: Path):
     """ffmpeg 把任意容器解码为 16k mono wav 临时文件（供分离前 SNR 探测，视频/音频通用）。
     失败返回 None，不阻断主流程。"""
@@ -402,7 +469,7 @@ def probe_audio_codec(video: Path) -> str:
 
 def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=None,
                    srt=False, engine=None, extra=None, tag=None, single=False,
-                   dict_hash=None) -> str:
+                   dict_hash=None, loudnorm=False) -> str:
     """转写缓存文件名：任一影响识别文本的配置不同 → 缓存不同。
 
     识别引擎（qwen/aed）输出的文本不同，是缓存键的必需维度——漏掉它会让人以为换了引擎、
@@ -410,6 +477,8 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
     tag 用于同一目录内存在多份待转写音频的场景（声道分轨），缺了它两路会命中同一份缓存、
     转出完全相同的文本（实测踩过）。
     dict_hash = 纠错词典内容哈希：词典更新后旧缓存不再复用（否则新词条对已缓存素材不生效）。
+    loudnorm = 本次是否对音频做了响度归一化。归一化改波形，识别文本可能不同，
+    必须与未归一化的结果分开缓存，否则同一素材换台机器（触发条件不同）会串用。
 
     srt 刻意不进缓存键：字幕只影响 sentences 字段，lines 的文本完全相同。把 srt 计入键
     会让"先转写、后补字幕"变成整套重转，白烧最贵的识别环节。需要字幕而缓存里没有时，
@@ -425,6 +494,8 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
         parts.append("pyannote")
     if threshold is not None:
         parts.append(f"阈值{threshold}")
+    if loudnorm:
+        parts.append("响度归一")
     if hotwords:
         parts.append("热词" + hashlib.sha256(hotwords.encode("utf-8")).hexdigest()[:6])
     if names:
@@ -668,7 +739,8 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     cache_json = vocals.parent / asr_cache_name(
         opts.get("threshold"), opts.get("diarize_engine"), opts.get("hotwords"),
         opts.get("names"), bool(opts.get("srt")), opts.get("engine"), key_extra, tag,
-        single=bool(opts.get("no_diarize")), dict_hash=opts.get("dict_hash"))
+        single=bool(opts.get("no_diarize")), dict_hash=opts.get("dict_hash"),
+        loudnorm=bool(opts.get("loudnorm")))
     source_fp = audio_fingerprint(vocals)
 
     def _need_srt(payload):
@@ -954,6 +1026,10 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
         run_child(["ffmpeg", "-y", "-i", str(vocals), "-af",
                    "agate=threshold=-40dB:ratio=99:attack=2:release=100",
                    str(vocals_asr)], env=child_env())
+        # 响度归一化紧跟噪声门：两者都改波形，放在一起只解码一遍；
+        # 条件触发（明显偏小才做），结果写进缓存键避免与未归一化的旧缓存混用
+        if maybe_normalize_loudness(vocals_asr, stem):
+            opts = dict(opts, loudnorm=True)
 
     # 纯补字幕：只跑对齐，不动 md/docx（转写内容没变，重写 md 会覆盖用户可能已手工修改的稿）
     if needs_srt and md_path.exists() and vocals_asr.exists():
@@ -1244,6 +1320,59 @@ def env_default(name: str, choices: tuple, fallback: str) -> str:
     return fallback
 
 
+def watch_dir(watch_dir: Path, passthrough: list, poll_s: float = 5.0) -> int:
+    """目录监视：新素材落盘稳定后自动跑一次管线。
+
+    为什么用轮询而不是 watchdog：只多一个依赖就能省掉一个依赖，5 秒粒度对
+    「录完自动转写」这种场景完全够用，且轮询在 Windows 网络盘上比 inotify 类
+    机制可靠（后者在 SMB 上常丢事件）。
+
+    稳定性判据：文件大小连续两次采样相同且非零。这一条就很管用——正在拷贝的
+    文件大小会变，拷贝完才稳定；也顺带跳过 0 字节的占位文件。
+
+    幂等性复用现有机制：已处理的素材由管线自己的 md/docx 存在判定与缓存键跳过，
+    这里不重复实现，只负责「发现新文件 → 起一次子进程」。
+    """
+    if not watch_dir.is_dir():
+        print(f"[watch] 目录不存在：{watch_dir}", file=sys.stderr)
+        return 1
+    print(f"[watch] 监视 {watch_dir}（每 {poll_s:.0f}s 扫一次，Ctrl+C 退出）")
+    print(f"[watch] 透传参数：{' '.join(passthrough) if passthrough else '（无）'}")
+    seen = {}          # path -> 上次采样的大小
+    handled = set()    # 已提交过的路径（避免重复触发）
+    rc_total = 0
+    try:
+        while True:
+            try:
+                current = {p for p in watch_dir.iterdir()
+                           if p.is_file() and p.suffix.lower() in MEDIA_EXTS}
+            except OSError as e:
+                print(f"[watch] 扫描失败：{e}", file=sys.stderr)
+                time.sleep(poll_s)
+                continue
+            for p in current - handled:
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                if size > 0 and seen.get(p) == size:
+                    handled.add(p)
+                    print(f"\n[watch] 发现稳定素材 {p.name}（{size/1024/1024:.1f} MB）")
+                    cmd = [sys.executable, str(Path(__file__).resolve()), str(p)] + passthrough
+                    rc = subprocess.call(cmd)
+                    rc_total = rc_total or rc
+                    if rc != 0:
+                        print(f"[watch] {p.name} 处理失败（rc={rc}），继续监视", file=sys.stderr)
+                else:
+                    seen[p] = size
+            # 清掉已消失文件的采样记录，避免长期运行时字典无限增长
+            seen = {k: v for k, v in seen.items() if k in current}
+            time.sleep(poll_s)
+    except KeyboardInterrupt:
+        print(f"\n[watch] 已停止，本次共处理 {len(handled)} 个素材")
+        return rc_total
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1252,7 +1381,10 @@ def main():
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="音视频全自动批量（拆轨 + 人声分离 + 说话人分离转写 → 转写文稿 / 结构化总结）")
-    ap.add_argument("input", help="视频/音频文件或包含它们的文件夹")
+    ap.add_argument("input", nargs="?", help="视频/音频文件或包含它们的文件夹（--watch 时可省略）")
+    ap.add_argument("--watch", metavar="DIR", default=None,
+                    help="目录监视模式：持续扫 DIR，发现新素材（大小稳定后）自动跑完整管线；"
+                         "本进程只做投递，实际转写起子进程。幂等由管线自身的完成判定与缓存键保证")
     ap.add_argument("-o", "--output", help="输出目录（默认 <输入>/separated_out）")
     ap.add_argument("--force", action="store_true", help="已处理过的也重跑")
     ap.add_argument("--no-asr", action="store_true", help="只拆轨+人声分离，不转写不生成文稿")
@@ -1336,6 +1468,10 @@ def main():
                          "装了 FireRedVAD 才换）；fsmn=FunASR 内置；firered=FireRedVAD（误报更低）")
     ap.add_argument("--language", default=None,
                     help="强制语言（zh/en/yue/ja 等代码），默认自动检测")
+    ap.add_argument("--dialect", default=None, metavar="NAME",
+                    help="声明方言（如 四川/河南/粤语）：配合 --asr-engine auto 时走 qwen 而非 AED。"
+                         # argparse 会对 help 做 % 格式化，字面百分号须写成 %%
+                         "AED 的方言精度明显低于普通话（CER 2.89%% vs 方言集均值 11.55%%）")
     ap.add_argument("--max-line", type=int, default=None,
                     help="单条字幕最大字数（默认 28，配合 --srt 使用）")
     ap.add_argument("--merge-gap", type=int, default=None,
@@ -1362,6 +1498,27 @@ def main():
     if args.meeting and args.no_diarize:
         sys.exit("--meeting 需要说话人分离产出说话人标签，不能与 --no-diarize 同用")
 
+    if args.watch:
+        # 监视模式下本进程只做投递：把本次除 input/--watch 外的全部参数原样透传给
+        # 子进程，语义与用户手工跑一次完全一致，不复制任何管线逻辑。
+        passthrough, skip_next = [], False
+        argv = sys.argv[1:]
+        for i, tok in enumerate(argv):
+            if skip_next:
+                skip_next = False
+                continue
+            if tok == "--watch":
+                skip_next = True
+                continue
+            if tok.startswith("--watch="):
+                continue
+            if not tok.startswith("-") and Path(tok) == Path(args.watch):
+                continue   # 位置参数（若用户同时给了 input 且等于 watch 目录）
+            passthrough.append(tok)
+        return watch_dir(Path(args.watch), passthrough)
+
+    if not args.input:
+        ap.error("缺少输入：请给出文件/文件夹，或用 --watch DIR 进入监视模式")
     src = Path(args.input)
     if not src.exists():
         sys.exit(f"输入不存在：{src}")
@@ -1434,7 +1591,8 @@ def main():
     extra = []
     for flag, val in (("--replace", args.replace), ("--replace-file", replace_file_arg),
                       ("--replace-save", replace_save_arg),
-                      ("--language", args.language), ("--speaker-db", speaker_db_arg),
+                      ("--language", args.language), ("--dialect", args.dialect),
+                      ("--speaker-db", speaker_db_arg),
                       ("--max-line", args.max_line), ("--merge-gap", args.merge_gap),
                       ("--min-dur", args.min_dur), ("--max-cps", args.max_cps),
                       ("--vad", vad_arg),
@@ -1584,5 +1742,11 @@ def main():
         log_handle.close()
         print(f"[日志] 已写入 {log_path}")
 
+    # 退出码反映是否有素材失败：批量里个别失败仍会产出其余成稿（不该整批算崩），
+    # 但调用方（脚本 / CI / --watch 子进程）必须能靠退出码区分「全成功」与「有失败」。
+    # 部分成功的语义是「产出了部分结果但未全成」，统一按 1 返回。
+    return 1 if (fail or invalid) else 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
