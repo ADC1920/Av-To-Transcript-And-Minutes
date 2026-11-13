@@ -1827,12 +1827,13 @@ def run_single(argv=None):
     ap.add_argument("--engine", choices=["qwen", "aed", "auto", "cloud"], default="qwen",
                     help="识别引擎: qwen=Qwen3-ASR-1.7B(默认,多语言含日文); aed=FireRedASR2-AED(中/英/粤更准,不支持日文,输出经 ct-punc 补标点); "
                          "auto=按 --language 路由(中/英/粤走 aed,其余走 qwen;未指定语言时保守走 qwen)")
-    ap.add_argument("--cloud-model", choices=["message", "omni", "filetrans"], default="message",
-                    help="cloud 引擎模型: message=qwen-audio-3.1-asr-message(dashscope SDK,整文件直出"
-                         "句级+字级时间戳,默认;加 --diarize 时逐段并经本地声纹聚类);"
-                         " omni=qwen3.8-omni-flash(OpenAI 兼容全模态转写,无时间戳);"
-                         " filetrans=qwen-audio-3.1-asr-flash-filetrans(异步整文件,仅公网 URL --cloud-url,"
-                         "自带说话人分离(--diarize)与字级时间戳,跳过本地 VAD/模型)")
+    ap.add_argument("--cloud-model", choices=["message", "omni", "filetrans", "auto"], default="auto",
+                    help="cloud 引擎模型: auto=默认，有公网 URL(--cloud-url)走 filetrans、否则回落 message;"
+                         " filetrans=qwen-audio-3.1-asr-flash-filetrans(异步整文件,仅公网 URL,"
+                         "自带说话人分离与字级时间戳,跳过本地 VAD/模型,最快);"
+                         " message=qwen-audio-3.1-asr-message(dashscope SDK,整文件直出"
+                         "句级+字级时间戳;加 --diarize 时逐段并经本地声纹聚类);"
+                         " omni=qwen3.8-omni-flash(OpenAI 兼容全模态转写,无时间戳)")
     ap.add_argument("--cloud-url", default=None,
                     help="filetrans 模式的音频公网 URL(仅此模式需要;本地文件用 3.1/3.0 即可)")
     ap.add_argument("--no-punc", action="store_true", help="aed 引擎不补标点(默认用 ct-punc 补)")
@@ -1916,6 +1917,20 @@ def run_single(argv=None):
             if not lang:
                 print("[提示] --engine auto 未指定 --language，保守使用 qwen；"
                       "若素材是中/英/粤，加 --language zh 可自动切到更准的 AED", file=sys.stderr)
+
+    # --cloud-model auto：有公网 URL 走 filetrans（最快，云端一并做说话人分离与字级时间戳），
+    # 没有就回落 message（本地文件直传，实测 90 分钟素材 170 秒，比本地 AED 快约 10 倍）。
+    # filetrans 只收公网可访问 URL，本机没有天然出口，故 auto 是默认值而不是硬指 filetrans：
+    # 这样配好 OSS/图床后无需改代码，自动走更快的通道。
+    if args.cloud_model == "auto":
+        if args.cloud_url:
+            args.cloud_model = "filetrans"
+            print("[提示] 检测到 --cloud-url，使用 filetrans（云端整文件，最快）", file=sys.stderr)
+        else:
+            args.cloud_model = "message"
+            print("[提示] 未提供 --cloud-url，cloud 模型回落 message；"
+                  "filetrans 需要公网可访问的音频 URL，用 --cloud-url 指定可自动切换",
+                  file=sys.stderr)
 
     # --vad auto：就地解析成具体后端。解析必须发生在任何 run_vad 调用之前，
     # 且结果要能被上层当作缓存键的一部分（管线会显式下发解析后的名字，不依赖这里）。
