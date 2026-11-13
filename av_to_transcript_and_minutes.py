@@ -1742,6 +1742,11 @@ def main():
         log_handle.close()
         print(f"[日志] 已写入 {log_path}")
 
+    # 退出码反映是否有素材失败：批量里个别失败仍会产出其余成稿（不该整批算崩），
+    # 但调用方（脚本 / CI / --watch 子进程）必须能靠退出码区分「全成功」与「有失败」。
+    # 部分成功的语义是「产出了部分结果但未全成」，统一按 1 返回。
+    return 1 if (fail or invalid) else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
