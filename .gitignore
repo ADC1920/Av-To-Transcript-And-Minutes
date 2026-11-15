@@ -65,5 +65,8 @@ out/
 memory/agent-log.md
 docs/fulltest-90min-continue.md
 
+# 设计档只入库 md 源稿，docx 排版产物本机生成不入库
+docs/design-specs/*.docx
+
 # 合成测试素材：音频本体与标注都是可复现产物，由 scripts/make_fixtures.py 现场生成
 # （.tmp/fixtures/ 已被上面的 .tmp/ 覆盖，此处仅作说明；如需改放别处请同步本规则）
