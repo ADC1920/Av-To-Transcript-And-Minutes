@@ -950,17 +950,23 @@ def speaker_summary(payload: dict) -> str:
     return "\n".join(rows) + "\n\n"
 
 
-def meeting_md(payload: dict, stem: str) -> str:
+def meeting_md(payload: dict, stem: str, low_conf: float = None) -> str:
     """会议模式：会议原文——按时间顺序完整转写，每段带 [分:秒] 时间戳与说话人标签
     （pyannote 分离可靠后恢复标签；--names 提供人名映射时显示真实姓名）
-    供对照审核与纪要提炼；正式纪要由会话内 AI 按 meeting-notes-expert 模板从原文提炼"""
+    供对照审核与纪要提炼；正式纪要由会话内 AI 按 meeting-notes-expert 模板从原文提炼
+    low_conf 给定时，置信度低于它的段落行尾加【待校对】（置信度只有 AED/Qwen 产出，
+    云端与旧缓存缺该字段则不标记）"""
     body = []
     for l in payload.get("lines") or []:
         name = l.get("spk_name") or f"说话人{l.get('spk')}"
         m, s = divmod(int(l.get("start_ms", 0)) // 1000, 60)
         text = (l.get("text") or "").strip()
         if text:
-            body.append(f"[{m:02d}:{s:02d}] {name}：{text}")
+            mark = ""
+            if (low_conf is not None and l.get("confidence") is not None
+                    and float(l["confidence"]) < low_conf):
+                mark = "　【待校对】"
+            body.append(f"[{m:02d}:{s:02d}] {name}：{text}{mark}")
     joined = "\n\n".join(body) if body else "（未检测到语音）"
     return f"# 会议原文：{stem}\n\n{speaker_summary(payload)}{joined}\n"
 
@@ -1072,7 +1078,7 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
               "如需区分说话人，可加 --meeting 或 --diarize-engine pyannote 并用 --force 重跑",
               file=sys.stderr)
     use_labels = meeting or bool(opts.get("split_channels"))
-    md_body = meeting_md(payload, stem) if use_labels else transcript_md(payload, stem)
+    md_body = meeting_md(payload, stem, opts.get("low_conf_mark")) if use_labels else transcript_md(payload, stem)
     if not md_body:
         return "novoice"
     md_path.write_text(md_body, encoding="utf-8")
@@ -1479,6 +1485,12 @@ def main():
     ap.add_argument("--asr-extra", default=None,
                     help="其余 qwen_asr 参数原样透传（如 '--fuzzy --min-seg 300'）；"
                          "变更后自动用新缓存重转")
+    ap.add_argument("--low-conf-mark", type=float, default=0.6,
+                    help="会议原文里置信度低于此值(0-1)的段落行尾加【待校对】标记（默认 0.6；"
+                         "置信度仅 AED/Qwen 引擎产出，云端与旧缓存缺字段不标记）。"
+                         "只改渲染不进缓存键，改阈值无需重转")
+    ap.add_argument("--no-conf-mark", action="store_true",
+                    help="不在会议原文里标记低置信度段落")
     ap.add_argument("--verbose", action="store_true",
                     help="实时透传各子进程输出（排查卡顿与失败原因时用）")
     ap.add_argument("--clean", action="store_true",
@@ -1633,7 +1645,9 @@ def main():
             "rttm": args.rttm,
             # 供 _align_srt_only 补字幕时透传（不进缓存键）
             "align_engine": args.align_engine, "language": args.language,
-            "max_line": args.max_line}
+            "max_line": args.max_line,
+            # 低置信度标记阈值：纯渲染层参数，不进缓存键（改阈值不该触发重转）
+            "low_conf_mark": None if args.no_conf_mark else args.low_conf_mark}
 
     # 日志落盘：终端与 run.log 双写，批量跑完还能回溯
     log_path = None

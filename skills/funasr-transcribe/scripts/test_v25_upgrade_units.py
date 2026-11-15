@@ -178,6 +178,51 @@ def test_pipeline_helpers():
         check("管线 RTTM 写 3 行", n == 3, n)
 
 
+def test_conf_mark():
+    """低置信度标记：低于阈值行尾加【待校对】，高于/缺字段/关闭时不加。
+    标记只改会议原文渲染，不进缓存键——改阈值不该触发重转。"""
+    import av_to_transcript_and_minutes as av
+    print("[6] 会议原文低置信度标记")
+    payload = {"lines": [
+        {"spk": 0, "start_ms": 0, "end_ms": 1000, "text": "清晰段", "confidence": 0.95},
+        {"spk": 0, "start_ms": 1000, "end_ms": 2000, "text": "含糊段", "confidence": 0.4},
+        {"spk": 1, "start_ms": 2000, "end_ms": 3000, "text": "旧缓存段"},  # 旧缓存无 confidence
+    ]}
+    md = av.meeting_md(payload, "demo", low_conf=0.6)
+    check("低置信度段被标记", "含糊段　【待校对】" in md, md[-200:])
+    check("高置信度段不标记", "清晰段　【待校对】" not in md and "清晰段" in md, md)
+    check("缺置信度字段不标记", "旧缓存段　【待校对】" not in md, md)
+    md2 = av.meeting_md(payload, "demo", low_conf=None)
+    check("关闭阈值时全文无标记", "【待校对】" not in md2, md2)
+
+
+def test_partial_batches():
+    """断点续跑 partial：批结果落盘/复用/清除；素材内容或批计划任一变化即失效。
+    这里只测纯逻辑（存取与指纹），真实续跑行为靠端到端冒烟。"""
+    print("[7] 分批转写断点续跑 partial")
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "audio.wav"
+        src.write_bytes(b"A" * 4096)
+        plan = {"units": [[0, 60000], [60000, 120000]], "batch_size": 8, "engine": "test"}
+        ps = q.PartialBatches(src, plan)
+        check("未完成批返回 None", ps.load_done(0) is None)
+        ps.save_batch(0, [{"transcription": "第一批"}])
+        check("已完成批可复用", ps.load_done(0) == [{"transcription": "第一批"}])
+        check("其他批仍为 None", ps.load_done(1) is None)
+        # 重启语义：新建句柄（模拟重跑进程）仍能读到
+        ps2 = q.PartialBatches(src, plan)
+        check("重跑加载已完成批", ps2.load_done(0) == [{"transcription": "第一批"}])
+        # 批计划变化 → 旧 partial 失效（分批方式变了，批号对不上）
+        ps3 = q.PartialBatches(src, {**plan, "batch_size": 4})
+        check("批计划变化后失效", ps3.load_done(0) is None)
+        # 素材内容变化 → 失效（防止换素材误复用）
+        src.write_bytes(b"B" * 4096)
+        ps4 = q.PartialBatches(src, plan)
+        check("素材内容变化后失效", ps4.load_done(0) is None)
+        ps2.clear()
+        check("清除后文件不存在", not ps2.path.exists())
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -186,6 +231,8 @@ def main():
     test_reading_speed()
     test_rttm()
     test_pipeline_helpers()
+    test_conf_mark()
+    test_partial_batches()
     print()
     if fails:
         print(f"FAILED ({len(fails)}): {', '.join(fails)}")
