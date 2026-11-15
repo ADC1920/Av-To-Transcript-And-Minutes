@@ -316,9 +316,35 @@ def transcribe_batch(model, processor, audio_paths, language=None, hotwords=None
     if "input_features" in inputs and torch.is_tensor(inputs["input_features"]):
         inputs["input_features"] = inputs["input_features"].to(model.dtype)
     with torch.inference_mode():
-        gen = model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens)
-    out_ids = gen[:, inputs["input_ids"].shape[1]:]
+        gen = model.generate(**inputs, do_sample=False, max_new_tokens=max_new_tokens,
+                             output_scores=True, return_dict_in_generate=True)
+    in_len = inputs["input_ids"].shape[1]
+    out_ids = gen.sequences[:, in_len:]
     parsed = processor.decode(out_ids, return_format="parsed")
+    # 置信度：贪心解码逐步 log softmax，取所选 token 的 logp 按有效长度平均后
+    # 指数回概率域（几何平均概率）。有效长度 = 到第一个 eos（含）的步数，无 eos
+    # 则按全部步数。提示性字段，任何异常静默跳过（下游按缺键处理，不阻断转写）。
+    try:
+        step_lp = torch.stack([
+            torch.log_softmax(sc.float(), dim=-1).gather(
+                1, gen.sequences[:, in_len + si].unsqueeze(1)).squeeze(1)
+            for si, sc in enumerate(gen.scores)
+        ], dim=1)                                   # [batch, steps]
+        eos_id = getattr(getattr(processor, "tokenizer", None), "eos_token_id", None)
+        n_gen = out_ids.shape[1]
+        if eos_id is not None:
+            eq = out_ids == eos_id
+            has_eos = eq.any(dim=1)
+            lens = torch.where(has_eos, eq.float().argmax(dim=1) + 1,
+                               torch.full((eq.shape[0],), n_gen, device=eq.device, dtype=torch.float))
+        else:
+            lens = torch.full((out_ids.shape[0],), n_gen, device=out_ids.device, dtype=torch.float)
+        mask = (torch.arange(n_gen, device=out_ids.device)[None, :] < lens[:, None]).float()
+        conf = torch.exp((step_lp * mask).sum(dim=1) / lens.clamp(min=1.0)).tolist()
+        for item, c in zip(parsed, conf):
+            item["confidence"] = c
+    except Exception:
+        pass
     for item in parsed:
         if t2s is not None and item.get("language") in ("Chinese", "Cantonese"):
             item["transcription"] = t2s(item["transcription"])
@@ -1128,6 +1154,73 @@ def aed_batch_plan(paths, batch_size, budget_s):
     return batches
 
 
+class PartialBatches:
+    """分批转写的断点续跑：每批识别完成即原子落盘，重跑跳过已完成批。
+
+    长会议转写到一半 OOM/断电，此前整份作废重转；有了批级 partial，重跑只补
+    剩余批。失效条件 = 素材内容（首尾 1MB sha256）或批计划（分段边界 + 批参数）
+    任一变化，旧 partial 自然失效。文件放素材同目录而不是 work_dir——work_dir
+    是随机临时目录（进程退出即清），放那里续跑根本拿不到。转写全部完成后删除。
+
+    ponytail: save_batch 每次全量读改写；批数 ≤ 段数/8，IO 可忽略，够用。
+    """
+    MAX_FP_BYTES = 1024 * 1024
+
+    def __init__(self, src_path, plan_desc, log=print):
+        import hashlib
+        p = Path(src_path)
+        size = p.stat().st_size
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            h.update(f.read(self.MAX_FP_BYTES))
+            if size > 2 * self.MAX_FP_BYTES:
+                f.seek(-self.MAX_FP_BYTES, 2)
+            h.update(f.read(self.MAX_FP_BYTES))
+        self.src_fp = h.hexdigest()[:16]
+        blob = json.dumps(plan_desc, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        self.plan_fp = hashlib.sha256(blob).hexdigest()[:16]
+        self.path = p.parent / f".asr_partial_{self.src_fp}.json"
+        self.log = log
+        self.ok = True      # 读写异常时置 False，本轮退化为一口气跑完（不阻塞转写）
+        self._cache = None  # 已读入的 partial 内容，避免每批重复读文件
+
+    def _read(self):
+        if self._cache is not None:
+            return self._cache
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            self._cache = data if data.get("plan_fp") == self.plan_fp else {}
+        except Exception:
+            self._cache = {}
+        return self._cache
+
+    def load_done(self, idx):
+        """第 idx 批已完成的结果列表，未完成返回 None"""
+        r = self._read().get("batches", {}).get(str(idx))
+        return r if r else None
+
+    def save_batch(self, idx, results):
+        try:
+            data = self._read()
+            if not data:
+                data = {"plan_fp": self.plan_fp, "batches": {}}
+                self._cache = data
+            data["batches"][str(idx)] = results
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            self.ok = False
+            self.log(f"[resume] partial 写盘失败（{type(exc).__name__}），本次退化为一口气跑完")
+
+    def clear(self):
+        self._cache = None
+        try:
+            self.path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def split_wav_at_quiet(wav_path, work_dir, depth):
     """在 25%-75% 时长区间找 50ms 能量最低点把 wav 二分。VAD 段是连续语音,
     最静点是可用的最优启发(可能切在语流中间,仅在 OOM 重试时触发)。
@@ -1890,6 +1983,8 @@ def run_single(argv=None):
                     help="声纹余弦聚类阈值(声音相近漏分调低0.65-0.7,同人被拆调高0.8)")
     ap.add_argument("--batch-size", type=int, default=8, help="转写批大小(AED 引擎另受批内总时长预算限制,默认每批最多 120s)")
     ap.add_argument("--max-new-tokens", type=int, default=2048, help="单段最大生成 token 数")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="关闭分批转写的断点续跑（默认每批完成即落盘，重跑跳过已完成批）")
     ap.add_argument("--no-t2s", action="store_true", help="关闭默认的繁->简转换(保留模型原始输出)")
     ap.add_argument("--itn", action="store_true",
                     help="中文逆文本正则化:三百二十万元->320万元、百分之八十->80%%、二零二六年十月十五日->2026年10月15日")
@@ -2145,6 +2240,18 @@ def run_single(argv=None):
             fa = AutoModel(model="fa-zh", device=args.device, disable_update=True)
             log("[1b] fa-zh 强制对齐模型已加载（中文专用）")
 
+    def _make_resume(units):
+        """批级断点续跑的 partial 句柄。计划键用分段边界序列（VAD/聚类确定性，跨运行
+        稳定）而非临时 wav 路径——unit 文件在随机临时目录里，每次运行路径都不同。
+        素材指纹锚定 src0（to_wav16k 之前的真实输入）而不是 src：AED 引擎会先重编码
+        到临时目录的 16k wav，同一输入每次编码的字节存在差异，挂在它上面续跑永不命中。"""
+        try:
+            return PartialBatches(src0, {"units": [[int(u["start_ms"]), int(u["end_ms"])] for u in units],
+                                         "batch_size": args.batch_size, "engine": _engine_tag}, log)
+        except Exception as exc:
+            log(f"[resume] 无法启用断点续跑（{type(exc).__name__}），按普通模式跑")
+            return None
+
     def align_units(wav_paths, texts):
         """统一对齐入口：按当前后端产出与 fa-zh 同构的 aligns，失败返回 None"""
         if qwen_aligner is not None:
@@ -2154,8 +2261,10 @@ def run_single(argv=None):
             return align_batch(fa, wav_paths, texts)
         return None
 
-    def infer(paths):
-        """统一识别入口（按引擎分发,批量）"""
+    def infer(paths, resume=None):
+        """统一识别入口（按引擎分发,批量）
+        resume: PartialBatches 或 None。提供时本地批量走批级断点续跑
+        （每批完成即落盘，重跑跳过已完成批），云端通道自带任务轮询不适用。"""
         out = []
         if use_cloud:
             cctx = {"key": load_dashscope_key(), "model": args.cloud_model,
@@ -2167,17 +2276,37 @@ def run_single(argv=None):
             # 空结果(疑似 OOM)自动拆小重试
             aed_ctx = {"work_dir": work_dir, "log": log,
                        "min_split_s": AED_MIN_SPLIT_S, "max_depth": AED_MAX_SPLIT_DEPTH}
-            for chunk in aed_batch_plan(paths, args.batch_size, AED_BATCH_BUDGET_S):
-                out.extend(transcribe_batch(model, processor, chunk, args.language,
-                                            hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
-                                            punc=punc, engine=args.engine, aed_ctx=aed_ctx,
-                                            itn=itn_fn))
-            return out
-        bs = max(args.batch_size, 8)
-        for i in range(0, len(paths), bs):
-            out.extend(transcribe_batch(model, processor, paths[i:i + bs], args.language,
-                                        hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
-                                        punc=punc, engine=args.engine, itn=itn_fn))
+            batches = aed_batch_plan(paths, args.batch_size, AED_BATCH_BUDGET_S)
+            for bi, chunk in enumerate(batches):
+                done = resume.load_done(bi) if resume is not None and resume.ok else None
+                if done is not None:
+                    log(f"[2c] 断点续跑: 批 {bi + 1}/{len(batches)} 复用已完成结果（{len(done)} 段）")
+                    out.extend(done)
+                    continue
+                results = transcribe_batch(model, processor, chunk, args.language,
+                                           hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
+                                           punc=punc, engine=args.engine, aed_ctx=aed_ctx,
+                                           itn=itn_fn)
+                if resume is not None and resume.ok:
+                    resume.save_batch(bi, results)
+                out.extend(results)
+        else:
+            bs = max(args.batch_size, 8)
+            batches = [paths[i:i + bs] for i in range(0, len(paths), bs)]
+            for bi, chunk in enumerate(batches):
+                done = resume.load_done(bi) if resume is not None and resume.ok else None
+                if done is not None:
+                    log(f"[2c] 断点续跑: 批 {bi + 1}/{len(batches)} 复用已完成结果（{len(done)} 段）")
+                    out.extend(done)
+                    continue
+                results = transcribe_batch(model, processor, chunk, args.language,
+                                           hotwords, args.max_new_tokens, t2s=t2s, matcher=matcher,
+                                           punc=punc, engine=args.engine, itn=itn_fn)
+                if resume is not None and resume.ok:
+                    resume.save_batch(bi, results)
+                out.extend(results)
+        if resume is not None and resume.ok:
+            resume.clear()
         return out
 
     _engine_tag = ("FireRedASR2-AED" if use_aed else
@@ -2196,11 +2325,14 @@ def run_single(argv=None):
             units = [{"start_ms": int(s), "end_ms": int(e), "text": "", "spk": None, "seg_idx": [i]}
                      for i, (s, e) in enumerate(segments)]
             seg_files = write_unit_wavs(audio, units, work_dir)
-            parsed = infer(seg_files)
+            parsed = infer(seg_files,
+                           resume=(_make_resume(units) if not args.no_resume else None))
             punc = None; gc_cuda()   # ct-punc 已用完,置 None 放开闭包 cell 引用(小模型不驻留到转写峰值后)
             for u, p in zip(units, parsed):
                 u["text"] = p["transcription"]
                 u["language"] = p.get("language")
+                if p.get("confidence") is not None:
+                    u["confidence"] = p["confidence"]
             texts = [u["text"] for u in units]
             if use_aed and aed_ts_usable(parsed):
                 aligns = aed_aligns_from(parsed)
@@ -2216,7 +2348,9 @@ def run_single(argv=None):
             payload = {"schema_version": SCHEMA_VERSION, "language": main_lang,
                        "text": "\n".join(texts), "engine": _engine_tag,
                        "segments": [{"start_ms": u["start_ms"], "end_ms": u["end_ms"], "language": u.get("language"),
-                                     "text": u["text"]} for u in units]}
+                                     "text": u["text"],
+                                     **({"confidence": u["confidence"]} if u.get("confidence") is not None else {})}
+                                    for u in units]}
             if aligns is not None:
                 payload["sentences"] = subtitle_units(units, aligns, args.max_line, args.min_dur, args.max_cps)
             out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2371,7 +2505,8 @@ def run_single(argv=None):
     atexit.register(lambda d=tmp_dir: shutil.rmtree(d, ignore_errors=True))   # 分段 wav 随进程清理
     unit_files = write_unit_wavs(audio, units, tmp_dir)
 
-    parsed = infer(unit_files)
+    parsed = infer(unit_files,
+                   resume=(_make_resume(units) if not args.no_resume else None))
     punc = None; gc_cuda()   # 转写已完成,置 None 放开闭包 cell 引用
     if len(parsed) != len(units):  # 防御：任何引擎返回短列表都不能让 zip 静默截断
         print(f"[warn] 识别结果 {len(parsed)} 条 / 输入 {len(units)} 条，缺失段按空文本补齐",
