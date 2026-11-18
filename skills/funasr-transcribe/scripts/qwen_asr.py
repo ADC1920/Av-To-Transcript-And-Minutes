@@ -2411,7 +2411,10 @@ def run_single(argv=None):
     for u, p in zip(units, parsed):
         u["text"] = p["transcription"]
         u["language"] = p.get("language")
-        u["spk_name"] = names.get(u["spk"]) or db_names.get(u["spk"])
+        # 声纹库命中写独立字段：主管线按 --names 改名时只覆盖 spk_name，
+        # 若两者混用同一字段，改名后的缓存再复用时会把声纹身份一起抹掉。
+        u["spk_db_name"] = db_names.get(u["spk"])
+        u["spk_name"] = names.get(u["spk"]) or u["spk_db_name"]
         # 置信度：AED 引擎原生返回，Qwen 与云端通道没有（为 None）。
         # 只在有值时下发，避免给 lines 塞一堆 null 干扰下游判断。
         if p.get("confidence") is not None:

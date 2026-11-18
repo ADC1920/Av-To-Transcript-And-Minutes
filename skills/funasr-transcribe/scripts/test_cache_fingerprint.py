@@ -150,6 +150,60 @@ def main() -> int:
     check("names 空值", mod._parse_names("") == {})
     check("names 跳过非法项", mod._parse_names("坏项,2=王五") == {2: "王五"})
 
+    # ---- 改名不重转（2026-11-18）----
+    # names 曾参与缓存键，换称呼即整套重转（实测 23 分钟素材多烧 148 秒）。
+    # 现在 names 只走渲染层覆盖，键必须与 names 无关。
+    key_no_names = mod.asr_cache_name(threshold=0.75, diarize_engine="pyannote",
+                                      hotwords=None, names=None, engine="cloud")
+    key_with_names = mod.asr_cache_name(threshold=0.75, diarize_engine="pyannote",
+                                        hotwords=None, names="0=张三,1=李四",
+                                        engine="cloud")
+    check("names 不进缓存键", key_no_names == key_with_names,
+          f"{key_no_names} vs {key_with_names}")
+    # 但真正影响识别文本的维度仍必须变键，否则会拿旧引擎结果冒充新结果
+    check("引擎仍进缓存键",
+          key_no_names != mod.asr_cache_name(threshold=0.75, diarize_engine="pyannote",
+                                             hotwords=None, names=None, engine="aed"))
+    check("热词仍进缓存键",
+          key_no_names != mod.asr_cache_name(threshold=0.75, diarize_engine="pyannote",
+                                             hotwords="胚布,库龄", names=None,
+                                             engine="cloud"))
+    check("阈值仍进缓存键",
+          key_no_names != mod.asr_cache_name(threshold=0.6, diarize_engine="pyannote",
+                                             hotwords=None, names=None, engine="cloud"))
+
+    # 覆盖行为：给了 names 按 spk 下标覆盖，没给的保留声纹库身份
+    payload = {"lines": [
+        {"spk": 0, "spk_name": "旧名0", "spk_db_name": "库认出A", "text": "甲"},
+        {"spk": 1, "spk_name": "旧名1", "spk_db_name": None, "text": "乙"},
+    ]}
+    mod.apply_name_overrides(payload, "0=张三")
+    check("改名只覆盖指定说话人", payload["lines"][0]["spk_name"] == "张三",
+          payload["lines"][0]["spk_name"])
+    check("未指定的说话人保持原值", payload["lines"][1]["spk_name"] == "旧名1",
+          payload["lines"][1]["spk_name"])
+    check("改名不动文本", payload["lines"][0]["text"] == "甲")
+
+    # 去掉 names 后要能还原声纹库身份，而不是停在「张三」
+    mod.apply_name_overrides(payload, None)
+    check("去掉 names 还原声纹身份", payload["lines"][0]["spk_name"] == "库认出A",
+          payload["lines"][0]["spk_name"])
+    check("无声纹身份时保留缓存值", payload["lines"][1]["spk_name"] == "旧名1")
+
+    # 空串表示显式去名，回落到编号显示（渲染层按 spk 兜底）
+    payload2 = {"lines": [{"spk": 0, "spk_name": "张三", "text": "甲"}]}
+    mod.apply_name_overrides(payload2, "0=")
+    check("空串去名", payload2["lines"][0]["spk_name"] is None,
+          str(payload2["lines"][0]["spk_name"]))
+
+    # 旧缓存没有 spk_db_name 字段时不得抛错
+    payload3 = {"lines": [{"spk": 0, "spk_name": "张三", "text": "甲"}]}
+    try:
+        mod.apply_name_overrides(payload3, None)
+        check("旧缓存缺 spk_db_name 不报错", True)
+    except Exception as e:
+        check("旧缓存缺 spk_db_name 不报错", False, repr(e))
+
     print("SELFTEST", "PASS" if not fails else f"FAIL（{len(fails)} 项）")
     return 0 if not fails else 1
 
