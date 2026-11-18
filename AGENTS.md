@@ -29,6 +29,8 @@
 | `meeting_index.py` | `python tools/meeting_index.py add <目录>` / `search <词>` | 跨会议检索；中文走 trigram，两字词退 LIKE |
 | `mcp_server.py` | `python tools/mcp_server.py` | MCP 工具服务（stdio），需 `uv sync --extra mcp` |
 | `validate_minutes.py` | 加 `--export <json>` | 纪要导出结构化 JSON（待办表、决策列表） |
+| `minutes_quality.py` | `python tools/minutes_quality.py <纪要> --source <原文>` | 纪要导出 + 校验的统一入口；出稿时同目录有纪要会自动触发 |
+| `minutes_eval.py` | `python tools/minutes_eval.py <纪要> --source <原文> [--gate]` | 质量评测门禁（编造数字/溯源率/节齐全度）；语义类指标只列不判 |
 
 调用约定：MCP 的 `transcribe_start` 立即返回 `job_id`，不要在同一次调用里等转写完成；查询用 `transcribe_status` 轮询。参数只接受白名单，拼错的键会被拒而不是静默忽略。
 
@@ -37,6 +39,7 @@
 - 主产物：`{名}.md`（稿件）、`{名}.docx`（排版稿）；可选 `.srt` / `.vtt` 字幕、`.rttm` 说话人日志。
 - 附属产物独立判定：缺 `.vtt` 或 `.rttm` 时走「补文件」通道，复用缓存转写，不重跑分离与识别。
 - 缓存键不含纯字幕参数（`--align-engine` / `--max-line` / `--min-dur` / `--max-cps`），也不含 `--vad fsmn`（与升级前默认等价），改这些不会触发全量重转。
+- `--names` 同样不进缓存键（2026-11-18 起）：改名只覆盖显示名，命中缓存后按 `spk` 重算 `spk_name`，不重跑识别。改回计入键会让改名重新变成全量重转。
 
 ## 识别引擎
 
