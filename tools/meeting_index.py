@@ -26,6 +26,9 @@ import sys
 import time
 from pathlib import Path
 
+TOOLS_DIR = Path(__file__).resolve().parent
+ROOT = TOOLS_DIR.parent
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meetings (
   id INTEGER PRIMARY KEY,
@@ -46,6 +49,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS segments USING fts5(
   text,
   tokenize = 'trigram'
 );
+-- 行动项单独成表：跨会跟踪「哪些事还没做」靠它，全文检索查不出状态。
+-- 由纪要的待办表解析而来，status 为空表示旧六列稿或未标状态。
+CREATE TABLE IF NOT EXISTS action_items (
+  id INTEGER PRIMARY KEY,
+  meeting_id INTEGER NOT NULL,
+  task TEXT NOT NULL,
+  owner TEXT DEFAULT '',
+  due TEXT DEFAULT '',
+  priority TEXT DEFAULT '',
+  status TEXT DEFAULT '',
+  strength TEXT DEFAULT '',
+  source TEXT DEFAULT '',
+  source_file TEXT DEFAULT '',
+  meeting_date TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_action_items_status ON action_items(status);
+CREATE INDEX IF NOT EXISTS idx_action_items_owner ON action_items(owner);
 """
 # 分词器用 trigram 而不是 unicode61：中文没有词边界，unicode61 会把整句切成
 # 一个大 token，"销售数据"这种子串查询永远命中不了。trigram 按三字滑动窗口建索引，
@@ -123,6 +143,45 @@ def load_source(path):
     return None, None
 
 
+def _minutes_module():
+    """复用技能的解析层，不写第二套表格解析器（两套必然漂移）。"""
+    skill_scripts = ROOT / "skills" / "meeting-notes-expert" / "scripts"
+    if str(skill_scripts) not in sys.path:
+        sys.path.insert(0, str(skill_scripts))
+    import validate_minutes
+    return validate_minutes
+
+
+def extract_action_items(path):
+    """从纪要 md 里抽待办表（含状态/强度/出处）。解析失败返回 []。"""
+    try:
+        vm = _minutes_module()
+        blocks = vm.parse_md(path.read_text(encoding="utf-8", errors="replace"))
+        _basic, sections, _tbl = vm.split_sections(blocks)
+        items, _header = vm.collect_action_items(sections.get("待办事项") or [])
+        return items
+    except Exception:
+        return []
+
+
+def _meeting_date_of(basic):
+    raw = (basic or {}).get("会议时间", "")
+    m = re.search(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", raw)
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else ""
+
+
+def extract_minutes_meta(path):
+    """返回 (会议日期, 待办行列表)。日期用于「上期未完成项」按时序排序。"""
+    try:
+        vm = _minutes_module()
+        blocks = vm.parse_md(path.read_text(encoding="utf-8", errors="replace"))
+        basic, sections, _tbl = vm.split_sections(blocks)
+        items, _header = vm.collect_action_items(sections.get("待办事项") or [])
+        return _meeting_date_of(basic), items
+    except Exception:
+        return "", []
+
+
 def collect_files(root):
     if root.is_file():
         return [root]
@@ -177,6 +236,17 @@ def cmd_add(ns):
         db.executemany(
             "INSERT INTO segments(source,meeting_id,speaker,ts,text) VALUES(?,?,?,?,?)",
             [(str(f), mid, s["speaker"], s["ts"], s["text"]) for s in segs])
+        # 纪要另外把待办表收进行动项表（跨会查询未完成项靠它）
+        if kind == "minutes":
+            db.execute("DELETE FROM action_items WHERE meeting_id = ?", (mid,))
+            mdate, items = extract_minutes_meta(f)
+            if items:
+                db.executemany(
+                    "INSERT INTO action_items(meeting_id,task,owner,due,priority,status,"
+                    "strength,source,source_file,meeting_date) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    [(mid, it["task"], it["owner"], it["due"], it["priority"],
+                      it["status"], it["strength"], it["source"], str(f), mdate)
+                     for it in items if it["task"]])
         added += 1
     db.commit()
     total = db.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]
@@ -231,11 +301,58 @@ def cmd_search(ns):
     return 0
 
 
+def cmd_open(ns):
+    """查未完成的行动项（跨会跟踪）。status 为「完成」「取消」的排除。"""
+    db, db_path = connect(ns.db)
+    where = ["COALESCE(a.status, '') NOT IN ('完成', '取消')"]
+    params = []
+    if ns.owner:
+        where.append("a.owner LIKE ?")
+        params.append(f"%{ns.owner}%")
+    if ns.topic:
+        where.append("a.task LIKE ?")
+        params.append(f"%{ns.topic}%")
+    if ns.since:
+        where.append("a.meeting_date >= ?")
+        params.append(ns.since)
+    sql = ("SELECT a.task, a.owner, a.due, a.status, a.strength, a.meeting_date, "
+           "m.title, m.path FROM action_items a "
+           "JOIN meetings m ON m.id = a.meeting_id "
+           "WHERE " + " AND ".join(where) +
+           " ORDER BY a.meeting_date DESC, a.id LIMIT ?")
+    params.append(ns.limit)
+    rows = db.execute(sql, params).fetchall()
+    if not rows:
+        print(f"没有未完成的行动项（{db_path}）")
+        db.close()
+        return 0
+    print(f"未完成行动项 {len(rows)} 条（{db_path}）")
+    for task, owner, due, status, strength, mdate, title, path in rows:
+        extra = []
+        if status:
+            extra.append(status)
+        if strength == "软性":
+            extra.append("软性承诺")
+        if due:
+            extra.append(f"原定 {due}")
+        print(f"  [{mdate or '日期未记录'}] {owner or '待定'} · {task}"
+              + (f"（{'，'.join(extra)}）" if extra else ""))
+        print(f"      {title}  {path}")
+    db.close()
+    return 0
+
+
 def cmd_stats(ns):
     db, db_path = connect(ns.db)
     n = db.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]
     segs = db.execute("SELECT COUNT(*) FROM segments").fetchone()[0]
-    print(f"库：{db_path}\n会议/文稿 {n} 份，可检索块 {segs} 条")
+    try:
+        acts = db.execute("SELECT COUNT(*) FROM action_items").fetchone()[0]
+        opens = db.execute("SELECT COUNT(*) FROM action_items WHERE "
+                           "COALESCE(status, '') NOT IN ('完成', '取消')").fetchone()[0]
+    except sqlite3.OperationalError:
+        acts = opens = 0
+    print(f"库：{db_path}\n会议/文稿 {n} 份，可检索块 {segs} 条，行动项 {acts} 条（未完成 {opens}）")
     for title, kind, lines, at in db.execute(
             "SELECT title, kind, line_count, indexed_at FROM meetings ORDER BY mtime DESC LIMIT 10"):
         print(f"  {at}  {kind:10s} {lines:4d} 段  {title}")
@@ -269,6 +386,14 @@ def main(argv=None):
 
     p_st = sub.add_parser("stats", parents=[common], help="库概况")
     p_st.set_defaults(func=cmd_stats)
+
+    p_o = sub.add_parser("open", parents=[common],
+                         help="查未完成的行动项（跨会跟踪；已完成与已取消的排除）")
+    p_o.add_argument("--owner", default=None, help="按责任人过滤")
+    p_o.add_argument("--topic", default=None, help="按事项关键词过滤")
+    p_o.add_argument("--since", default=None, metavar="YYYY-MM-DD", help="只查该日期及之后的会议")
+    p_o.add_argument("--limit", type=int, default=30)
+    p_o.set_defaults(func=cmd_open)
 
     ns = ap.parse_args(argv)
     # 顶层 --db 与子命令 --db 共用同一 dest：子命令未给时父级值生效，

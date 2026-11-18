@@ -57,9 +57,14 @@ GATES = {
     "owner_groundedness_min": 0.8,   # 责任人溯源：允许少量转写变体差异
     "fact_coverage_min": 0.5,        # 数字覆盖：纪要里的数字至少一半有出处
     "section_presence_min": 1.0,     # 必填节：必须齐全
+    # 出处覆盖率：待办表中有多少行标了可溯源的「出处：」。
+    # 六列旧稿没有出处列，重跑老稿会落在门槛下——这是提示补标，不是判它错。
+    "source_coverage_min": 0.8,
 }
 
 REQUIRED_SECTIONS = ("会议结论", "关键决策", "待办事项", "会议内容")
+# 通用总结（访谈/播客/讲座）的必填节，见 SKILL.md「通用骨架」。
+GENERIC_REQUIRED = ("核心结论", "关键要点", "内容详情")
 NUM_RE = re.compile(r"\d+(?:[.,]\d+)*\s*[%％]?")
 
 # 中文数字：转写稿里价格与数量常用「十三四块」「十五六块」这类写法，
@@ -137,12 +142,9 @@ def _cn_to_values(seq: str) -> set:
 
 
 def _cn_numbers(text: str) -> set:
-    """原文里出现的所有中文数字可能取值（字符串形式，与阿拉伯数字同口径归一）。"""
-    out = set()
-    for seq in CN_NUM_SEQ.findall(text or ""):
-        for v in _cn_to_values(seq):
-            out.add(str(v))
-    return out
+    """中文数字展开统一走校验器实现，避免两个工具各写一套再生漂移。"""
+    mod = _load_validator()
+    return mod.cn_numbers(text)
 
 
 def _norm_num(s: str) -> str:
@@ -151,12 +153,13 @@ def _norm_num(s: str) -> str:
 
 
 def _strip_timestamps(text: str) -> str:
-    """剥掉原文的 [00:12] 时间戳。
+    """剥掉时间戳，方括号与圆括号两种写法都剥。
 
-    不剥会让「12」进数字集合，纪要里编造的「12 台」正好命中而查不出来——
-    这个坑在 validate_minutes.py 的溯源核对里已实测踩过一次。
+    源文用 `[00:12]`，而摘要稿在引述时会写成 `（00:15）`——只剥方括号的话，
+    稿件的 `01、38、54` 会被当成编造数字（实测：一份纯中文稿被判 12 条编造）。
+    这个坑在 validate_minutes.py 里已分两处修过，这里统一成一条正则。
     """
-    return re.sub(r"\[\d{1,3}:\d{2}(?:-\d{1,3}:\d{2})?\]", " ", text)
+    return re.sub(r"[\[（(]?\d{1,3}:\d{2}(?:-\d{1,3}:\d{2})?[\]）)]?", " ", text)
 
 
 def _numbers(text: str) -> set:
@@ -181,10 +184,11 @@ def _body_without_list_numbers(data: dict) -> str:
         cleaned = re.sub(r"(?m)^\s*\d+[.、)]\s+", "", text)
         chunks.append(cleaned)
     # 待办表的任务描述仍要参与数字核对（任务里可能写「3000 万」这类关键数字），
-    # 但只取 task 与 note 字段，不取 id
+    # 但只取 task 与 note 字段，不取 id；note 里的「出处：00:20 张三」是定位锚点
+    # 不是事实数据，先剥掉再计数——否则每份带出处的合格纪要都会被判编造数字。
     for it in data.get("action_items") or []:
         chunks.append(str(it.get("task") or ""))
-        chunks.append(str(it.get("note") or ""))
+        chunks.append(re.sub(r"出处[：:][^；;|]*", "", str(it.get("note") or "")))
     return "\n".join(chunks)
 
 
@@ -196,6 +200,12 @@ def evaluate(minutes_path: Path, source_text: str) -> dict:
     items = data.get("action_items") or []
     decisions = data.get("decisions") or []
 
+    # 章节名决定用哪套必填节：本工具原有的四项必填节只对会议纪要成立。
+    # 访谈/播客/讲座走通用骨架（核心结论/关键要点/内容详情），套会议口径会把
+    # 合格的总结判成「必填节齐全度 0」直接 fail（实测踩到）。
+    is_meeting = any(k in sections for k in REQUIRED_SECTIONS)
+    required = REQUIRED_SECTIONS if is_meeting else GENERIC_REQUIRED
+
     src_clean = _strip_timestamps(source_text or "")
     src_nums = _numbers(src_clean)
     src_tokens = set(NUM_RE.findall(src_clean))
@@ -204,6 +214,13 @@ def evaluate(minutes_path: Path, source_text: str) -> dict:
 
     # 纪要做数字统计时剔掉结构性序号（待办表序号列、决策列表前缀），只看事实内容
     body = _body_without_list_numbers(data)
+    # 稿件侧同样要剥时间戳：访谈/播客稿的引述会带「（00:15）」这类锚点，
+    # 不剥的话 01、38、54 全被当成编造数字（实测：一份中文稿被判 12 条编造）。
+    body = _strip_timestamps(body)
+    # 日期必须先剥离再统计数字：校验器早已这么做（`_strip_dates`），这里原本没做，
+    # 于是「11 月 21 日」的 11 与 21 被判成编造数字、数字溯源率被压低到 0.33（实测）。
+    # 两个工具口径必须一致，所以直接复用校验器的函数，不另写一套。
+    body = mod._strip_dates(body)
     out_nums = _numbers(body)
     invented = sorted(n for n in out_nums if n not in src_all and n not in src_tokens)
 
@@ -216,14 +233,29 @@ def evaluate(minutes_path: Path, source_text: str) -> dict:
     owner_groundedness = len(grounded) / len(real_owners) if real_owners else 1.0
 
     src_len_k = max(len(src_clean) / 1000.0, 1e-6)
-    present = [k for k in REQUIRED_SECTIONS if (sections.get(k) or "").strip()]
-    section_presence = len(present) / len(REQUIRED_SECTIONS)
+    present = [k for k in required if (sections.get(k) or "").strip()]
+    section_presence = len(present) / len(required)
+
+    # 出处覆盖率：备注标了「出处：」的行，锚点要能在原文里找到。
+    # 这是「行动项是否编造」的机械代理指标——最前沿模型的典型失效正是编造行动项。
+    # 比对前两边都归一化（去空白与标点）：原文 `[00:20] 李四：` 与锚点 `00:20 李四`
+    # 差一对括号一个冒号，不归一化就永远匹配不上。
+    src_flat = mod.norm_anchor(source_text or "")
+    anchored = [it for it in items if (it.get("source") or "")]
+    grounded_anchors = [it for it in anchored
+                        if mod.norm_anchor(it["source"]) in src_flat]
+    source_coverage = (len(grounded_anchors) / len(items)) if items else 1.0
+    # 状态填充率：跨会跟踪能不能用，全看这一列有没有填。
+    status_filled = (sum(1 for it in items if (it.get("status") or "") not in ("", "待定"))
+                     / len(items)) if items else 0.0
 
     metrics = {
         "invented_numbers": len(invented),
         "invented_number_list": invented[:10],
         "fact_coverage": round(fact_coverage, 3),
         "owner_groundedness": round(owner_groundedness, 3),
+        "source_coverage": round(source_coverage, 3),
+        "status_filled": round(status_filled, 3),
         "decision_density": round(len(decisions) / src_len_k, 2),
         "action_density": round(len(items) / src_len_k, 2),
         "section_presence": round(section_presence, 3),
@@ -241,11 +273,13 @@ def evaluate(minutes_path: Path, source_text: str) -> dict:
         "owner_groundedness": metrics["owner_groundedness"] >= GATES["owner_groundedness_min"],
         "fact_coverage": metrics["fact_coverage"] >= GATES["fact_coverage_min"],
         "section_presence": metrics["section_presence"] >= GATES["section_presence_min"],
+        # 出处覆盖率只对「有待办」的纪要有意义；没有待办时按 1.0 放行
+        "source_coverage": metrics["source_coverage"] >= GATES["source_coverage_min"],
     }
     verdict = "pass" if all(checks.values()) else "fail"
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "minutes": str(minutes_path),
         "metrics": metrics,
         "checks": checks,
@@ -255,8 +289,12 @@ def evaluate(minutes_path: Path, source_text: str) -> dict:
         "unjudged": [
             "语义忠实度：是否曲解原意（需读语义，机械判定会误伤同义改写）",
             "无依据量化：把原文的模糊表述写成精确数字（需读语义）",
-            "说话人张冠李戴：归属错人（纪要若为中性叙述则不适用）",
             "语用过信：把推测写成事实（需读语义）",
+            "状态真实性：待办标「进行中」是否属实（需与上期表格对照）",
+        ],
+        # 已由校验器下沉为机检的语义项，在此声明避免与 unjudged 混淆
+        "downgraded": [
+            "说话人归属：按「出处锚点 vs 责任人」近似判定，校验器出 WARN，不进本门禁",
         ],
     }
 
@@ -279,11 +317,15 @@ def render_report(rep: dict) -> str:
         f"必填节齐全度                {m['section_presence']:<9}"
         f"≥{g['section_presence_min']:<10}"
         f"{'PASS' if rep['checks']['section_presence'] else 'FAIL'}",
+        f"待办出处覆盖率              {m['source_coverage']:<9}"
+        f"≥{g['source_coverage_min']:<10}"
+        f"{'PASS' if rep['checks']['source_coverage'] else 'FAIL'}",
         "-" * 60,
         f"参考项（不设门槛）：决策 {m['n_decisions']} 条（密度 {m['decision_density']}/千字）、"
         f"待办 {m['n_action_items']} 条（密度 {m['action_density']}/千字）",
         f"                责任人填写率 {m['owner_filled']:.0%}、"
-        f"完成时间填写率 {m['due_filled']:.0%}",
+        f"完成时间填写率 {m['due_filled']:.0%}、"
+        f"状态填写率 {m['status_filled']:.0%}",
     ]
     if m["invented_number_list"]:
         rows.append(f"编造数字明细：{'、'.join(m['invented_number_list'])}")
@@ -291,6 +333,10 @@ def render_report(rep: dict) -> str:
     rows.append("未评估（需人工或语义判断）：")
     for u in rep["unjudged"]:
         rows.append(f"  - {u}")
+    if rep.get("downgraded"):
+        rows.append("已下沉为机检（校验器 WARN 级，不进本门禁）：")
+        for d in rep["downgraded"]:
+            rows.append(f"  - {d}")
     return "\n".join(rows)
 
 
@@ -321,9 +367,9 @@ def selftest() -> int:
 
 ## 待办事项
 
-| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 备注 |
-|---|---|---|---|---|---|
-| 1 | 核对毛利率口径 | 李四 | 本周五 | 高 | 无 |
+| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 状态 | 备注 |
+|---|---|---|---|---|---|---|
+| 1 | 核对毛利率口径 | 李四 | 11 月 20 日 | 高 | 未开始 | 优先级未明示；出处：00:20 李四 |
 
 ## 会议内容
 

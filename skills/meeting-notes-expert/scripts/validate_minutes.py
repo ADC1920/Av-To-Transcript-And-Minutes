@@ -64,8 +64,35 @@ RELATIVE_TIME_RE = re.compile(
     r"(?:本周|下周|这周)[一二三四五六日天]|[周星期][一二三四五六日天]前|月底前|下月初")
 DATE_RE = re.compile(r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*[日号]?|\d{1,2}\s*月\s*\d{1,2}\s*[日号]")
 RISK_TIERS = {"可行", "待补", "待核", "不可行"}
-ACTION_COLUMNS = ["序号", "待办事项", "责任人/责任部门", "完成时间", "优先级", "备注"]
+# 待办表两套列序：七列（现行，含状态）与六列（v1.12.0 及以前的历史件）。
+# 六列件不判缺状态，只告警提示补——历史归档件重跑校验不该集体报错。
+ACTION_COLUMNS_7 = ["序号", "待办事项", "责任人/责任部门", "完成时间", "优先级", "状态", "备注"]
+ACTION_COLUMNS_6 = ["序号", "待办事项", "责任人/责任部门", "完成时间", "优先级", "备注"]
+# 正式会议在七列中间插一列「对应动议」——插在状态之后、备注之前，
+# 这样七列件的列序在两种表里保持一致，读者不必重新适应。
+ACTION_COLUMNS_FORMAL = ["序号", "待办事项", "责任人/责任部门", "完成时间", "优先级",
+                         "状态", "对应动议", "备注"]
+ACTION_COLUMNS = ACTION_COLUMNS_7
+ACTION_COLUMN_SETS = (ACTION_COLUMNS_7, ACTION_COLUMNS_6, ACTION_COLUMNS_FORMAL)
+ACTION_FIELD_MAP = {"序号": "id", "待办事项": "task", "责任人/责任部门": "owner",
+                    "责任人": "owner", "完成时间": "due", "优先级": "priority",
+                    "状态": "status", "备注": "note"}
 PRIORITIES = {"高", "中", "低", "待定"}
+# 状态五态 + 待定：跨会跟踪靠它区分「还没做」与「做完了」。
+STATUSES = {"未开始", "进行中", "受阻", "完成", "取消", "待定"}
+# 表述强度：软承诺入表但不升格为确定任务（SKILL.md「四类产出物归属」）。
+STRENGTHS = {"确定", "软性"}
+# 待办出处：备注列里以「出处：00:35 张三」或「出处：会议原文引文」形式标注。
+# 用备注列承载而不新增第八列——八列在 A4 可用宽 15.92cm 下每列不足 2cm，内容频繁换行。
+SOURCE_RE = re.compile(r"出处[：:]\s*([^；;|]+)")
+# 表述强度写在备注列（「强度：软性」），不新增第八列——理由同出处。
+STRENGTH_RE = re.compile(r"强度[：:]\s*([^\s；;|、，。]+)")
+# 正式会议的待办需回指所执行的动议编号（SKILL.md「正式会议法定要素节」）。
+MOTION_RE = re.compile(r"动议\s*([0-9]+|[一二三四五六七八九十]+)")
+# 通用总结的行动事项表沿用同一套列（访谈/播客常无状态，缺失只提示不判错）。
+GENERIC_TIMESTAMP_RE = re.compile(r"^\s*(\d{1,2}):([0-5]\d)")
+# 术语定义句式：讲座里引入术语时「X 是指」「所谓 X」「X 的定义是」。
+DEFINITION_RE = re.compile(r"(?:所谓\s*([^\s，。；：]{2,12})|([^\s，。；：]{2,12})\s*(?:是指|定义为|的定义是))")
 BASIC_FIELDS_OK = {"会议主题", "会议时间", "会议地点", "参会人员", "记录人",
                    "主持人", "会议方式", "会议编号", "会议形式",
                    # 完整分层版常用字段（对照听脑AI 模板）：参会方按单位列、
@@ -75,7 +102,115 @@ HEADING_RE = re.compile(r"^##(?!#)\s+(.+)$")
 HEADING_STYLE_RE = re.compile(r"^(?:Heading|标题)\s*(\d+)$")
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.、)])\s+")
 NUM_RE = re.compile(r"\d+(?:[.,]\d+)*\s*[%％]?")
+# 中文数字：纪要常把「百分之五」「两万亿」写成汉字，只比对阿拉伯数字会漏掉它们，
+# 于是中文数字稿的「数字溯源」永远报 0 个、等于这项校验整个失效（实测踩到）。
+CN_DIGIT = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+            "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+CN_NUM_SEQ = re.compile(r"[零一二三四五六七八九十百千万亿两]{1,6}")
+
+
+def cn_to_values(seq):
+    """把一段中文数字串展开成可能的阿拉伯数字集合（保守展开，宁宽不漏）。
+
+    只处理会议记录里真正会出现的两类：
+      - 确定值：「二十」→20、「十六」→16、「三百」→300
+      - 模糊相邻：「十五六」→15/16、「十三四」→13/14
+    宁宽不漏的理由：本指标要抓的是「原文根本没提过这个数」，「十五六块」写成
+    「15 元至 16 元」是忠实整理而非编造，误判会让人不信这项校验。
+    展开也必须收窄——早期版本把「十五六」也展开出 50/55/56，等于放水。
+    """
+    out = set()
+    if not seq:
+        return out
+    m = re.fullmatch(r"([一二三四五六七八九两])?十([一二三四五六七八九两])?", seq)
+    if m:
+        tens = CN_DIGIT[m.group(1)] if m.group(1) else 1
+        out.add(tens * 10 + CN_DIGIT[m.group(2)] if m.group(2) else tens * 10)
+        return out
+    m = re.fullmatch(r"([一二三四五六七八九两])?([百千万亿])", seq)
+    if m:
+        base = CN_DIGIT[m.group(1)] if m.group(1) else 1
+        out.add(base * {"百": 100, "千": 1000, "万": 10000, "亿": 100000000}[m.group(2)])
+        return out
+    # 复合大单位：「两万亿」= 2 万亿 = 2e12，「十几万亿」同理，「八千亿」= 8000 亿。
+    # 不处理这一段，后面按位兜底会把「两万亿」解成 ['2']，原文真有这个数也匹配不上
+    # （实测：稿件写「两万亿」被判成编造）。
+    if "万" in seq or "亿" in seq:
+        total = 0
+        rest = seq
+        for unit, factor in (("亿", 100000000), ("万", 10000)):
+            idx = rest.find(unit)
+            if idx < 0:
+                continue
+            # 单位前的那一截本身可以是「二十」「八百」这类，交给本函数递归解析
+            head = rest[:idx] or "一"
+            head_vals = cn_to_values(head)
+            if len(head_vals) == 1:
+                total += head_vals.pop() * factor
+                rest = rest[idx + 1:]
+        if total:
+            out.add(total)
+            return out
+    if len(seq) == 1 and seq in CN_DIGIT:
+        out.add(CN_DIGIT[seq])
+        return out
+    vals = [CN_DIGIT[c] for c in seq if c in CN_DIGIT]
+    if vals:
+        out.update(vals)
+        if "十" in seq:
+            for i, c in enumerate(seq):
+                if c != "十":
+                    continue
+                prev = CN_DIGIT.get(seq[i - 1]) if i > 0 else 1
+                prev = 1 if prev is None else prev
+                out.add(prev * 10)
+                if i + 1 < len(seq):
+                    nxt = CN_DIGIT.get(seq[i + 1])
+                    if nxt is not None:
+                        out.add(prev * 10 + nxt)
+                        if i + 2 < len(seq):
+                            n2 = CN_DIGIT.get(seq[i + 2])
+                            if n2 is not None:
+                                out.add(prev * 10 + n2)
+            ten_at = seq.index("十")
+            for h in [CN_DIGIT[c] for c in seq[:ten_at] if c in CN_DIGIT]:
+                out.add(h * 10)
+        if len(vals) == 2 and "十" not in seq:
+            out.add(vals[0] * 10 + vals[1])
+    return out
+
+
+def cn_numbers(text):
+    """文本里出现的所有中文数字可能取值（字符串形式，与阿拉伯数字同口径归一）。
+
+    切串时把数字后紧邻的大单位一并纳入：「两万多亿」里「多」隔断了数字串，
+    只切到「两万」会展开成 20000、丢掉后面的「亿」，而原文「两万亿」展开是 2e12，
+    两者明明同一数量级却对不上（实测踩到）。
+
+    两侧必须用同一函数：稿件写「两万多亿美元」、源文写「两万亿」时，
+    只要都经过这里展开，差集才对得上。
+    """
+    out = set()
+    t = text or ""
+    # 数字串可选跟一个「多/余/来」再接大单位，把整段当一个数处理
+    pattern = r"[零一二三四五六七八九十百千万亿两]{1,8}(?:[多余来][百千万亿])?"
+    for m in re.finditer(pattern, t):
+        seq = m.group(0)
+        core = re.sub(r"[多余来]", "", seq)
+        for v in cn_to_values(core):
+            out.add(str(v))
+        # 去掉末尾单位后的前缀也收：与源文只写「两万」的形态对齐
+        for v in cn_to_values(re.sub(r"[万亿]+$", "", core)):
+            out.add(str(v))
+        # 后缀子串（源文侧可能出现更短的写法）
+        for i in range(1, len(core)):
+            for v in cn_to_values(core[i:]):
+                out.add(str(v))
+    return out
 OWNER_PLACEHOLDERS = {"待定", "未指定", "全体", "大家", "—", "-"}
+# 责任人是部门/单位而非个人时的后缀。这类值不进人名溯源——会议原文从不出现
+# 「财务部」三个字（说的是「财务那边」），按人名核对必然误报；说话人归属同理跳过。
+ORG_SUFFIX_LIST = ("部", "组", "科", "司", "处", "室", "中心", "团队", "委员会")
 
 
 # ---------- 解析 ----------
@@ -234,15 +369,52 @@ def _first_table(entries):
 
 
 def collect_action_items(entries):
-    """取待办节的第一张表。列数不对也返回，让列名断言报出来，而不是静默当作没有表。"""
-    keys = ["id", "task", "owner", "due", "priority", "note"]
+    """取待办节的第一张表，按表头名映射成字段。
+
+    六列旧件（无状态）与七列新件都认：按表头文字映射，不按位置硬取，
+    这样列序调整或加列不会静默错位。列数不对时仍返回，让列名断言报出来。
+    """
     rows, header = _first_table(entries)
     if not header:
         return [], []
+    keys = [ACTION_FIELD_MAP.get(h, "") for h in header]
     items = []
     for cells in rows:
-        items.append({k: (cells[i] if i < len(cells) else "") for i, k in enumerate(keys)})
+        item = {k: "" for k in ("id", "task", "owner", "due", "priority",
+                                "status", "note", "source", "strength")}
+        for i, key in enumerate(keys):
+            if key and i < len(cells):
+                item[key] = cells[i]
+        # 出处与表述强度写在备注列，解析后单独取出供溯源、跨会查询与强度机检使用
+        m = SOURCE_RE.search(item["note"] or "")
+        item["source"] = (m.group(1).strip() if m else "")
+        m2 = STRENGTH_RE.search(item["note"] or "")
+        item["strength"] = (m2.group(1) if m2 else "")
+        items.append(item)
     return items, header
+
+
+def _has_motion_column(header):
+    """正式会议：备注列外允许出现「对应动议」类列，判据是表头含「动议」。"""
+    return any("动议" in h for h in header)
+
+
+def _schema_item(it):
+    """待办行转 schema 载荷：空的可选字段不下发，避免 enum 被空串打穿。"""
+    out = {k: it[k] for k in ("id", "task", "owner", "due", "priority", "note")}
+    for k in ("status", "strength", "source"):
+        if it.get(k):
+            out[k] = it[k]
+    return out
+
+
+def norm_anchor(s):
+    """出处锚点与原文比对前的归一化：去空白与标点。
+
+    原文是 `[00:20] 李四：…`，锚点写 `00:20 李四`——差一对括号和一个冒号。
+    不归一化就永远匹配不上，出处溯源会全盘误报（实测）。
+    """
+    return re.sub(r"[\s\[\]()（）【】:：，。、；;|—\-]", "", s or "")
 
 
 def collect_decisions(entries):
@@ -254,6 +426,19 @@ def collect_decisions(entries):
         if text:
             lines.append(LIST_RE.sub("", text).strip())
     return [x for x in lines if x]
+
+
+def split_decision_source(line):
+    """把决策条目里以「出处：…」结尾的锚点拆出来，返回 (正文, 出处)。
+
+    决策正文按 SKILL.md 不加任何出处标注；锚点只用于 JSON 导出。
+    若作者在 docx 里手写了「（出处：00:35）」且希望保留可读性，这里仍拆走——
+    正文不带依据是硬口径。
+    """
+    m = re.search(r"[（(]?\s*出处[：:]\s*([^）)]+)[）)]?\s*$", line)
+    if not m:
+        return line.strip(), ""
+    return line[:m.start()].strip(), m.group(1).strip()
 
 
 # ---------- 校验 ----------
@@ -389,12 +574,12 @@ def validate(path, source_text=None, strict=False):
         # 分层版的行动项表列名与默认待办表同源，但不要求必须有行——方案评审类常常
         # 只有「各方补材料」这一两件事，空表加说明也合法。
         items, header = collect_action_items(sections.get("行动项", []))
-        if header and header != ACTION_COLUMNS:
-            bad("行动项列名", "应为 " + "/".join(ACTION_COLUMNS) + "，实为 " + "/".join(header))
+        if header and header not in ACTION_COLUMN_SETS:
+            bad("行动项列名", "应为 " + "/".join(ACTION_COLUMNS_7) + "，实为 " + "/".join(header))
         elif header:
-            ok("行动项列名", f"六列且顺序正确（{len(items)} 行）")
+            ok("行动项列名", f"{len(header)} 列且顺序正确（{len(items)} 行）")
         else:
-            warn("行动项", "本节未解析到表格（分层版建议用六列表呈现行动项）")
+            warn("行动项", "本节未解析到表格（分层版建议用行动项表呈现行动项）")
         # 风险评估的「判断」列只允许四档：SKILL.md 写死了取值，但不校验就等于没约束，
         # 第五种写法（「存疑」「不确定」「较好」）会悄悄流进对外交付稿。
         risk_rows, risk_header = _first_table(sections.get("风险评估", []))
@@ -415,35 +600,35 @@ def validate(path, source_text=None, strict=False):
         items, header = collect_action_items(sections.get("下轮改进项", []))
         if not items:
             warn("下轮改进项", "本节无表格行（无改进项时应写明「本次未形成改进项」）")
-        elif header != ACTION_COLUMNS:
-            bad("改进表列名", "应为 " + "/".join(ACTION_COLUMNS) + "，实为 " + "/".join(header))
+        elif header not in ACTION_COLUMN_SETS:
+            bad("改进表列名", "应为 " + "/".join(ACTION_COLUMNS_7) + "，实为 " + "/".join(header))
         else:
-            ok("改进表列名", f"六列且顺序正确（{len(items)} 行）")
+            ok("改进表列名", f"{len(header)} 列且顺序正确（{len(items)} 行）")
     elif is_standup:
         # 站会不要求表格，但阻塞节必须存在（「没有人被卡住」本身是有效信息）
         items, header = [], None
         ok("站会阻塞", "阻塞节已写")
     elif is_generic:
-        # 通用总结的行动事项用同一张六列表；没有行动时允许写明「未形成行动事项」。
+        # 通用总结的行动事项用同一张表；没有行动时允许写明「未形成行动事项」。
         # 不在这里硬判必须有行动——访谈与讲座常常没有行动项。
         items, header = collect_action_items(sections.get("行动事项", []))
-        if header and header != ACTION_COLUMNS:
-            bad("行动表列名", "应为 " + "/".join(ACTION_COLUMNS) + "，实为 " + "/".join(header))
+        if header and header not in ACTION_COLUMN_SETS:
+            bad("行动表列名", "应为 " + "/".join(ACTION_COLUMNS_7) + "，实为 " + "/".join(header))
         elif header:
-            ok("行动表列名", "六列且顺序正确")
+            ok("行动表列名", f"{len(header)} 列且顺序正确")
         else:
             ok("行动表", "本节无表格（通用总结允许无行动事项）")
     else:
         items, header = collect_action_items(sections.get("待办事项", []))
         if header:
-            if header == ACTION_COLUMNS:
-                ok("待办表列名", "六列且顺序正确")
+            if header in ACTION_COLUMN_SETS:
+                ok("待办表列名", f"{len(header)} 列且顺序正确")
             else:
-                bad("待办表列名", "应为 " + "/".join(ACTION_COLUMNS) + "，实为 " + "/".join(header))
+                bad("待办表列名", "应为 " + "/".join(ACTION_COLUMNS_7) + "，实为 " + "/".join(header))
         elif "未形成行动事项" in section_text(sections.get("待办事项", [])):
             ok("待办表", "声明未形成行动事项")
         else:
-            bad("待办表", "待办节既无六列表格，也无「未形成行动事项」声明")
+            bad("待办表", "待办节既无表格，也无「未形成行动事项」声明")
 
     if items:
         for i, it in enumerate(items, 1):
@@ -455,8 +640,16 @@ def validate(path, source_text=None, strict=False):
                 bad(f"待办第{i}行", "完成时间列缺失（未定时应填「待定」）")
             if it["priority"] not in PRIORITIES:
                 bad(f"待办第{i}行", f"优先级「{it['priority']}」不在 高/中/低/待定 内")
+            # 状态列只在表里确实有状态列时才判——六列旧件没有这一列，判它等于逼历史件返工
+            has_status_col = "状态" in (header or [])
+            if has_status_col and it["status"] not in STATUSES:
+                bad(f"待办第{i}行", f"状态「{it['status']}」不在 未开始/进行中/受阻/完成/取消/待定 内")
+            if it["strength"] and it["strength"] not in STRENGTHS:
+                bad(f"待办第{i}行", f"表述强度「{it['strength']}」不在 确定/软性 内")
         if not any(r[0] == "FAIL" and r[1].startswith("待办第") for r in results):
             ok("待办字段", f"{len(items)} 行责任人与时间均非空")
+        if header == ACTION_COLUMNS_6:
+            warn("待办表状态列", "六列旧格式，缺状态列；新稿应为七列并填状态，便于跨会跟踪未完成项")
         # 相对时间：会议时间可解析到日期时才判，解析不到就放行（无基准，换算等于编造）。
         basic_date = _parse_meeting_date(basic.get("会议时间", ""))
         rel = [it["due"] for it in items if RELATIVE_TIME_RE.search(it["due"] or "")]
@@ -464,6 +657,27 @@ def validate(path, source_text=None, strict=False):
             bad("相对时间", "完成时间须换算为具体日期，仍在用相对表述：" + "、".join(rel[:5]))
         elif rel:
             ok("相对时间", "会议时间缺失，保留原话不换算")
+        # 出处：新格式要求备注列带「出处：…」；无源材料时仅提示，有源材料时进溯源统计。
+        if header in (ACTION_COLUMNS_7,):
+            no_src = [str(i) for i, it in enumerate(items, 1) if not it["source"]]
+            if no_src:
+                warn("待办出处", "以下行备注未标出处：" + "、".join(no_src[:5])
+                     + "（备注写「出处：00:35 张三」或原文引文片段）")
+            else:
+                ok("待办出处", f"{len(items)} 行均标了原文出处")
+        # 正式会议：行动项应能回指所执行的动议编号。
+        # 只在确实有待办行时才判——「本次会议未形成行动事项」的稿子没有表可加列。
+        if is_formal and items:
+            if _has_motion_column(header or []):
+                no_motion = [str(i) for i, row in enumerate(
+                    _first_table(sections.get("待办事项", []))[0], 1)
+                    if not MOTION_RE.search("|".join(row))]
+                if no_motion:
+                    warn("动议回指", "以下行未标对应动议：" + "、".join(no_motion[:5]))
+                else:
+                    ok("动议回指", "行动项均回指动议")
+            else:
+                warn("动议回指", "正式会议待办表建议加「对应动议」列，便于按动议核销执行情况")
 
     if not missing and not is_generic and not (is_retro or is_standup or is_layered):
         # schema 只描述常规会议结构：通用总结、复盘、站会的章节名不同，套会议 schema
@@ -475,8 +689,10 @@ def validate(path, source_text=None, strict=False):
             payload = {
                 "basic_info": basic,
                 "sections": {k: section_text(v) for k, v in sections.items()},
-                "action_items": items if (items and header == ACTION_COLUMNS) else [],
-                "decisions": decisions,
+                "action_items": [_schema_item(it) for it in items] if items else [],
+                "decisions": [{"text": t, "source": s} for t, s in
+                              (split_decision_source(d) for d in decisions)],
+                "decision_texts": decisions,
             }
             jsonschema.validate(payload, schema)
             ok("结构 schema", "符合 minutes-schema.json")
@@ -517,6 +733,9 @@ def validate(path, source_text=None, strict=False):
                     in_table = True
                     if cells and re.fullmatch(r"\d+", cells[0]):
                         cells = [""] + cells[1:]
+                    # 「对应动议」列的「动议 2」是结构性编号，不是事实数字——
+                    # 和序号一样剔掉，否则每份正式会议纪要都会被判编造数字。
+                    cells = [re.sub(r"^动议\s*\d+$", "", c) for c in cells]
                     lines.append(" ".join(c for c in cells if c))
                 else:
                     if in_table:
@@ -524,18 +743,30 @@ def validate(path, source_text=None, strict=False):
                     lines.append(ln)
             body_for_nums = "\n".join(lines)
         out_nums = {re.sub(r"[,\s]", "", x).rstrip("%％") for x in NUM_RE.findall(body_for_nums)}
+        # 中文数字同样要进受检集合：纪要写「百分之五」「两万亿」时若只比对阿拉伯
+        # 数字，这项校验就一个数都查不到、静默失效（实测：中文稿报「0 个数字」）。
+        out_cn = cn_numbers(body_for_nums)
+        out_all = out_nums | out_cn
+        # 源文侧同样补中文数字：「每年升百分之五」在原文里就是汉字写法
+        src_cn = cn_numbers(src_clean)
+        src_all = src_nums | src_cn
         # 一位数不再整体豁免：源文数字很少时它恰恰是编造的重灾区。改为要求该数字
         # 在源文里以独立 token 出现，避免「1」被「12」包含而误判为已出现。
         src_tokens = set(NUM_RE.findall(src_clean))
-        invented = sorted(n for n in out_nums
-                          if n not in src_nums and n not in src_tokens)
+        # 中文数字与阿拉伯数字的量级要对齐：「两万亿」展开是 2e12，而原文写
+        # 「两万亿美元」也展开成 2e12，两边一致；但阿拉伯写法「2 万亿」会被
+        # NUM_RE 拆成 2 和 20000 两个 token。这里把两边的量级形式都补进源文集合，
+        # 只补「能由已有值直接拼出」的组合，不做跨句推断。
+        invented = sorted(n for n in out_all
+                          if n not in src_all and n not in src_tokens)
         if invented:
             warn("数字溯源", "源材料未出现：" + "、".join(invented[:8]))
         else:
-            ok("数字溯源", f"{len(out_nums)} 个数字均可在源材料中找到")
+            ok("数字溯源", f"{len(out_all)} 个数字均可在源材料中找到")
 
         owners = [it["owner"] for it in items
-                  if it["owner"] and it["owner"] not in OWNER_PLACEHOLDERS]
+                  if it["owner"] and it["owner"] not in OWNER_PLACEHOLDERS
+                  and not it["owner"].endswith(ORG_SUFFIX_LIST)]
         # 日期溯源：日期不进数字集合（会与相对时间换算冲突），单独核。
         # 通过条件二选一——源文出现过同一日期，或能由会议时间换算得出。
         src_dates = {d for _, d in _extract_dates(src_clean, {}) if d}
@@ -562,11 +793,140 @@ def validate(path, source_text=None, strict=False):
         else:
             ok("责任人溯源", "无可核对的责任人（均为待定/未指定）")
 
+        # 出处溯源：备注列标了「出处：…」的行，锚点须能在源文里找到。
+        # 锚点可能写成时间戳（00:35）或引文片段，两种都按归一化后的子串匹配。
+        # 源文同时准备两种形态：原样，以及把「说话人N（真名）」压成真名——
+        # 锚点写「00:14 钱伟」而原文是「说话人1（钱伟）」，不压标签就永远匹配不上（实测）。
+        src_flat = norm_anchor(src)
+        src_flat_alias = norm_anchor(re.sub(r"说话人\s*\d+\s*[（(]\s*([^）)]{1,20})\s*[）)]",
+                                            r"\1", src))
+        anchored = [it for it in items if it.get("source")]
+        bad_src = [it["source"] for it in anchored
+                   if norm_anchor(it["source"]) not in src_flat
+                   and norm_anchor(it["source"]) not in src_flat_alias]
+        if bad_src:
+            warn("出处溯源", "以下出处无法在源材料中找到：" + "、".join(bad_src[:5]))
+        elif anchored:
+            ok("出处溯源", f"{len(anchored)} 条出处均可在源材料中找到")
+
+        # 说话人归属（语义层的第一项下沉）：出处引文能定位到某段，而该段说话人与
+        # 责任人不是同一人时提示。误报来源明确——同一人跨段发言、责任人由他人代派、
+        # 正式会议的动议由主持人宣读而由他人执行，所以只出 WARN 不判 FAIL。
+        # 这是外部评测里占比 16% 的失效类型的最小化机检。
+        seg_speakers = _segment_speakers(src)
+        # 执行主体为部门/单位（「财务部」「运营组」）时归属核对无从比对，跳过
+        misattr = []
+        for it in anchored:
+            owner = it["owner"]
+            if not owner or owner in OWNER_PLACEHOLDERS:
+                continue
+            if owner.endswith(ORG_SUFFIX_LIST):
+                continue
+            # 责任人不在原文出现时归属比对无意义——「责任人溯源」已经报过这条，
+            # 再叠一条归属告警只是同一问题的重复。实测场景：纪要用身份代称
+            # （「主持人」）而原文是「说话人0」标签，两边天然对不上。
+            if owner not in src:
+                continue
+            spk = _speaker_of_anchor(it["source"], seg_speakers)
+            if spk and owner not in spk and spk not in owner:
+                misattr.append(f"第{it['id'] or '?'}行 {owner} / {spk}")
+        if misattr:
+            warn("说话人归属", "责任人与出处段说话人不同（可能是代派或跨段发言）："
+                 + "；".join(misattr[:3]))
+
+    # ---- 通用总结的两条可机检项（会议版不适用）----
+    if is_generic:
+        _check_generic_machine_items(sections, source_text, warn, ok, bad)
+
     fails = sum(1 for r in results if r[0] == "FAIL")
     warns = sum(1 for r in results if r[0] == "WARN")
     if strict:
         fails += warns
     return (1 if fails else 0), results
+
+
+def _segment_speakers(src):
+    """从会议原文抽 [(时间戳秒, 说话人)]。
+
+    原文两种常见形态都认：管线产出的 `[00:35] 张三：…`，
+    以及「说话人N（真名）」标注的 `[00:35] 说话人1（李四）：…`。
+    后者取括号里的真名——纪要正文用的是真名，按标签「说话人1」比对必然错配。
+    """
+    out = []
+    for m in re.finditer(r"\[(\d{1,3}):(\d{2})(?:-\d{1,3}:\d{2})?\]\s*([^：:\n]{1,20})[：:]", src):
+        label = m.group(3).strip()
+        alias = re.search(r"[（(]\s*([^）)]{1,20})\s*[）)]", label)
+        if alias:
+            label = alias.group(1).strip()
+        else:
+            label = re.sub(r"^说话人\s*\d+\s*", "", label).strip() or label
+        out.append((int(m.group(1)) * 60 + int(m.group(2)), label))
+    return out
+
+
+def _speaker_of_anchor(anchor, seg_speakers):
+    """按出处锚点找对应段的说话人。锚点是时间戳时取最近的前一段。"""
+    if not seg_speakers or not anchor:
+        return ""
+    m = re.search(r"(\d{1,3}):(\d{2})", anchor)
+    if not m:
+        return ""
+    t = int(m.group(1)) * 60 + int(m.group(2))
+    best = ""
+    for ts, spk in seg_speakers:
+        if ts <= t + 1:
+            best = spk
+        else:
+            break
+    return best
+
+
+def _check_generic_machine_items(sections, source_text, warn, ok, bad=None):
+    """通用总结两条机检：播客章节时间戳（FAIL 级）、讲座术语定义（WARN 级）。
+
+    分级理由：时刻是精确值，错位就是错，按 FAIL 判（SKILL.md「时间戳一律按原文
+    实际时刻写，不估算」）；术语名能否溯源受讲者口语变体影响，误报率高，按 WARN 判。
+    """
+    body_ts = section_text(sections.get("章节时间戳", []))
+    if body_ts.strip():
+        rows = [ln for ln in body_ts.splitlines() if ln.strip()]
+        stamps = []
+        for ln in rows:
+            m = re.search(r"(\d{1,3}):([0-5]\d)", ln)
+            if m:
+                stamps.append((int(m.group(1)) * 60 + int(m.group(2)), ln.strip()))
+        if stamps and stamps[0][0] != 0:
+            (bad or warn)("章节时间戳", f"首条章节不是 0:00，实为 {stamps[0][1][:20]}")
+        elif stamps:
+            ok("章节时间戳", f"{len(stamps)} 条章节时刻齐备")
+        if stamps and source_text:
+            src_ts = {int(m.group(1)) * 60 + int(m.group(2))
+                      for m in re.finditer(r"\[(\d{1,3}):([0-5]\d)", source_text)}
+            if src_ts:
+                off = [f"{t // 60}:{t % 60:02d}" for t, ln in stamps if t not in src_ts]
+                if off:
+                    (bad or warn)("章节时间戳溯源",
+                                  "以下时刻源材料中不存在：" + "、".join(off[:5]))
+                else:
+                    ok("章节时间戳溯源", f"{len(stamps)} 个时刻均能在源材料中找到")
+
+    terms_body = section_text(sections.get("术语定义", []))
+    if terms_body.strip() and source_text:
+        terms = [LIST_RE.sub("", ln).strip() for ln in terms_body.splitlines() if ln.strip()]
+        terms = [t for t in terms if t]
+        # 术语名取条目开头到第一个分隔符（「：」「——」「·」）
+        names = [re.split(r"[：:—\-·]", t, 1)[0].strip() for t in terms]
+        names = [n for n in names if 1 < len(n) <= 20]
+        if names:
+            missing = [n for n in names if n not in source_text]
+            if missing:
+                warn("术语定义", "以下术语在源材料中未出现：" + "、".join(missing[:5]))
+            else:
+                # 定义句式是加分证据而非必要条件：讲者常说「X 就是…」等变体，
+                # 只要求术语本身在原文出现，定义句式的出现与否只写进明细。
+                has_def = bool(DEFINITION_RE.search(source_text))
+                ok("术语定义", f"{len(names)} 个术语均可溯源"
+                   + ("（原文含定义句式）" if has_def else "（原文未见标准定义句式）"))
 
 
 def summarize(results):
@@ -612,9 +972,9 @@ SELFTEST_OK = """# 会议纪要：测试会议
 
 ## 待办事项
 
-| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 备注 |
-|---|---|---|---|---|---|
-| 1 | 完成上线检查 | 张三 | 10 月 25 日 | 高 | 优先级未明示 |
+| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 状态 | 备注 |
+|---|---|---|---|---|---|---|
+| 1 | 完成上线检查 | 张三 | 10 月 25 日 | 高 | 未开始 | 优先级未明示；出处：00:15 张三 |
 
 ## 待定与开放问题
 
@@ -690,6 +1050,55 @@ def selftest():
         tri_ok = st_clean == "complete" and st_warn == "degraded" and st_fail == "failed" and len(wl) > 0
         print(f"[{'PASS' if tri_ok else 'FAIL'}] 三态判定（{st_clean}/{st_warn}/{st_fail}，告警 {len(wl)} 条）")
         ok &= tri_ok
+        # 状态枚举：非法状态值必须被抓，合法五态放行。
+        st_bad = SELFTEST_OK.replace("| 高 | 未开始 |", "| 高 | 已完成一半 |")
+        stp = Path(td) / "status.md"
+        stp.write_text(st_bad, encoding="utf-8")
+        rc5, res5 = validate(stp)
+        st_caught = any(r[0] == "FAIL" and "状态" in r[2] for r in res5)
+        print(f"[{'PASS' if st_caught else 'FAIL'}] 非法状态值应被抓")
+        ok &= st_caught
+        # 表述强度：备注里「强度：软性」应被解析出来，非法值要 FAIL。
+        soft_doc = SELFTEST_OK.replace("优先级未明示；", "优先级未明示；强度：软性；")
+        sp = Path(td) / "soft.md"
+        sp.write_text(soft_doc, encoding="utf-8")
+        _rc6, res6 = validate(sp)
+        items6, _ = collect_action_items(
+            split_sections(parse_md(soft_doc))[1].get("待办事项", []))
+        strength_ok = (items6 and items6[0]["strength"] == "软性"
+                       and not any(r[0] == "FAIL" and "强度" in r[2] for r in res6))
+        print(f"[{'PASS' if strength_ok else 'FAIL'}] 软承诺强度应被解析为合法值")
+        ok &= bool(strength_ok)
+        st_bad2 = soft_doc.replace("强度：软性", "强度：也许")
+        sp2 = Path(td) / "soft_bad.md"
+        sp2.write_text(st_bad2, encoding="utf-8")
+        _rc6b, res6b = validate(sp2)
+        strength_bad = any(r[0] == "FAIL" and "强度" in r[2] for r in res6b)
+        print(f"[{'PASS' if strength_bad else 'FAIL'}] 非法强度值应被抓")
+        ok &= strength_bad
+        # 导出结构：document_status / processing_warnings / 决策对象化三件必须在位。
+        exp = export_structured(good, source_text="[00:15] 张三：上线检查我来做。")
+        exp_ok = (exp.get("document_status") in ("complete", "degraded", "failed")
+                  and isinstance(exp.get("processing_warnings"), list)
+                  and exp["decisions"] and isinstance(exp["decisions"][0], dict)
+                  and exp["decisions"][0].get("text")
+                  and exp.get("decision_texts") == [d["text"] for d in exp["decisions"]])
+        print(f"[{'PASS' if exp_ok else 'FAIL'}] 导出含文档状态与对象化决策")
+        ok &= exp_ok
+        # 六列旧件的兼容：不应因缺状态列 FAIL，只 WARN。
+        six = SELFTEST_OK.replace(
+            "| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 状态 | 备注 |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| 1 | 完成上线检查 | 张三 | 10 月 25 日 | 高 | 未开始 | 优先级未明示；出处：00:15 张三 |",
+            "| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 备注 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| 1 | 完成上线检查 | 张三 | 10 月 25 日 | 高 | 优先级未明示 |")
+        sixp = Path(td) / "six.md"
+        sixp.write_text(six, encoding="utf-8")
+        rc7, res7 = validate(sixp)
+        six_ok = (rc7 == 0 and any(r[0] == "WARN" and r[1] == "待办表状态列" for r in res7))
+        print(f"[{'PASS' if six_ok else 'FAIL'}] 六列旧件只告警不判错（exit={rc7}）")
+        ok &= six_ok
         # docx 往返：article-format 出稿后标题是段落样式、正文无 `##`，
         # 这条断言防 parse_docx 退回「只认字面 ##」的旧缺陷。
         try:
@@ -773,24 +1182,52 @@ def selftest():
     return 0 if ok else 1
 
 
-def export_structured(path):
+def export_structured(path, source_text=None):
     """把纪要解析成机器可读结构：基本信息 / 各节文本 / 待办表 / 决策列表。
 
     纪要到这一步之前只是给人看的文档，下游（任务同步、跨会议检索、报表）
     拿不到任何字段。这里复用校验器已有的解析逻辑，不新增第二套解析器——
-    两套解析器必然漂移，而校验器已经覆盖 md 与 docx 两种输入。"""
+    两套解析器必然漂移，而校验器已经覆盖 md 与 docx 两种输入。
+
+    文档级完整性（status / processing_warnings）随导出一起下发：纪要「残不残」
+    不能只藏在校验日志里，消费方拿到 JSON 就该知道。给了 source_text 时会先跑
+    一遍校验取真实三态；没给则按结构解析结果推——缺必填节 failed、有 WARN 无从
+    判断故给 complete（此时不代表已校验，只代表结构可解析）。
+    """
     blocks = parse_md(path.read_text(encoding="utf-8", errors="replace")) \
         if path.suffix.lower() == ".md" else parse_docx(path)
     basic, sections, _ = split_sections(blocks)
     action_items, _header = collect_action_items(sections.get("待办事项") or [])
-    decisions = collect_decisions(sections.get("关键决策") or [])
+    decision_lines = collect_decisions(sections.get("关键决策") or [])
+    decisions = []
+    for line in decision_lines:
+        text, src = split_decision_source(line)
+        if text:
+            decisions.append({"text": text, "source": src})
+
+    if source_text:
+        _rc, results = validate(path, source_text)
+        status, warn_dicts = summarize(results)
+        # summarize 已经把 WARN 归一成 {step, reason, message}，直接用，别再按元组取下标
+        warnings_payload = warn_dicts
+    else:
+        missing = [s for s in REQUIRED if not section_text(sections.get(s, []))]
+        status = "failed" if missing else "complete"
+        warnings_payload = ([{"step": "必需节齐备", "reason": "缺：" + "、".join(missing)}]
+                            if missing else [])
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_file": str(path),
         "basic_info": basic,
         "sections": {k: section_text(v) for k, v in sections.items()},
         "action_items": action_items,
         "decisions": decisions,
+        # 向后兼容：v1 消费方读纯文本决策列表
+        "decision_texts": [d["text"] for d in decisions],
+        "document_status": status,
+        "status": status,
+        "processing_warnings": warnings_payload,
     }
 
 
@@ -813,11 +1250,14 @@ def main(argv=None):
         print(f"文件不存在：{path}")
         return 2
     if ns.export:
-        data = export_structured(path)
+        export_source = (Path(ns.source).read_text(encoding="utf-8", errors="replace")
+                         if ns.source else None)
+        data = export_structured(path, export_source)
         Path(ns.export).write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                    encoding="utf-8")
         print(f"结构化纪要已导出：{ns.export}"
-              f"（待办 {len(data['action_items'])} 条，决策 {len(data['decisions'])} 条）")
+              f"（待办 {len(data['action_items'])} 条，决策 {len(data['decisions'])} 条，"
+              f"状态 {data['document_status']}）")
     source = Path(ns.source).read_text(encoding="utf-8", errors="replace") if ns.source else None
     rc, results = validate(path, source, ns.strict)
     for level, name, detail in results:
