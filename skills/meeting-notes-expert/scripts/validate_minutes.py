@@ -17,6 +17,7 @@
 退出码：0 通过；1 有 FAIL（--strict 时 WARN 也计 FAIL）；2 用法/读取错误。
 """
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -54,6 +55,15 @@ LAYERED_REQUIRED = ["会议决策摘要", "关键议题与讨论", "行动项", 
 LAYERED_OPTIONAL = ["项目背景", "项目背景与建设内容", "风险评估", "待决问题与风险",
                     "意见与分歧"]
 FORBIDDEN = ["待确认", "存疑", "转写亦作", "不确定标注"]
+# 「未提供」「材料未提及」与「待确认」同属禁用标注：材料缺就整行省略，不交代缺口。
+# 「材料未记录」不在此列——它是结构性槽位（法定人数/表决票数/复盘原定目标）的合法写法。
+FORBIDDEN_PHRASES = ["未提供", "材料未提及", "材料未说明"]
+# 相对时间：待办完成时间必须换算成具体日期（SKILL.md「相对时间换算」）。
+# 会议时间缺失时无从换算，放行不判——硬算等于编造。
+RELATIVE_TIME_RE = re.compile(
+    r"(?:本周|下周|这周)[一二三四五六日天]|[周星期][一二三四五六日天]前|月底前|下月初")
+DATE_RE = re.compile(r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*[日号]?|\d{1,2}\s*月\s*\d{1,2}\s*[日号]")
+RISK_TIERS = {"可行", "待补", "待核", "不可行"}
 ACTION_COLUMNS = ["序号", "待办事项", "责任人/责任部门", "完成时间", "优先级", "备注"]
 PRIORITIES = {"高", "中", "低", "待定"}
 BASIC_FIELDS_OK = {"会议主题", "会议时间", "会议地点", "参会人员", "记录人",
@@ -153,19 +163,86 @@ def section_text(entries):
     return "\n".join(out).strip()
 
 
+def _parse_meeting_date(text, default_year=None):
+    """从文本解析出日期，解析不到返回 None。
+
+    「11 月 20 日」这类不带年份的写法用 default_year 补齐——纪要正文按惯例不写年份，
+    不补的话每个日期都解析成 None，日期溯源会全盘误报（实测）。补出的日期若比
+    参照日早 60 天以上，按跨年处理（会议在 12 月说「1 月 5 日」应是次年）。
+    """
+    if not text:
+        return None
+    m = re.search(r"(\d{4})\s*[-年/.]\s*(\d{1,2})\s*[-月/.]\s*(\d{1,2})", text)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    if default_year is None:
+        return None
+    m = re.search(r"(\d{1,2})\s*月\s*(\d{1,2})", text)
+    if not m:
+        return None
+    try:
+        return datetime.date(default_year, int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None
+
+
+def _strip_dates(text):
+    """剥掉日期，避免换算得到的日期数字被当成编造。只剥完整年月日与「X 月 Y 日」——
+    不剥裸「X 月」：「3 个月内完成」是时长不是日期，剥掉会漏掉真编造。"""
+    return DATE_RE.sub(" ", text)
+
+
+def _extract_dates(text, basic):
+    """收集稿中出现的日期，返回 [(原文写法, 解析出的 date 或 None)]。
+
+    用于「日期溯源」：日期要么在源文里出现过，要么能由会议时间与相对表述换算得出。
+    不带年份的写法用会议时间的年份补齐——纪要正文按惯例不写年份。
+    """
+    base = _parse_meeting_date((basic or {}).get("会议时间", ""))
+    year = base.year if base else None
+    found = []
+    for m in DATE_RE.finditer(text):
+        raw = m.group(0)
+        found.append((raw, _parse_meeting_date(raw, default_year=year)))
+    return found
+
+
+def _derivable_from_basic(target, basic):
+    """日期能否由会议时间合理换算得出：同月内的月末、次月初、或会议后 30 天内。
+
+    这是宽松兜底——相对表述的精确换算由人做，校验器只挡住明显凭空编的远期日期
+    （会期在 11 月却写「12 月 30 日」这种）。范围取 30 天是因为「月底前」「下月初」
+    「两周内」这类表述都落在会期后一个月内。
+    """
+    base = _parse_meeting_date((basic or {}).get("会议时间", ""))
+    if not base:
+        return False
+    return base <= target <= base + datetime.timedelta(days=30)
+
+
+def _first_table(entries):
+    """取节内第一张表，返回 (数据行, 表头)。无表时返回 ([], [])。"""
+    for kind, payload in entries:
+        if kind == "t" and payload:
+            header = [c.strip() for c in payload[0]]
+            rows = [[c.strip() for c in r] for r in payload[1:]]
+            return rows, header
+    return [], []
+
+
 def collect_action_items(entries):
     """取待办节的第一张表。列数不对也返回，让列名断言报出来，而不是静默当作没有表。"""
     keys = ["id", "task", "owner", "due", "priority", "note"]
-    for kind, payload in entries:
-        if kind != "t" or not payload:
-            continue
-        header = [c.strip() for c in payload[0]]
-        items = []
-        for row in payload[1:]:
-            cells = [c.strip() for c in row]
-            items.append({k: (cells[i] if i < len(cells) else "") for i, k in enumerate(keys)})
-        return items, header
-    return [], []
+    rows, header = _first_table(entries)
+    if not header:
+        return [], []
+    items = []
+    for cells in rows:
+        items.append({k: (cells[i] if i < len(cells) else "") for i, k in enumerate(keys)})
+    return items, header
 
 
 def collect_decisions(entries):
@@ -250,7 +327,12 @@ def validate(path, source_text=None, strict=False):
     if hits:
         bad("禁用标注", "全文出现：" + "、".join(hits))
     else:
-        ok("禁用标注", "无待确认/存疑类标注")
+        # 禁用短语只扫基本信息与各节正文；「材料未记录」是结构性槽位的合法写法，不在禁用表里。
+        phrase_hits = [w for w in FORBIDDEN_PHRASES if w in full_text]
+        if phrase_hits:
+            warn("缺失写法", "出现「" + "、".join(phrase_hits) + "」：材料缺就整行省略，结构性槽位写「材料未记录」")
+        else:
+            ok("禁用标注", "无待确认/存疑类标注")
 
     decisions = collect_decisions(sections.get("关键决策", []))
     if is_layered:
@@ -313,6 +395,21 @@ def validate(path, source_text=None, strict=False):
             ok("行动项列名", f"六列且顺序正确（{len(items)} 行）")
         else:
             warn("行动项", "本节未解析到表格（分层版建议用六列表呈现行动项）")
+        # 风险评估的「判断」列只允许四档：SKILL.md 写死了取值，但不校验就等于没约束，
+        # 第五种写法（「存疑」「不确定」「较好」）会悄悄流进对外交付稿。
+        risk_rows, risk_header = _first_table(sections.get("风险评估", []))
+        if not risk_header:
+            warn("风险评估", "本节未解析到表格（分层版建议用「维度/判断/依据」三列表）")
+        elif "判断" not in risk_header:
+            bad("风险评估表头", "缺「判断」列，实为 " + "/".join(risk_header))
+        else:
+            idx = risk_header.index("判断")
+            wrong = [r[idx] for r in risk_rows
+                     if idx < len(r) and r[idx].strip() and r[idx].strip() not in RISK_TIERS]
+            if wrong:
+                bad("风险评估判断", "取值不在 可行/待补/待核/不可行 内：" + "、".join(wrong[:5]))
+            else:
+                ok("风险评估判断", f"{len(risk_rows)} 行均取自四档")
     elif is_retro:
         # 复盘的核心是「待改进」能对上下轮改进项；两者其一为空说明骨架没走完。
         items, header = collect_action_items(sections.get("下轮改进项", []))
@@ -360,6 +457,13 @@ def validate(path, source_text=None, strict=False):
                 bad(f"待办第{i}行", f"优先级「{it['priority']}」不在 高/中/低/待定 内")
         if not any(r[0] == "FAIL" and r[1].startswith("待办第") for r in results):
             ok("待办字段", f"{len(items)} 行责任人与时间均非空")
+        # 相对时间：会议时间可解析到日期时才判，解析不到就放行（无基准，换算等于编造）。
+        basic_date = _parse_meeting_date(basic.get("会议时间", ""))
+        rel = [it["due"] for it in items if RELATIVE_TIME_RE.search(it["due"] or "")]
+        if rel and basic_date:
+            bad("相对时间", "完成时间须换算为具体日期，仍在用相对表述：" + "、".join(rel[:5]))
+        elif rel:
+            ok("相对时间", "会议时间缺失，保留原话不换算")
 
     if not missing and not is_generic and not (is_retro or is_standup or is_layered):
         # schema 只描述常规会议结构：通用总结、复盘、站会的章节名不同，套会议 schema
@@ -396,6 +500,11 @@ def validate(path, source_text=None, strict=False):
         # 行首的列表序号也不是事实数据：决策列表的「1.」「2.」会被当成编造数字（实测）。
         # 只剥行首带标点的序号，不剥行内数字——「共 3 项」这种是正文事实，要保留。
         body_for_nums = re.sub(r"(?m)^\s*\d+[.、)]\s+", "", body_for_nums)
+        # 日期单独核对、不进数字集合：会议时间 11 月 18 日、会上说「周五前」，成稿写
+        # 「11 月 20 日前」时 20 必然不在源文里，混进数字集合会让每份合格纪要都告警
+        # （实测）。日期改由下面的「日期溯源」单独判，覆盖不丢。
+        doc_dates = _extract_dates(body_for_nums, basic)
+        body_for_nums = _strip_dates(body_for_nums)
         # 表格展平后序号列会挤进数字流（「序号 | 待办事项 | ... | 1 | ...」），
         # 而序号是排版产物不是事实。剔掉每行表格第一个单元格——它与表头首列
         # （序号）对齐，仅在表头首列确为「序号」时执行，避免误伤别的表。
@@ -427,6 +536,24 @@ def validate(path, source_text=None, strict=False):
 
         owners = [it["owner"] for it in items
                   if it["owner"] and it["owner"] not in OWNER_PLACEHOLDERS]
+        # 日期溯源：日期不进数字集合（会与相对时间换算冲突），单独核。
+        # 通过条件二选一——源文出现过同一日期，或能由会议时间换算得出。
+        src_dates = {d for _, d in _extract_dates(src_clean, {}) if d}
+        src_date_raw = {raw for raw, _ in _extract_dates(src_clean, {})}
+        unknown_dates = []
+        for raw, parsed in doc_dates:
+            if raw in src_date_raw:
+                continue
+            if parsed and parsed in src_dates:
+                continue
+            if parsed and _derivable_from_basic(parsed, basic):
+                continue
+            unknown_dates.append(raw)
+        if unknown_dates:
+            warn("日期溯源", "源材料未出现且无法由会议时间换算：" + "、".join(unknown_dates[:5]))
+        elif doc_dates:
+            ok("日期溯源", f"{len(doc_dates)} 个日期均可溯源或可换算")
+
         unknown_owners = [o for o in owners if o not in src]
         if unknown_owners:
             warn("责任人溯源", "源材料未出现：" + "、".join(sorted(set(unknown_owners))))
@@ -540,12 +667,22 @@ def selftest():
         caught = [r for r in res2 if r[0] == "FAIL"]
         print(f"[{'PASS' if rc2 == 1 and len(caught) >= 4 else 'FAIL'}] 负例应被抓（exit={rc2}，{len(caught)} 项 FAIL）")
         ok &= rc2 == 1 and len(caught) >= 4
-        # 数字溯源负例：成稿出现源材料没有的数字
+        # 数字溯源负例：成稿出现源材料没有的非日期数字，应告警。
+        # 不用日期做载体——日期已单独走「日期溯源」，混用会让这条断言失去意义。
         src = "本次会议由张三汇报，产量 120 吨。"
-        rc3, res3 = validate(good, source_text=src)
+        num_doc = SELFTEST_OK.replace("完成上线检查", "完成 999 台设备上线检查")
+        nump = Path(td) / "num.md"
+        nump.write_text(num_doc, encoding="utf-8")
+        rc3, res3 = validate(nump, source_text=src)
         warn_hit = any(r[0] == "WARN" and r[1] == "数字溯源" for r in res3)
         print(f"[{'PASS' if warn_hit else 'FAIL'}] 编造数字应告警")
         ok &= warn_hit
+        # 日期不混进数字集合：待办里的「10 月 25 日」不应被判成编造数字
+        # （会期 10 月 19 日，25 日在 30 天内可换算，属合法日期）
+        date_as_num = any(r[0] == "WARN" and r[1] == "数字溯源" for r in res3
+                          if "25" in r[2])
+        print(f"[{'PASS' if not date_as_num else 'FAIL'}] 日期不得被当成编造数字")
+        ok &= not date_as_num
         # 三态判定：干净稿=complete，有 WARN=degraded，有 FAIL=failed
         st_clean, _ = summarize(validate(good)[1])
         st_warn, wl = summarize(res3)
@@ -613,9 +750,13 @@ def selftest():
         print(f"[{'PASS' if caught5 else 'FAIL'}] 基本信息区的禁用标注应被抓（exit={rc5}）")
         ok &= caught5
 
-        # 源文时间戳不得参与数字比对：源文里的 [00:12] 会让编造的「12 台」看起来有出处
+        # 源文时间戳不得参与数字比对：源文里的 [00:12] 会让编造的「12 台」看起来有出处。
+        # 用一个非日期的编造数字（台数）验证，避免与日期豁免混淆。
         ts_src = "[00:12] 张三：今天讨论一下。\n[01:30] 李四：好的。"
-        rc6, res6 = validate(good, source_text=ts_src)
+        ts_doc = SELFTEST_OK.replace("完成上线检查", "完成 12 台设备上线检查")
+        tsp = Path(td) / "ts.md"
+        tsp.write_text(ts_doc, encoding="utf-8")
+        rc6, res6 = validate(tsp, source_text=ts_src)
         caught6 = any(r[0] == "WARN" and r[1] == "数字溯源" for r in res6)
         print(f"[{'PASS' if caught6 else 'FAIL'}] 时间戳不得为编造数字背书")
         ok &= caught6
