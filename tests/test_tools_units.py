@@ -173,6 +173,139 @@ def test_fmt_ts():
     check("负数兜底", st.fmt_ts(-5) == "00:00", st.fmt_ts(-5))
 
 
+def test_minutes_quality():
+    print("[8] 纪要导出与校验")
+    # offline CI job 只装 numpy；纪要工具依赖 python-docx。缺依赖时跳过而非判红，
+    # 完整覆盖由 skill-minutes job 的两个 --selftest 承担。
+    import importlib.util as _u
+    if _u.find_spec("docx") is None:
+        print("  SKIP python-docx 未安装（由 skill-minutes job 覆盖）")
+        return
+    import minutes_quality as mq
+    check("技能可定位", mq._skill_dir() is not None)
+    mod = mq._load_validator()
+    check("校验器可加载", hasattr(mod, "validate"))
+
+    good = """# 会议纪要：测试
+
+## 会议基本信息
+
+会议主题：测试会议
+会议时间：2026-11-18
+
+## 会议结论
+
+本次会议决定采用方案 A。
+
+## 关键决策
+
+1. 决定采用方案 A 上线。
+
+## 待办事项
+
+| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 备注 |
+|---|---|---|---|---|---|
+| 1 | 整理上线清单 | 张三 | 本周五 | 高 | 无 |
+
+## 会议内容
+
+### 议题一
+
+讨论了上线安排，决定采用方案 A。
+"""
+    with tempfile.TemporaryDirectory() as td:
+        md = Path(td) / "会议纪要-测试.md"
+        md.write_text(good, encoding="utf-8")
+        res = mq.export(md)
+        check("导出文件落盘", Path(res["json"]).is_file())
+        data = res["data"]
+        check("待办解析出 1 条", len(data["action_items"]) == 1,
+              str(len(data["action_items"])))
+        check("决策解析出 1 条", len(data["decisions"]) == 1, str(len(data["decisions"])))
+        check("待办字段齐全",
+              set(data["action_items"][0]) >= {"id", "task", "owner", "due",
+                                               "priority", "note"})
+
+        chk = mq.check(md, md)
+        check("校验返回三态", chk["status"] in ("complete", "degraded", "failed"),
+              chk["status"])
+        check("校验结果带 PASS 明细",
+              any(r[0] == "PASS" for r in chk["results"]))
+
+        # 禁用标注必须被抓到：这正是本次真实纪要踩过的坑
+        bad = good.replace("2026-11-18", "待确认")
+        bd = Path(td) / "坏纪要.md"
+        bd.write_text(bad, encoding="utf-8")
+        chk2 = mq.check(bd)
+        check("禁用标注判失败", chk2["status"] == "failed", chk2["status"])
+        check("失败项定位到禁用标注",
+              any("禁用标注" in f["step"] for f in chk2["fails"]))
+
+        # 数字溯源：纪要里出现源材料没有的数字应给 WARN，不是 FAIL
+        src = Path(td) / "原文.md"
+        src.write_text("[00:10] 张三：我们做 3000 万。\n", encoding="utf-8")
+        num_md = Path(td) / "数字纪要.md"
+        num_md.write_text(good.replace("本周五", "9 月 99 日"), encoding="utf-8")
+        chk3 = mq.check(num_md, src)
+        check("编造数字给 WARN 不给 FAIL",
+              any("数字溯源" in w["step"] for w in chk3["warns"]),
+              str(chk3["warns"]))
+
+    # 工具入口不因校验 FAIL 返回非零：纪要是人写的稿，不该让管线判死
+    check("selftest 入口可跑", callable(mq.selftest))
+
+
+def test_minutes_eval():
+    print("[9] 纪要质量评测")
+    import importlib.util as _u
+    if _u.find_spec("docx") is None:
+        print("  SKIP python-docx 未安装（由 skill-minutes job 覆盖）")
+        return
+    import minutes_eval as me
+    check("中文数字展开 十五六", me._cn_to_values("十五六") >= {15, 16},
+          str(sorted(me._cn_to_values("十五六"))))
+    check("中文数字展开 十三四", me._cn_to_values("十三四") >= {13, 14})
+    check("中文数字展开 二十", me._cn_to_values("二十") == {20})
+    check("中文数字展开 三百", me._cn_to_values("三百") == {300})
+    # 不能过宽：十五六不该展开出 56 这类不可能的价位
+    check("中文数字不过宽", 56 not in me._cn_to_values("十五六"),
+          str(sorted(me._cn_to_values("十五六"))))
+
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "原文.md"
+        # 转写稿用中文数字写价格，纪要用阿拉伯数字——这是忠实整理，不能判成编造
+        src.write_text("[00:05] 张三：卖个十三四块、十五六块都有。\n"
+                       "[00:09] 李四：张三代号在，可成交 3000 万。\n", encoding="utf-8")
+        md = Path(td) / "纪要.md"
+        md.write_text(
+            "# 会议纪要：价格\n\n## 会议基本信息\n\n会议主题：价格\n\n"
+            "## 会议结论\n\n确认价位 13 元至 16 元。\n\n"
+            "## 关键决策\n\n1. 定价区间定在 13 元至 16 元。\n\n"
+            "## 待办事项\n\n"
+            "| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 备注 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| 1 | 复核 3000 万口径 | 李四 | 待定 | 中 | 无 |\n\n"
+            "## 会议内容\n\n### 价格\n\n会上给出 13 元至 16 元的区间。\n",
+            encoding="utf-8")
+        rep = me.evaluate(md, src.read_text(encoding="utf-8"))
+        check("中文数字不算编造", rep["metrics"]["invented_numbers"] == 0,
+              str(rep["metrics"]["invented_number_list"]))
+        check("正常稿判 pass", rep["verdict"] == "pass", str(rep["checks"]))
+        check("待办序号不参与数字核对", "1" not in rep["metrics"]["invented_number_list"])
+
+        # 真编造仍要抓：原文没有 99 亿
+        md2 = Path(td) / "纪要2.md"
+        md2.write_text(md.read_text(encoding="utf-8").replace(
+            "会上给出 13 元至 16 元的区间", "会上给出 13 元至 16 元的区间，目标 99 亿"),
+            encoding="utf-8")
+        rep2 = me.evaluate(md2, src.read_text(encoding="utf-8"))
+        check("真编造被抓", rep2["metrics"]["invented_numbers"] >= 1,
+              str(rep2["metrics"]["invented_number_list"]))
+        check("编造判 fail", rep2["verdict"] == "fail")
+
+    check("selftest 入口可跑", callable(me.selftest))
+
+
 def main():
     test_manifest_item()
     test_mcp_params()
@@ -181,6 +314,8 @@ def main():
     test_index_search_cn()
     test_timeline_render()
     test_fmt_ts()
+    test_minutes_quality()
+    test_minutes_eval()
     print(f"\n合计 {passed + failed}，PASS {passed}，FAIL {failed}")
     return 0 if failed == 0 else 1
 

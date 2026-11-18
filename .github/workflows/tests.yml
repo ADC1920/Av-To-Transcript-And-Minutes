@@ -58,6 +58,12 @@ jobs:
         run: python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
       - name: golden 用例回归
         run: python skills/meeting-notes-expert/scripts/golden_cases.py
+      # 纪要结构化导出与质量评测（2026-11-18 新增）：两个工具都复用上面的校验器解析层，
+      # 依赖与本节一致，故放在同一 job 跑
+      - name: 纪要导出与校验工具自检
+        run: python tools/minutes_quality.py --selftest
+      - name: 纪要质量评测基准自检
+        run: python tools/minutes_eval.py --selftest
 
   # 引擎单测job：装 funasr（Linux 上自动带 CPU torch）+ soundfile，跑 51 项纯函数单测
   engine-units:
