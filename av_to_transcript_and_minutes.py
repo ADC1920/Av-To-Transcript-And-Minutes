@@ -233,6 +233,14 @@ def flatten_outputs(stem_dir: Path, media: Path, out_stem: str) -> None:
                 moved.append(target.name)
             except OSError:
                 pass
+    # 人名标记要一起搬走：留在工作目录会被下面的 rmtree 删掉，下次重跑就会把
+    # 「标记缺失」误判成「改过名」，白重出一遍稿。命名加前缀避免与成稿混淆。
+    stamp_src = stem_dir / ".names_used"
+    if stamp_src.is_file():
+        try:
+            shutil.move(str(stamp_src), str(media.parent / f".{out_stem}.names_used"))
+        except OSError:
+            pass
     if not moved:
         print(f"[提示] {media.stem}：未产出 docx/字幕/说话人日志，跳过平铺清理以免删掉 md 成稿"
               f"（工作目录保留：{stem_dir}）", file=sys.stderr)
@@ -473,7 +481,7 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
     """转写缓存文件名：任一影响识别文本的配置不同 → 缓存不同。
 
     识别引擎（qwen/aed）输出的文本不同，是缓存键的必需维度——漏掉它会让人以为换了引擎、
-    实际拿到的是旧引擎结果；热词、人名、额外 ASR 参数同理不可与默认结果混用。
+    实际拿到的是旧引擎结果；热词、额外 ASR 参数同理不可与默认结果混用。
     tag 用于同一目录内存在多份待转写音频的场景（声道分轨），缺了它两路会命中同一份缓存、
     转出完全相同的文本（实测踩过）。
     dict_hash = 纠错词典内容哈希：词典更新后旧缓存不再复用（否则新词条对已缓存素材不生效）。
@@ -482,7 +490,12 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
 
     srt 刻意不进缓存键：字幕只影响 sentences 字段，lines 的文本完全相同。把 srt 计入键
     会让"先转写、后补字幕"变成整套重转，白烧最贵的识别环节。需要字幕而缓存里没有时，
-    走 --align-only 只补对齐（见 call_asr）。参数 srt 保留仅为向后兼容调用签名。"""
+    走 --align-only 只补对齐（见 call_asr）。参数 srt 保留仅为向后兼容调用签名。
+
+    names 同样刻意不进键（2026-11-18 改）：它只改 lines 的显示名，不参与识别。
+    计入键会让"换个称呼"触发整套重转，实测一次 23 分钟素材要重跑 148 秒。
+    命中缓存后由 apply_name_overrides 按当前 names 覆盖 spk_name，
+    参数保留仅为向后兼容调用签名——勿把 names 重新计入键。"""
     parts = []
     if tag:
         parts.append(str(tag))
@@ -498,8 +511,6 @@ def asr_cache_name(threshold=None, diarize_engine=None, hotwords=None, names=Non
         parts.append("响度归一")
     if hotwords:
         parts.append("热词" + hashlib.sha256(hotwords.encode("utf-8")).hexdigest()[:6])
-    if names:
-        parts.append("人名" + hashlib.sha256(names.encode("utf-8")).hexdigest()[:6])
     if dict_hash:
         parts.append("词典" + dict_hash)
     if extra:
@@ -748,12 +759,17 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
 
         缓存已有 sentences 时不补对齐，但若用户这次要的格式（srt/vtt）还没落盘，
         仍需按缓存里的 sentences 直接写——否则"先前只出 srt，这次加 --vtt"会拿不到文件。
+        两条分支都先按本次 names 覆盖显示名：缓存里的 spk_name 是上次跑时的值，直接
+        拿去出稿会让「改了名字但命中缓存」的素材显示旧名字（改名不进缓存键的必然结果）。
         """
+        payload = apply_name_overrides(payload, opts.get("names"))
         if not (opts.get("srt") or opts.get("vtt")):
             return payload
         subs = (payload or {}).get("sentences")
         if not subs:
-            return _align_srt_only(vocals, cache_json, opts)
+            # 补对齐会重新读缓存并返回新对象，覆盖要放在它之后再做一次
+            return apply_name_overrides(_align_srt_only(vocals, cache_json, opts),
+                                        opts.get("names"))
         written = write_cached_subtitles(subs, opts, vocals.parent, vocals.stem)
         if written:
             print(f"[补字幕] {vocals.name}：按缓存 sentences 补写 {', '.join(written)}",
@@ -808,7 +824,9 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     payload["_source_fp"] = source_fp
     _write_json(cache_json, payload)
     raw_json.unlink(missing_ok=True)
-    return payload
+    # 写缓存后统一再过一遍覆盖：子进程按 --names 写好了 spk_name，但分轨与云端
+    # 通道各有自己的赋值路径，这里以 spk 下标为准收口，避免不同通道行为不一致。
+    return apply_name_overrides(payload, opts.get("names"))
 
 
 def manifest_item(media: Path, out_dir: Path, status: str, detail, seconds: float) -> dict:
@@ -1010,7 +1028,13 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     needs_srt = ((opts.get("srt") and not srt_path.exists())
                  or (opts.get("vtt") and not vtt_path.exists())
                  or (opts.get("rttm") and not rttm_path.exists()))
-    if md_path.exists() and not force and not needs_srt:
+    # 改名没进缓存键，于是「成稿在、缓存也在」会整份 skip，新名字根本没机会覆盖到稿子里
+    # （实测：改 --names 重跑无任何变化）。用标记文件记住上次出稿用的 names，
+    # 与本轮不同则视为未完成，走下面的重出稿路径——识别与分离命中缓存，只重新渲染。
+    names_stamp = _names_stamp_path(opts, stem_dir, out_stem)
+    cur_names = str(opts.get("names") or "")
+    renamed = cur_names != _read_stamp(names_stamp)
+    if md_path.exists() and not force and not needs_srt and not renamed:
         # md 已在：docx 齐备或排版技能缺失才算完成；只差 docx（首跑时技能未装）则只补排版，
         # 不重跑分离与转写——旧行为要到 --force 全量重跑，连 Demucs 一起白烧
         if docx_path.exists() or article_skill() is None:
@@ -1018,6 +1042,8 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
         print(f"[补排版] {stem}：md 已在，仅补 article-format docx")
         render_docx(md_path, docx_path, stem_dir, bool(opts.get("verbose")))
         return "redocx"
+    # renamed 时落到这里继续走下面的转写路径：单任务直接调用本函数（不经 separate_one）
+    # 也能正确重出稿。日志由 separate_one 打印，此处不重复。
     if needs_srt and md_path.exists():
         wants = [n for n, w in (("字幕", opts.get("srt") or opts.get("vtt")),
                                 ("说话人日志", opts.get("rttm"))) if w]
@@ -1082,6 +1108,12 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
     if not md_body:
         return "novoice"
     md_path.write_text(md_body, encoding="utf-8")
+    # 记下本次出稿用的 names：下次判定「是否只是改了名」就靠它。
+    # 放工作子目录，--flat 收尾时随成稿一起搬走（见 flatten_outputs 的搬移清单）。
+    try:
+        names_stamp.write_text(cur_names, encoding="utf-8")
+    except OSError:
+        pass
     # rttm 直接从 payload.lines 写（不转存子进程产物）：缓存命中时子进程没跑，
     # lines 却是每次都有的，一份数据源覆盖"首次运行"与"事后补文件"两条路径
     if opts.get("rttm"):
@@ -1099,7 +1131,48 @@ def transcribe_and_write_article(stem_dir: Path, stem: str, force: bool,
             raw.replace(stem_dir / f"{out_stem}{ext}")
     if render_docx(md_path, docx_path, stem_dir, bool(opts.get("verbose"))):
         print(f"[排版] {stem}：article-format 规范 docx 已生成")
+    # 纪要不是管线产物（会话内 AI 按模板写），但同目录若已有纪要，顺手导出结构化 JSON
+    # 并跑一次质量校验：这一步把「给人看的纪要」和「给程序用的字段」接上，
+    # 也让格式违规在交付前就暴露，而不是等人工发现。
+    handle_minutes_sidecars(stem_dir, media.parent if opts.get("flat") else None,
+                            out_stem, md_path)
     return "done"
+
+
+def handle_minutes_sidecars(stem_dir: Path, flat_dir: Path | None,
+                            out_stem: str, source_md: Path) -> None:
+    """纪要旁挂产物：结构化 JSON 导出 + 质量校验。
+
+    触发条件是「同目录存在纪要」，不是「本次转写成功」，因为纪要往往在转写之后
+    由会话内 AI 写出——管线重跑一次就会自动补上 JSON，不需要另外手工跑命令。
+
+    任何异常都只告警不抛出：纪要是人写的稿子，校验失败不该让转写结果被判失败，
+    更不该阻断批量里其余素材。"""
+    stem = out_stem.split("-", 1)[-1]
+    candidates = [stem_dir / f"会议纪要-{stem}.md", stem_dir / f"会议纪要-{stem}.docx"]
+    if flat_dir is not None:
+        candidates += [flat_dir / f"会议纪要-{stem}.md", flat_dir / f"会议纪要-{stem}.docx"]
+    minutes = next((p for p in candidates if p.is_file()), None)
+    if minutes is None:
+        return
+    tool = SCRIPT_DIR / "tools" / "minutes_quality.py"
+    if not tool.is_file():
+        return
+    out_json = minutes.with_suffix(".json")
+    cmd = [sys.executable, str(tool), str(minutes), "--export", "--check",
+           "--out", str(out_json), "--source", str(source_md)]
+    # 校验结论要让人在主管线日志里看到：这一步的价值就是「格式问题在交付前暴露」，
+    # 静默跑完等于没跑。工具本身不因校验 FAIL 返回非零，故 catch 只兜真正的异常。
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", check=False, env=child_env(), shell=False)
+        merged = (proc.stdout or "") + (proc.stderr or "")
+        for line in merged.strip().splitlines():
+            if line.startswith(("[导出]", "[校验]", "  FAIL", "  WARN")):
+                print(f"[纪要] {line.strip()}")
+    except OSError:
+        print(f"[提示] {minutes.name}：纪要导出或校验未完成，已保留原始稿"
+              f"（转写结果不受影响）", file=sys.stderr)
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -1170,6 +1243,53 @@ def _parse_names(names) -> dict:
     return out
 
 
+def _names_stamp_path(opts: dict, stem_dir: Path, out_stem: str) -> Path:
+    """记名字改动用的人名标记文件路径。
+
+    `--flat` 收尾会把标记搬到素材目录并改名（见 flatten_outputs），
+    所以平铺模式下读写的都是那份带前缀的；工作模式下用工作子目录里的短名。
+    """
+    if opts.get("flat"):
+        return stem_dir.parent / f".{out_stem}.names_used"
+    return stem_dir / ".names_used"
+
+
+def _read_stamp(path: Path) -> str:
+    """读人名标记；文件缺失或读失败按空串处理（视为未标注过）。"""
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    except OSError:
+        return ""
+
+
+def apply_name_overrides(payload: dict, names) -> dict:
+    """按当前 --names 覆盖 lines 的显示名，就地改并返回同一 payload。
+
+    改名不进缓存键（见 asr_cache_name），所以缓存里的 spk_name 反映的是「上次跑时的
+    names 或声纹库身份」，不能直接当本次结果。这里以 spk 下标为准重算：
+    1. 本次给了 names 的说话人 → 用 names 的值；
+    2. 没给的 → 回落到声纹库身份（spk_db_name），再回落到缓存里原有的 spk_name；
+    3. 显式给了空串视为「去掉名字」，回落到编号显示。
+
+    声纹库身份单独存在 spk_db_name 里（qwen_asr.py 写入），正是为了让这一步可逆：
+    先把 names 加进去、后来去掉，仍能还原出库里认出的那个人。
+    """
+    name_map = _parse_names(names)
+    lines = payload.get("lines") or []
+    if not name_map:
+        # 本次不指定名字：还原成声纹身份（若有），否则保留缓存里的原值
+        for ln in lines:
+            db_name = ln.get("spk_db_name")
+            if db_name is not None:
+                ln["spk_name"] = db_name
+        return payload
+    for ln in lines:
+        spk = ln.get("spk")
+        if isinstance(spk, int) and spk in name_map:
+            ln["spk_name"] = name_map[spk] or None
+    return payload
+
+
 def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
                  meeting: bool = False, opts: dict = None,
                  no_separate: bool = False) -> str:
@@ -1209,7 +1329,21 @@ def separate_one(media: Path, out_dir: Path, force: bool, do_asr: bool = True,
             if opts.get("flat") and (media.parent / f"{out_stem}{ext}").exists():
                 continue
             all_done = False
+    # 改名没进缓存键，就绕过了上面所有"成稿是否存在"的判定：成稿在、缓存也在，
+    # 于是整份被 skip，新名字根本没机会覆盖到稿子里（实测：改 --names 重跑无任何变化）。
+    # 用标记文件记住上次出稿用的 names，与本轮不同则判未完成——识别与分离会命中缓存，
+    # 代价只是重新渲染，不是重转。
+    names_stamp = _names_stamp_path(opts, stem_dir, out_stem)
+    if do_asr and all_done and not force:
+        if str(opts.get("names") or "") != _read_stamp(names_stamp):
+            print(f"[改名] {media.stem}：说话人标注已变更，重出稿（复用转写缓存，不重转）",
+                  file=sys.stderr)
+            all_done = False
     if all_done and not force:
+        # 跳过分支也要过一遍纪要旁挂：纪要往往在转写之后才写出来，
+        # 只挂在出稿路径上会让「转写完成后补写的纪要」永远等不到导出，除非 --force 全重跑。
+        handle_minutes_sidecars(stem_dir, media.parent if opts.get("flat") else None,
+                                out_stem, stem_dir / f"{out_stem}.md")
         if opts.get("clean"):
             removed = clean_intermediates(stem_dir)
             if removed:
