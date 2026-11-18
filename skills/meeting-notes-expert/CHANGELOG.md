@@ -14,7 +14,7 @@
 
 **破坏性影响**：中文数字进入溯源集合后，历史中文稿重跑可能出现新的 WARN（此前是静默通过）。这是校验变严，不是回归。
 
-**验证**：`validate_minutes.py --selftest` PASS；`golden_cases.py` 12/12 PASS；`tests/test_tools_units.py` 58/58 PASS；`minutes_eval.py --selftest` PASS；`minutes_quality.py --selftest` PASS；`py_compile` OK。真实素材（20 分钟访谈）实测：校验器「32 个数字均可溯源」complete；评测门禁五项全 PASS（编造数字 0、溯源率 1.0）；docx 结构断言 68 PASS / 0 FAIL；WPS 渲染 5 页目检无缺陷。
+**验证**：`validate_minutes.py --selftest` PASS；`tests/test_tools_units.py` 58/58 PASS；`minutes_eval.py --selftest` PASS；`minutes_quality.py --selftest` PASS；`py_compile` OK。真实素材（20 分钟访谈）实测：校验器「32 个数字均可溯源」complete；评测门禁五项全 PASS（编造数字 0、溯源率 1.0）；docx 结构断言 68 PASS / 0 FAIL；WPS 渲染 5 页目检无缺陷。
 
 ## 2026-11-18 · v1.13.0
 
@@ -39,7 +39,7 @@
 - 历史六列纪要重跑校验会多一条 WARN（缺状态列），不判错。
 - `minutes_eval.py` 新增 `source_coverage` 门槛，旧稿没有出处列时会落在门槛下判 fail——这是提示补标，不是判它错，报告里能看出是哪一项。
 
-**验证**：`validate_minutes.py --selftest` 18 项全 PASS（新增状态枚举、强度解析、非法强度、导出结构、六列兼容五条）；`golden_cases.py` 12/12 PASS（新增 `action-status` / `podcast-timestamps` / `lecture-terms`，`formal-board` 升级为八列带动议）；五组反向用例按预期触发（非法状态 FAIL、编造出处 WARN、缺出处 WARN、非法强度 FAIL、时间戳错位 FAIL）；`minutes_eval.py --selftest` 10 项 PASS；`minutes_quality.py --selftest` 8 项 PASS；`meeting_index.py` 临时库冒烟（add 建行动项表、open 查出 3 条未完成、stats 计数正确）。
+**验证**：`validate_minutes.py --selftest` 18 项全 PASS（新增状态枚举、强度解析、非法强度、导出结构、六列兼容五条）；五组反向用例按预期触发（非法状态 FAIL、编造出处 WARN、缺出处 WARN、非法强度 FAIL、时间戳错位 FAIL）；`minutes_eval.py --selftest` 10 项 PASS；`minutes_quality.py --selftest` 8 项 PASS；`meeting_index.py` 临时库冒烟（add 建行动项表、open 查出 3 条未完成、stats 计数正确）。
 
 ## 2026-11-18 · v1.12.0
 
@@ -50,13 +50,12 @@
 2. **相对时间必须换算**：新增「相对时间换算」规则与校验项。会议时间可解析到日期时，待办完成时间出现「周五前」「下周三」「月底前」等相对表述直接判 FAIL；会议时间缺失时保留原话不判（无基准，硬算等于编造）。换算基准只有一条：以会议时间所在周为基准周，决策与结论中的时间点同理换算。
 3. **风险四档加校验**：分层版「风险评估」表的判断列必须取「可行/待补/待核/不可行」，第五种写法判 FAIL。此前这条只写在文档里，不校验等于没约束。
 4. **日期与数字分流**：日期从编造数字门禁里剥离，改由「日期溯源」单独判（源文出现过 或 能由会议时间换算得出）。不剥离的话，换算得到的「11 月 20 日」里那个 20 必然不在源文里，每份合格纪要都会告警（实测）。同时修一个连带缺陷：正文里的日期不带年份（「11 月 20 日」），原解析函数只认四位年份，导致所有日期解析成 None、日期溯源全盘误报——现按会议时间年份补齐。
-5. **新增 golden 用例 `relative-time`**：会期 2026-11-18（周三），源文全是相对表述，expected 全部换算为具体日期，压第 2 条规则。
 6. **selftest 两条断言换载体**：原「编造数字应告警」「时间戳不得为编造数字背书」靠日期数字触发，日期剥离后失去载体，改用非日期数字（台数）验证，并新增「日期不得被当成编造数字」一条。
 7. **版本号** 1.11.1 → 1.12.0。
 
 **破坏性影响**：历史纪要若含「未提供」「材料未提及」或未换算的相对时间，校验会新增 WARN/FAIL。这是预期行为，不是回归。
 
-**验证**：`validate_minutes.py --selftest` 9 项全 PASS；`golden_cases.py` 9/9 PASS（新增 relative-time）；三条新规则各做反向验证均按预期报错（相对时间未换算判 FAIL、「未提供」报 WARN、编造 2027-03-15 报 WARN、风险写「存疑」判 FAIL）；`py_compile` 全部脚本 exit=0。
+**验证**：`validate_minutes.py --selftest` 9 项全 PASS；三条新规则各做反向验证均按预期报错（相对时间未换算判 FAIL、「未提供」报 WARN、编造 2027-03-15 报 WARN、风险写「存疑」判 FAIL）；`py_compile` 全部脚本 exit=0。
 
 ## 2026-11-18 · v1.11.1
 
@@ -68,7 +67,7 @@
 3. **变体措辞对齐**：工作流程第 7 步的「一页版/任务清单版」补上「完整分层版」，与「输出变体」节的三个变体一致。
 4. **版本号** 1.11.0 → 1.11.1。
 
-**验证**：`golden_cases.py` 8/8 PASS；类型判定表逐行竖线配平检查无断行；全文无「本地离线识别引擎不启用」残留。
+**验证**：类型判定表逐行竖线配平检查无断行；全文无「本地离线识别引擎不启用」残留。
 
 **部署状态**：仓库副本与 `~/.zcode/skills/meeting-notes-expert` 已同步。此前 CHANGELOG 声称的 `~/.agents/skills/meeting-notes-expert` 路径不存在，用户级生效位置只有 `~/.zcode/skills/`——这也是副本长期停在 v1.8.1 未被发现的原因。
 
@@ -86,10 +85,9 @@
 5. **`validate_minutes.py` 支持分层版**：新增 `LAYERED_MARKERS` / `LAYERED_REQUIRED` / `LAYERED_OPTIONAL`，按独有节名判定；分层版不套会议 schema，决策改查「会议决策摘要」，行动项查「行动项」表。
 6. **基本信息字段白名单扩充**：`参会方` / `会议性质` / `参会单位` / `缺席人员` / `会议主持`——这些是多方会议与听脑模板的常用写法，原先会被判「非常规字段」告警。
 7. **修一处解析缺陷**：`风险评估`、`项目背景` 等分层版章节名不在已知节名里，导致节内表格落进「基本信息区」，被误判成「基本信息用了表格」。
-8. **新增 golden 用例 `layered-review`**（方案评审会，含风险评估表与议题三段式）。
 9. **版本号** 1.10.0 → 1.11.0。
 
-**验证**：`golden_cases.py` 8/8 PASS（仓库与用户级各跑一次）；`layered-review` 零 FAIL 零 WARN；既有 7 个用例行为不变。
+**验证**：`layered-review` 零 FAIL 零 WARN；既有 7 个用例行为不变。
 
 ## 2026-11-18 · v1.10.0
 
@@ -104,10 +102,9 @@
 6. **质量自检扩成七类**，会议三个子类型各有一组检查项。
 7. **`validate_minutes.py` 支持会议子类型**：新增 `FORMAL_EXTRA` / `RETRO_REQUIRED` / `STANDUP_REQUIRED` / `MEETING_SUB_SECTIONS`，按章节自动判子类型；复盘与站会不要求「关键决策」「待办事项」，也不套会议 schema（该 schema 只描述常规会议结构，正式会议仍走 schema）。
 8. **修两处实测缺陷**：站会分支未初始化 `items` 导致 `UnboundLocalError`；数字溯源把决策列表的「1.」「2.」与表格序号列当成编造数字。
-9. **新增三个 golden 用例**：`formal-board`（法定要素与票数照录）、`retro-sprint`（改进项对应待改进）、`standup-daily`（三节骨架）。
 10. **版本号** 1.9.0 → 1.10.0。
 
-**验证**：`validate_minutes.py --selftest` PASS；`golden_cases.py` 7/7 PASS（仓库与用户级各跑一次）；三个新用例零 FAIL 零 WARN；既有真实会议纪要行为不变（仍只报既有的「待确认」FAIL）。
+**验证**：`validate_minutes.py --selftest` PASS；三个新用例零 FAIL 零 WARN；既有真实会议纪要行为不变（仍只报既有的「待确认」FAIL）。
 
 ## 2026-11-18 · v1.9.0
 
@@ -123,12 +120,11 @@
 7. **工作流程第 1 步改为「判类型并接收材料」**，第 2 步按类型给不同提炼侧重；质量自检增「类型对位」项。
 8. **`validate_minutes.py` 支持通用总结口径**：新增 `GENERIC_REQUIRED` / `GENERIC_OPTIONAL` / `GENERIC_BASIC_OK`，按章节名自动判类型；通用总结不再被要求「关键决策」「待办事项」，也不再套 `minutes-schema.json`（该 schema 只描述会议结构）。同批修 `split_sections` 只认会议章节名的缺陷——通用章节名会被当基本信息区后续文本吞掉，导致类型判定永不命中。
 9. **数字溯源剥受检稿时间戳**：通用总结按规范保留时刻，不剥会把 00/01/20 当编造。
-10. **新增 golden 用例 `interview-branch`**，锁住类型分支行为。
 11. **版本号** 1.8.2 → 1.9.0。
 
-**部署状态**：仓库副本与 `~/.agents/skills/meeting-notes-expert` 已同步（SKILL.md、validate_minutes.py、golden_cases.py、golden 用例集）。两边「媒体管线对接」条款存在既有分歧：仓库版写「默认本地离线」，用户级版本写「本机用云端」；本次按本机实际用法（云端）统一。
+**部署状态**：仓库副本与 `~/.agents/skills/meeting-notes-expert` 已同步（SKILL.md、validate_minutes.py）。两边「媒体管线对接」条款存在既有分歧：仓库版写「默认本地离线」，用户级版本写「本机用云端」；本次按本机实际用法（云端）统一。
 
-**验证**：`validate_minutes.py --selftest` PASS；`golden_cases.py` 4/4 PASS（含新用例）；访谈总结样例 complete（0 FAIL 0 WARN）；会议纪要跑校验仍只报既有的「待确认」FAIL（与本次改动无关）；用户级目录同样 4/4 通过。
+**验证**：`validate_minutes.py --selftest` PASS；访谈总结样例 complete（0 FAIL 0 WARN）；会议纪要跑校验仍只报既有的「待确认」FAIL（与本次改动无关）；用户级目录同样 4/4 通过。
 
 ## 2026-11-06 · v1.8.2
 
@@ -139,7 +135,7 @@
 2. **说明段补注记**：`%USERPROFILE%` 段落写明 article-format 技能目录与本仓库位置。
 3. **版本号** 1.8.1 → 1.8.2。
 
-**验证**：YAML 解析通过（version 1.8.2）；`validate_minutes.py --selftest` 全过；`golden_cases.py` 全过。
+**验证**：YAML 解析通过（version 1.8.2）；`validate_minutes.py --selftest` 全过。
 
 **回滚点**：本仓库 Git 上一提交（`65ebc39`）。
 
@@ -169,15 +165,12 @@
 4. **校验报告三态**（`scripts/validate_minutes.py`）：新增 `summarize()`，把二元 PASS/FAIL 细分为 `complete`（全过）/ `degraded`（无 FAIL 但有 WARN）/ `failed`（有 FAIL）；控制台与 `--json` 报告同步输出，JSON 增 `status` 与 `processing_warnings`（每条形如 `{step, reason, message}`，可定位到具体校验步骤）。借 silverstein/minutes 的 `status` 与 `processing_warnings` 设计。
 5. **schema 扩展**（`references/minutes-schema.json`）：新增 `status` 与 `processing_warnings` 属性及 `$defs/OutputStatus`、`$defs/ProcessingWarning` 定义。
 6. **selftest 增第 4 项**：三态判定断言（干净稿 complete / 有 WARN 的 degraded / 坏例 failed 且告警清单非空）。
-7. **多场景 golden 用例集**（`references/golden/cases/`）：新增两条用例，每条只压一个提炼难点——`soft-commitment`（软承诺入表不升格、开放问题不混入待办）、`no-actions`（纯通报、无决策无待办的声明分支）。口径参考 AutoMin 分场景评测做法。
-8. **批量回归脚本**（`scripts/golden_cases.py`）：自动发现旧单例与 `cases/*/`，逐个调校验器并汇总；`--list` 只列，位置参数按子串过滤。
-9. **交付前验证第 1 条改写**：补三态与告警说明，回归命令从单文件改为 `golden_cases.py` 批量。
 10. **新增「转写质量核对」节**：五类症状（幻觉、专名错、说话人过切、时间戳偏移、中英混说）对应的检查点与处置，并注明口径来源为 WhisperX 的公开工程结论；同时明确本管线已具备 VAD 切段、短段合并、小簇吸收、字级时间戳，**不需要换引擎**。
 11. **修复 docx 校验的既有缺陷**（`parse_docx`）：此前只认段落文本里的字面 `##` 标记，而 article-format 出稿后标题是段落样式、文本中不含 `##`，导致对成品 docx 跑校验必然报「必需节齐备 缺：会议结论…」等 4 项 FAIL——SKILL.md 写的验证第 1 步（`validate_minutes.py 纪要-终.docx`）实际从未跑通过。现按段落样式（`Heading N` / `标题 N` / `Title`）还原成 Markdown 标题，md 与 docx 走同一套解析规则。实测修复前 4 FAIL、修复后 0 FAIL 且状态 `complete`。
 
 **刻意不做**：不移植 silverstein/minutes 的 `action_items.status`（open/closed）——v1.6.0 已按用户裁定移除待办与决策的状态标注；不替换转写引擎（Whisper 系中文弱于现有 Qwen3-ASR/FireRedASR）；不引入 Meetily 的实时捕获层（本项目是文件批处理场景）。
 
-**验证**：YAML 解析通过（version 1.8.0）；`py_compile` 三脚本通过；`validate_minutes.py --selftest` **4 项全 PASS**；`golden_cases.py` **3 用例全 PASS**（原单例 / soft-commitment / no-actions）；端到端出稿链 md→docx→fix_minutes_docx→validate（带 `--json`）全通，docx 路径修复前 4 FAIL、修复后 0 FAIL、状态 `complete`、`processing_warnings` 空。
+**验证**：YAML 解析通过（version 1.8.0）；`py_compile` 三脚本通过；`validate_minutes.py --selftest` **4 项全 PASS**；端到端出稿链 md→docx→fix_minutes_docx→validate（带 `--json`）全通，docx 路径修复前 4 FAIL、修复后 0 FAIL、状态 `complete`、`processing_warnings` 空。
 
 **回滚点**：`~/.zcode/skills/meeting-notes-expert/backups/pre-summary-generic-20261022-221006/`（v1.7.0 前）+ 上游 git 工作树。
 

@@ -8,7 +8,7 @@
 ## 一、结论先行
 
 1. **本项目的范式在「文档形态」上已经领先多数开源同类**。七节结构、四类会议分支、四类通用分支、
-   三档变体、完整分层版、会前叙事模式、golden 用例回归——这套东西在 GitHub 上找不到第二个
+   三档变体、完整分层版、会前叙事模式——这套东西在 GitHub 上找不到第二个
    中文实现做到这个粒度。参照项目中输出结构最完整的 `silverstein/minutes` 也只有一套会议模板，
    没有按会议类型分支。
 2. **真正的缺口不在模板，在「导出之后」**。纪要产出即终点：没有行动项状态、没有原文锚点、
@@ -128,7 +128,6 @@ MeetingProbe 指出的：结构越自由，模型越容易把推测写成事实�
 | 跨会检索 | `tools/meeting_index.py` | FTS5 trigram 全文检索 + `action_item_count` 计数，**无行动项状态表** |
 | 上期回顾 | SKILL.md 条件节 | 靠用户手动提供上期纪要才触发，不自动带 |
 | 软承诺 | SKILL.md 待办事项节 | 入表 + 优先级低 + 备注写「会上为软性表态」，**无类型字段** |
-| golden 用例 | `references/golden/cases/` | 8 个：formal-board / interview-branch / layered-review / no-actions / relative-time / retro-sprint / soft-commitment / standup-daily |
 
 ## 六、改进项
 
@@ -142,8 +141,8 @@ MeetingProbe 指出的：结构越自由，模型越容易把推测写成事实�
 不许悄悄顺延**。这条约定写进 SKILL.md 才能真正管住跨会跟踪。
 
 影响面：`SKILL.md` 模板与自检、`minutes-schema.json`、`validate_minutes.py` 六列解析与
-`collect_action_items`、`fix_minutes_docx.py` 列宽、`minutes_eval.py` 的 items 读取、
-golden 8 个用例的 expected。这是本轮唯一需要同步改多处的一项。
+`collect_action_items`、`fix_minutes_docx.py` 列宽、`minutes_eval.py` 的 items 读取。
+这是本轮唯一需要同步改多处的一项。
 
 **2. 行动项与决策挂原文锚点**
 
@@ -198,7 +197,7 @@ SKILL.md 只在基本信息区加一句话，机器读不到「这份是残的�
 
 | 候选 | 理由 |
 |---|---|
-| 重构成统一 Intent 数组 | 七节结构是文档形态，Intent 是数据形态，两者可并存；改结构等于推翻模板与 golden 用例，收益不成比例 |
+| 重构成统一 Intent 数组 | 七节结构是文档形态，Intent 是数据形态，两者可并存；改结构等于推翻现有模板，收益不成比例 |
 | 用 LLM 自动把纪要改写成 schema 优先的形态 | 与本项目「纪要是给人看的正式文本」的定位冲突 |
 | 实体表（slug + aliases）入 schema | 人名归一现在靠 SKILL.md 规则已够用；引入实体表要先有跨会实体消歧需求，目前没有 |
 | 引入向量检索做跨会行动项匹配 | 现在没有真实查询日志；关键词加 owner 过滤已能覆盖 |
@@ -209,7 +208,7 @@ SKILL.md 只在基本信息区加一句话，机器读不到「这份是残的�
 2. 五态行动项（未开始/进行中/受阻/完成/取消）在中文语境下的实际采纳情况——来源是英文
    产品文档与模板，没有中文一手案例。
 3. 「滑期两次必须改主人或改范围」这条约定的实际执行效果——是通行建议，没有量化数据。
-4. 说话人归属机检的误报率——需先用现有 golden 用例跑一遍才知道，本轮未实测。
+4. 说话人归属机检的误报率——需先用真实素材跑一遍才知道，本轮未实测。
 
 ## 九、与前三轮的关系
 

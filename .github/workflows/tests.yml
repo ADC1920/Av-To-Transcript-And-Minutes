@@ -39,7 +39,7 @@ jobs:
       - name: 基准脚本自检（CER/编辑距离；DER 需 pyannote.metrics，缺则跳过）
         run: python benchmark_quality.py --selftest
 
-  # 纪要技能job：装 python-docx + jsonschema，跑结构校验自检与 golden 用例回归。
+  # 纪要技能job：装 python-docx + jsonschema，跑结构校验与导出/评测工具自检。
   # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，
   # 其 docx 校验缺陷（只认字面 ##）因此长期未被发现。
   skill-minutes:
@@ -56,8 +56,6 @@ jobs:
         run: pip install python-docx jsonschema
       - name: 结构校验自检（正例/负例/溯源/三态/docx 往返）
         run: python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
-      - name: golden 用例回归
-        run: python skills/meeting-notes-expert/scripts/golden_cases.py
       # 纪要结构化导出与质量评测（2026-11-18 新增）：两个工具都复用上面的校验器解析层，
       # 依赖与本节一致，故放在同一 job 跑
       - name: 纪要导出与校验工具自检

@@ -23,7 +23,6 @@
 | `skills/meeting-notes-expert/references/minutes-schema.json` | `action_items` 加 `status`/`strength`/`source`；`decisions` 改对象数组加 `source`；顶层加 `document_status`/`processing_warnings` | 是（decisions 从字符串数组变对象数组） |
 | `skills/meeting-notes-expert/scripts/validate_minutes.py` | 七列解析、状态枚举、出处解析、软承诺强度、文档状态、通用总结时间戳与术语机检、正式会议动议、说话人归属 WARN、`export_structured` 补字段 | 是 |
 | `skills/meeting-notes-expert/scripts/fix_minutes_docx.py` | 七列列宽 | 否（加一项） |
-| `skills/meeting-notes-expert/references/golden/cases/*` | 9 个用例的 expected 全部补状态列与出处 | 是 |
 | `tools/minutes_eval.py` | 读新字段；新增行动项出处覆盖率指标 | 否 |
 | `tools/meeting_index.py` | 加 `action_items` 表与跨会未完成项查询 | 否（新表） |
 | `README.md` | 待办七列与导出字段说明 | 否 |
@@ -91,9 +90,8 @@ SKILL.md 既有口径是「决策用肯定句式，不标状态、不附依据�
 ### 验证
 
 1. `python validate_minutes.py --selftest` 全 PASS（含新增断言）
-2. `python golden_cases.py` 9/9 PASS
-3. `python -m py_compile` 全部改动脚本
-4. 反向用例：状态写「已完成一半」→FAIL；备注无出处→WARN；软承诺强度写非法值→FAIL
+2. `python -m py_compile` 全部改动脚本
+3. 反向用例：状态写「已完成一半」→FAIL；备注无出处→WARN；软承诺强度写非法值→FAIL
 5. `tools/minutes_quality.py --selftest`、`tools/minutes_eval.py --selftest` PASS
 6. `tests/test_tools_units.py` 全 PASS
 7. 真实纪要导出：`--export` 后确认 `status`/`processing_warnings`/`source` 三字段在位

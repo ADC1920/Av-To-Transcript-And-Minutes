@@ -269,7 +269,7 @@ Av-To-Transcript-And-Minutes/
 │   │       ├── firered_mem_patch.py  AED 显存补丁
 │   │       ├── diarize.py
 │   │       └── test_*.py
-│   └── meeting-notes-expert/         纪要模板、校验器与 golden 用例
+│   └── meeting-notes-expert/         纪要模板与结构校验器
 └── .github/workflows/tests.yml
 ```
 
@@ -297,7 +297,7 @@ python benchmark_quality.py --selftest
 python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
 ```
 
-CI 分两个 job：离线 job 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；纪要 job 装 python-docx 与 jsonschema，跑结构校验自检与 golden 用例回归。需要模型与显卡的 e2e 与质量基线在本地跑。
+CI 分两个 job：离线 job 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；纪要 job 装 python-docx 与 jsonschema，跑结构校验自检。需要模型与显卡的 e2e 与质量基线在本地跑。
 
 ### 质量基准
 

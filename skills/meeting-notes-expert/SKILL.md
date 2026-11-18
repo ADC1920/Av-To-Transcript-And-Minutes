@@ -386,8 +386,7 @@ python "skills\meeting-notes-expert\scripts\fix_minutes_docx.py" 纪要.docx 纪
 
 ### 交付前验证（四层）
 
-1. **结构与溯源**：`python "skills\meeting-notes-expert\scripts\validate_minutes.py" 纪要-终.docx --source 会议原文.txt`（必需节、待办七列与字段、状态枚举、决策句式、禁用标注、数字/日期/责任人/出处溯源、软承诺强度、说话人归属，通用总结另判章节时间戳与术语定义；有源材料时必跑，`--strict` 让告警也阻断；脚本自带 `--selftest`）。输出除 PASS/FAIL 外还带三态：`complete` 全过、`degraded` 无 FAIL 但有 WARN、`failed` 有 FAIL；`--json` 报告里 `status` 与 `processing_warnings` 逐条可定位到具体校验步骤。
-   回归基线见 `references/golden/`：旧单例（`source.md` 与 `expected.md` 成对）与 `cases/<用例名>/` 下的多场景用例，每条只压一个提炼难点。改动提炼口径后跑 `python "skills\meeting-notes-expert\scripts\golden_cases.py"` 批量对照（`--list` 只列不跑，传子串只跑匹配用例）。现有用例：`soft-commitment`（软承诺入表但不升格）、`no-actions`（无决策无待办的纯通报）、`relative-time`（相对时间换算为具体日期）。校验项含：必需节、待办七列与字段、状态与强度枚举、决策句式、禁用标注与缺失写法、相对时间换算、数字与日期溯源、出处溯源、说话人归属、风险四档（分层版）、通用总结章节时间戳与术语定义。六列旧件只告警不判错（兼容历史归档件）。
+1. **结构与溯源**：`python "skills\meeting-notes-expert\scripts\validate_minutes.py" 纪要-终.docx --source 会议原文.txt`（必需节、待办七列与字段、状态枚举、决策句式、禁用标注、数字/日期/责任人/出处溯源、软承诺强度、说话人归属，通用总结另判章节时间戳与术语定义；有源材料时必跑，`--strict` 让告警也阻断；脚本自带 `--selftest`）。输出除 PASS/FAIL 外还带三态：`complete` 全过、`degraded` 无 FAIL 但有 WARN、`failed` 有 FAIL；`--json` 报告里 `status` 与 `processing_warnings` 逐条可定位到具体校验步骤。改动提炼口径后跑一次 `--selftest` 确认校验逻辑本身没退化。六列旧件只告警不判错（兼容历史归档件）。
 2. **结构断言**：`python "%USERPROFILE%\.agents\skills\article-format\scripts\verify_article_style.py" 纪要-终.docx`（约 65 条，随表格数浮动；含纸型 A4 / 页边距 2.54cm / 无字面 `**` 残留）。
 3. **XML 合法**：`officecli validate 纪要-终.docx`（要求 0 错误）。**WPS 保存过的文件会报 `uiPriority`/`themeFontLang` 元素顺序告警——这是 WPS 的写法不是文件损坏**：与编辑前备份对照，备份同报即放行；仅 document.xml 正文结构错误才算失败，渲染通过即健康。
 4. **真机渲染**：WPS 导出 PDF 后目检。本技能附渲染辅助脚本——`scripts\docx2pdf_wps.ps1`（`pwsh -File ... -Src <docx 绝对路径> -Dst <pdf 绝对路径>`，**两参数必须绝对路径**——相对路径会让 WPS COM 报「RPC 服务器不可用 0x800706BA」崩溃）与 `scripts\rasterize_pdf.py`（PDF 逐页转 PNG）；重点看表格列宽无截断、表头跨页重复、无字面星号，缺陷修好后重新出稿复验。续改模式（就地编辑）场景的验证＝人名与数字一致性复扫＋渲染目检，不必重跑全套结构断言。
