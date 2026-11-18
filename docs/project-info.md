@@ -6,7 +6,7 @@
 
 - `av_to_transcript_and_minutes.py`：主入口。负责拆轨（ffmpeg）、人声分离（demucs）、调用转写引擎、组稿与 docx 排版。
 - `skills/funasr-transcribe/scripts/qwen_asr.py`：转写引擎。四选一：`qwen`（本地 Qwen3-ASR）、`aed`（本地 FireRedASR2-AED）、`cloud`（阿里云百炼）、`auto`（按语言路由）。
-- `skills/meeting-notes-expert/`：纪要提炼技能，含七节模板、`validate_minutes.py` 结构校验器与 golden 回归用例。
+- `skills/meeting-notes-expert/`：纪要提炼技能，含七节模板与 `validate_minutes.py` 结构校验器。
 
 关键分层：**识别可上云，说话人分离始终在本地**。`--meeting` 或带说话人的转写依赖本地 funasr VAD + cam++ 声纹聚类；`--no-diarize` 单人场景才有纯云端轻量路径。
 

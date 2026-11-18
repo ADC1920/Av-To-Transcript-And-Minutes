@@ -126,21 +126,31 @@ def selftest() -> int:
     mod = _load_validator()
     ck("校验器可加载", hasattr(mod, "validate") and hasattr(mod, "export_structured"))
 
-    # 拿技能自带的 golden 期望稿做端到端导出，验证结构键齐全
-    golden = skill / "references/golden/expected.md"
-    if golden.is_file():
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            out = Path(td) / "x.json"
-            data = export(golden, out)
-            ck("导出落盘", out.is_file())
-            for k in ("basic_info", "sections", "action_items", "decisions"):
-                ck(f"导出含 {k}", k in data["data"])
-            res = check(golden)
-            ck("校验返回三态", res["status"] in ("complete", "degraded", "failed"),
-               res["status"])
-    else:
-        ck("golden 样例存在", False, str(golden))
+    # 端到端自检：临时生成一份最小纪要，验证导出键齐全与三态返回。
+    # 不依赖仓库内的固定样例文件，自检在任何检出状态下都能跑。
+    import tempfile
+    sample = (
+        "# 会议纪要：自检样例\n\n"
+        "## 会议基本信息\n\n会议主题：自检\n会议时间：2026-11-18\n\n"
+        "## 会议结论\n\n本次决定采用方案 A。\n\n"
+        "## 关键决策\n\n1. 决定采用方案 A。\n\n"
+        "## 待办事项\n\n"
+        "| 序号 | 待办事项 | 责任人/责任部门 | 完成时间 | 优先级 | 状态 | 备注 |\n"
+        "|---|---|---|---|---|---|---|\n"
+        "| 1 | 完成自检 | 张三 | 待定 | 中 | 未开始 | 优先级未明示；出处：00:10 张三 |\n\n"
+        "## 会议内容\n\n### 议题\n\n确定采用方案 A。\n"
+    )
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "selfcheck.md"
+        src.write_text(sample, encoding="utf-8")
+        out = Path(td) / "x.json"
+        data = export(src, out)
+        ck("导出落盘", out.is_file())
+        for k in ("basic_info", "sections", "action_items", "decisions"):
+            ck(f"导出含 {k}", k in data["data"])
+        res = check(src)
+        ck("校验返回三态", res["status"] in ("complete", "degraded", "failed"),
+           res["status"])
 
     print("SELFTEST", "PASS" if not fails else f"FAIL（{len(fails)} 项）")
     return 0 if not fails else 1

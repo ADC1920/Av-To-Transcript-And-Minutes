@@ -191,18 +191,26 @@ python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 
 会议原文顶部的发言概览给出每人段数、累计时长、占比、首末开口时间与重叠语音统计。提炼纪要时「谁占了六成发言、谁只说了两句」会直接改变权重与判断。
 
-纪要文档可再导出机器可读 JSON（待办表、决策列表、各节文本）：
+纪要文档可再导出机器可读 JSON（待办表、决策列表、各节文本、文档状态）：
 
 ```bash
-python skills/meeting-notes-expert/scripts/validate_minutes.py 会议纪要-x.docx --export 会议纪要-x.json
+python skills/meeting-notes-expert/scripts/validate_minutes.py 会议纪要-x.docx --source 会议原文.txt --export 会议纪要-x.json
 ```
+
+导出结构为 schema_version 2，关键字段：
+
+- `action_items[]`：`task` / `owner` / `due` / `priority` / `status`（未开始／进行中／受阻／完成／取消／待定）/ `strength`（软性承诺）/ `source`（原文锚点）
+- `decisions[]`：`{text, source}` 对象数组；`decision_texts[]` 保留纯文本形态供旧消费方使用
+- `document_status`：`complete` / `degraded` / `failed`，与 `processing_warnings[]` 一起下发，不必翻日志判断这份纪要残不残
+
+待办表为七列（含状态），备注列写「出处：00:35 张三」与「强度：软性」。给了 `--source` 时校验器会核出处是否真在原文、责任人与该段说话人是否一致。六列旧稿只告警不判错，历史归档件重跑不会集体报错。
 
 ## 工具层
 
 | 工具 | 用途 |
 | --- | --- |
 | `tools/speaker_timeline.py` | 转写结果 / 会议原文 / RTTM 渲染成说话人泳道图 HTML 片段 |
-| `tools/meeting_index.py` | 跨会议检索，SQLite FTS5，`add` / `search` / `stats` |
+| `tools/meeting_index.py` | 跨会议检索，SQLite FTS5，`add` / `search` / `stats` / `open` |
 | `tools/mcp_server.py` | MCP 工具服务（stdio），job 语义 |
 
 ```bash
@@ -212,6 +220,10 @@ python tools/speaker_timeline.py out/会议原文-x.json -o 时间轴.html
 # 跨会议检索（索引落 ~/.av2m/meetings.db，AV2M_INDEX 可覆盖）
 python tools/meeting_index.py add out/
 python tools/meeting_index.py search 胚布 白配检测 --speaker 张三
+
+# 查未完成行动项（跨会跟踪；纪要索引后自动建表）
+python tools/meeting_index.py open --owner 张三
+python tools/meeting_index.py open --topic 结算改版 --since 2026-10-01
 
 # MCP 服务（uv sync --extra mcp）
 python tools/mcp_server.py
@@ -257,7 +269,7 @@ Av-To-Transcript-And-Minutes/
 │   │       ├── firered_mem_patch.py  AED 显存补丁
 │   │       ├── diarize.py
 │   │       └── test_*.py
-│   └── meeting-notes-expert/         纪要模板、校验器与 golden 用例
+│   └── meeting-notes-expert/         纪要模板与结构校验器
 └── .github/workflows/tests.yml
 ```
 
@@ -285,7 +297,7 @@ python benchmark_quality.py --selftest
 python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
 ```
 
-CI 分两个 job：离线 job 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；纪要 job 装 python-docx 与 jsonschema，跑结构校验自检与 golden 用例回归。需要模型与显卡的 e2e 与质量基线在本地跑。
+CI 分两个 job：离线 job 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；纪要 job 装 python-docx 与 jsonschema，跑结构校验自检。需要模型与显卡的 e2e 与质量基线在本地跑。
 
 ### 质量基准
 
