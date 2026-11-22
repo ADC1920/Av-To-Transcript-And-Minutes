@@ -1000,7 +1000,10 @@ def render_docx(md_path: Path, docx_path: Path, stem_dir: Path, verbose: bool = 
     base = stem_dir / "_article_base_tmp.docx"
     # 主标题由 md 内首个 `# ` 行自动识别，无需 --title；
     # article-format 输出受 ARTICLE_OUT_DIR 约束，且两脚本对相对路径解析基准不同——传入路径一律绝对化
+    # md2docx 自 v2.1 起不再有默认排版，必须给 profile 否则直接退出（成稿 docx 全灭）。
+    # 管线产出的是转写稿/会议原文，按正式文稿 formal-doc 排版；用户显式设了环境变量则不覆盖。
     art_env = child_env(ARTICLE_OUT_DIR=str(stem_dir.resolve()))
+    art_env.setdefault("ARTICLE_FORMAT_PROFILE", "formal-doc")
     run_child([sys.executable, str(skill / "md2docx.py"),
                str(md_path.resolve()), str(base.resolve())], verbose=verbose, env=art_env)
     run_child([sys.executable, str(skill / "article_style.py"),

@@ -21,7 +21,7 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tools/*.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tools/*.py skills/funasr-transcribe/scripts/*.py
       - name: tools 工具单测（清单/MCP 参数/索引/泳道图，零依赖）
         run: python tests/test_tools_units.py
       - name: ITN 单测（零依赖）
@@ -38,10 +38,15 @@ jobs:
         run: python skills/funasr-transcribe/scripts/test_pyannote_chunking.py
       - name: 基准脚本自检（CER/编辑距离；DER 需 pyannote.metrics，缺则跳过）
         run: python benchmark_quality.py --selftest
+      - name: 技能双副本同步工具自检（零依赖，不碰本机用户目录）
+        run: python scripts/check_skill_sync.py --selftest
 
-  # 纪要技能job：装 python-docx + jsonschema，跑结构校验与导出/评测工具自检。
+  # 纪要技能job：装 python-docx + jsonschema，跑本仓纪要工具自检。
   # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，
   # 其 docx 校验缺陷（只认字面 ##）因此长期未被发现。
+  # 2026-11-22：技能已拆为独立私有仓库（ADC1920/meeting-notes-expert），本仓不再携带副本。
+  # 技能自身的 selftest 不在本仓 CI 里跑——它在独立仓库自己的 CI 跑更合适；
+  # 本 job 只验证「本仓工具在技能缺席时能正常运行」这一件事，那才是本仓的责任边界。
   skill-minutes:
     runs-on: ubuntu-latest
     strategy:
@@ -52,12 +57,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: 安装技能依赖（docx 读写 + schema 校验）
-        run: pip install python-docx jsonschema
-      - name: 结构校验自检（正例/负例/溯源/三态/docx 往返）
-        run: python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
-      # 纪要结构化导出与质量评测（2026-11-18 新增）：两个工具都复用上面的校验器解析层，
-      # 依赖与本节一致，故放在同一 job 跑
+      - name: 安装本仓工具依赖（仅 python-docx）
+        run: pip install python-docx
       - name: 纪要导出与校验工具自检
         run: python tools/minutes_quality.py --selftest
       - name: 纪要质量评测基准自检
