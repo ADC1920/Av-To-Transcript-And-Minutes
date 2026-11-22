@@ -8,7 +8,8 @@
 |---|---|---|
 | 主管线脚本 | `av_to_transcript_and_minutes.py` | 音视频 → 转写文稿 / 会议纪要，一条命令全流程 |
 | 质量基准 | `benchmark_quality.py` | 转写质量对比（DER / CER / 重叠检测），已入库，支持 `--selftest` |
-| 技能副本 | `skills/funasr-transcribe/`、`skills/meeting-notes-expert/` | 识别与纪要技能，随仓库分发 |
+| 识别技能 | `skills/funasr-transcribe/` | 识别引擎技能，随本仓分发 |
+| 纪要技能 | **独立仓库** `github.com/ADC1920/meeting-notes-expert` | 模板、校验器、排版脚本。**本仓不携带副本**，需单独安装到 `~/.zcode/skills/`；本仓代码按环境变量与用户级目录自动定位，找不到则降级 |
 | 端到端测试 | `test_pipeline_e2e.py` | 管线冒烟 |
 | 项目档案 | `docs/project-info.md` | 架构、模块表、依赖与环境分层 |
 
@@ -20,6 +21,8 @@
 4. 改动影响识别参数后，跑 `python tests/test_quality_baseline.py` 对照门槛（DER ≤ 0.25、CER ≤ 0.30）。
 5. 提交前跑 CI 等价检查：`python -m py_compile` 全脚本，再依次跑 `skills/funasr-transcribe/scripts/` 下各 `test_*.py` 与 `tests/test_tools_units.py`。
 6. 依赖用 uv 管理：`uv sync` 按 `uv.lock` 安装（torch 走 cu130 索引）；改依赖改 `pyproject.toml` 后重跑 `uv lock`，不要手改 `uv.lock`。判断装对没有看版本后缀有没有 `+cu130`，只看版本号会漏掉 CPU 版。
+7. **纪要技能是独立项目**（`github.com/ADC1920/meeting-notes-expert`），本仓不再携带副本。改动该技能请到独立仓库进行；本仓只保留 `scripts/check_skill_sync.py`，用于比对「独立仓库 / 用户级安装」两处是否一致（`--fix` 把独立仓库版覆盖到用户级）。历史上出过用户级长期停在 v1.8.1 未被发现的事故。
+8. 项目代码**不硬依赖技能路径**：`tools/minutes_quality.py` 与 `tools/meeting_index.py` 按「`MEETING_SKILL_DIR` → `~/.zcode/skills` → `~/.agents/skills` → `~/.claude/skills` → 本仓副本」定位，技能未安装时降级而非崩溃。改这类定位逻辑时保持同样顺序，别把仓库副本放回首位。
 
 ## 工具层（tools/）
 

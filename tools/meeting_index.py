@@ -144,23 +144,51 @@ def load_source(path):
 
 
 def _minutes_module():
-    """复用技能的解析层，不写第二套表格解析器（两套必然漂移）。"""
-    skill_scripts = ROOT / "skills" / "meeting-notes-expert" / "scripts"
-    if str(skill_scripts) not in sys.path:
-        sys.path.insert(0, str(skill_scripts))
-    import validate_minutes
-    return validate_minutes
+    """复用技能的解析层，不写第二套表格解析器（两套必然漂移）。
+
+    技能是独立仓库，本仓不携带副本——按「环境变量 → 三处用户级安装目录」定位，
+    与 tools/minutes_quality.py 同一口径。找不到返回 None，由调用方降级。
+    """
+    import os
+    home = Path.home()
+    cands = []
+    env = os.environ.get("MEETING_SKILL_DIR")
+    if env:
+        cands.append(Path(env))
+    cands += [home / ".zcode/skills/meeting-notes-expert",
+              home / ".agents/skills/meeting-notes-expert",
+              home / ".claude/skills/meeting-notes-expert"]
+    for c in cands:
+        scripts = c / "scripts"
+        if (scripts / "validate_minutes.py").is_file():
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            import validate_minutes
+            return validate_minutes
+    return None
 
 
 def extract_action_items(path):
-    """从纪要 md 里抽待办表（含状态/强度/出处）。解析失败返回 []。"""
+    """从纪要 md 里抽待办表（含状态/强度/出处）。解析失败返回 []。
+
+    注意：返回空既可能是「真没有待办」，也可能是「技能没装好」。
+    两者对跨会查询的含义完全不同，故解析失败要打印一行到 stderr，
+    不要让 except 静默吞掉——上一版就是把拆分返回值变更导致的 TypeError 吞了，
+    待办索引空了一整轮没人发现（实测）。
+    """
+    vm = _minutes_module()
+    if vm is None:
+        print("[meeting_index] 未找到 meeting-notes-expert 技能，待办抽取降级为空 "
+              "（可用 MEETING_SKILL_DIR 指定）", file=sys.stderr)
+        return []
     try:
-        vm = _minutes_module()
         blocks = vm.parse_md(path.read_text(encoding="utf-8", errors="replace"))
-        _basic, sections, _tbl = vm.split_sections(blocks)
+        _basic, sections, _tbl, _unknown = vm.split_sections(blocks)
         items, _header = vm.collect_action_items(sections.get("待办事项") or [])
         return items
-    except Exception:
+    except Exception as e:
+        print(f"[meeting_index] 待办抽取失败（{type(e).__name__}: {e}），本条按空处理；"
+              f"技能版本可能与解析口径不匹配", file=sys.stderr)
         return []
 
 

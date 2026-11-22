@@ -14,7 +14,7 @@
       └─ ⑤ 组稿与排版      转写文稿（普通）或会议原文（带时间戳与说话人）→ 规范 docx
 ```
 
-结构化纪要不由管线生成。管线产出带 `[分:秒] 说话人N：` 标签的会议原文，再由会话内 AI 按 [meeting-notes-expert](skills/meeting-notes-expert/SKILL.md) 模板提炼成七节式纪要。理解性工作交给 AI，确定性工作留给脚本。
+结构化纪要不由管线生成。管线产出带 `[分:秒] 说话人N：` 标签的会议原文，再由会话内 AI 按 [meeting-notes-expert](https://github.com/ADC1920/meeting-notes-expert) 模板提炼成纪要。**该技能是独立项目**，需单独安装（见下节「纪要技能」）。理解性工作交给 AI，确定性工作留给脚本。
 
 ```bash
 python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--meeting] [--srt] …
@@ -194,7 +194,8 @@ python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 纪要文档可再导出机器可读 JSON（待办表、决策列表、各节文本、文档状态）：
 
 ```bash
-python skills/meeting-notes-expert/scripts/validate_minutes.py 会议纪要-x.docx --source 会议原文.txt --export 会议纪要-x.json
+# 技能已拆为独立项目，脚本路径按安装位置指定（此处以用户级安装为例）
+python "$HOME/.zcode/skills/meeting-notes-expert/scripts/validate_minutes.py" 会议纪要-x.docx --source 会议原文.txt --export 会议纪要-x.json
 ```
 
 导出结构为 schema_version 2，关键字段：
@@ -269,9 +270,24 @@ Av-To-Transcript-And-Minutes/
 │   │       ├── firered_mem_patch.py  AED 显存补丁
 │   │       ├── diarize.py
 │   │       └── test_*.py
-│   └── meeting-notes-expert/         纪要模板与结构校验器
+│   └── （纪要技能已拆为独立项目，不在本仓）
 └── .github/workflows/tests.yml
 ```
+
+## 纪要技能（独立项目）
+
+纪要的模板、校验器与排版脚本已拆到独立仓库 [ADC1920/meeting-notes-expert](https://github.com/ADC1920/meeting-notes-expert)，本仓不再携带副本。
+
+装法（任选其一，然后确认脚本可跑）：
+
+```bash
+git clone https://github.com/ADC1920/meeting-notes-expert.git ~/.zcode/skills/meeting-notes-expert
+python "$HOME/.zcode/skills/meeting-notes-expert/scripts/validate_minutes.py" --selftest
+```
+
+本仓的 `tools/minutes_quality.py` 与 `tools/meeting_index.py` 会按
+`MEETING_SKILL_DIR` → `~/.zcode/skills` → `~/.agents/skills` → `~/.claude/skills` 顺序
+自动找技能；找不到时降级（导出/索引按空处理并打印提示），不影响管线本身。
 
 ## 验证与质量基线
 
@@ -292,9 +308,9 @@ python skills/funasr-transcribe/scripts/test_cloud_units.py
 python skills/funasr-transcribe/scripts/test_cache_fingerprint.py
 python tests/test_tools_units.py
 
-# 基准自检与纪要校验自检
+# 基准自检与纪要校验自检（后者需先装独立技能，见上节）
 python benchmark_quality.py --selftest
-python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
+python "$HOME/.zcode/skills/meeting-notes-expert/scripts/validate_minutes.py" --selftest
 ```
 
 CI 分两个 job：离线 job 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；纪要 job 装 python-docx 与 jsonschema，跑结构校验自检。需要模型与显卡的 e2e 与质量基线在本地跑。

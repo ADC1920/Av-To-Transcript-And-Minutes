@@ -26,20 +26,21 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
 
-# 技能目录查找顺序与主脚本 article_skill() 保持同一口径：
-# 仓库副本优先（随代码分发、版本一致），环境变量可覆盖到用户级安装。
-SKILL_CANDIDATES = ("skills/meeting-notes-expert",)
+# 技能是独立仓库（github.com/ADC1920/meeting-notes-expert），本仓不携带副本。
+# 定位顺序：环境变量 → 三处用户级安装目录。找不到时由调用方降级，不报错中断。
+# 2026-11-22 前这里还有一层「本仓 skills/ 副本」兜底，副本删除后该分支已无意义，一并去掉。
 
 
 def _skill_dir() -> Path | None:
     """定位 meeting-notes-expert 技能目录；找不到返回 None。"""
     import os
     env = os.environ.get("MEETING_SKILL_DIR")
-    cands = ([Path(env)] if env else []) + [REPO_ROOT / c for c in SKILL_CANDIDATES]
     home = Path.home()
-    cands += [home / ".agents/skills/meeting-notes-expert",
-              home / ".zcode/skills/meeting-notes-expert",
-              home / ".claude/skills/meeting-notes-expert"]
+    cands = ([Path(env)] if env else []) + [
+        home / ".zcode/skills/meeting-notes-expert",
+        home / ".agents/skills/meeting-notes-expert",
+        home / ".claude/skills/meeting-notes-expert",
+    ]
     for c in cands:
         if (c / "scripts/validate_minutes.py").is_file():
             return c

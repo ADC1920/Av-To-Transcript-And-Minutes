@@ -21,7 +21,7 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tools/*.py skills/funasr-transcribe/scripts/*.py skills/meeting-notes-expert/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tools/*.py skills/funasr-transcribe/scripts/*.py
       - name: tools 工具单测（清单/MCP 参数/索引/泳道图，零依赖）
         run: python tests/test_tools_units.py
       - name: ITN 单测（零依赖）
@@ -38,15 +38,23 @@ jobs:
         run: python skills/funasr-transcribe/scripts/test_pyannote_chunking.py
       - name: 基准脚本自检（CER/编辑距离；DER 需 pyannote.metrics，缺则跳过）
         run: python benchmark_quality.py --selftest
+      - name: 技能双副本同步工具自检（零依赖，不碰本机用户目录）
+        run: python scripts/check_skill_sync.py --selftest
 
   # 纪要技能job：装 python-docx + jsonschema，跑结构校验与导出/评测工具自检。
   # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，
   # 其 docx 校验缺陷（只认字面 ##）因此长期未被发现。
+  # 2026-11-22：技能已拆为独立私有仓库（ADC1920/meeting-notes-expert），本仓不再携带副本。
+  # 若配置了 SKILL_REPO_TOKEN secret 则拉取技能并跑完整自检；未配置则跳过技能部分，
+  # 只跑本仓自己的工具自检——不因缺少 secret 让 CI 变红。
   skill-minutes:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.10", "3.12"]
+    # secrets 不能直接用在 if 里；用 job 级 env 中转，step 里判断 env 是否为空
+    env:
+      SKILL_TOKEN: ${{ secrets.SKILL_REPO_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,10 +62,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: 安装技能依赖（docx 读写 + schema 校验）
         run: pip install python-docx jsonschema
+      - name: 拉取纪要技能（独立仓库，需 SKILL_REPO_TOKEN）
+        if: env.SKILL_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${SKILL_TOKEN}@github.com/ADC1920/meeting-notes-expert.git" \
+            "$RUNNER_TEMP/meeting-notes-expert"
       - name: 结构校验自检（正例/负例/溯源/三态/docx 往返）
-        run: python skills/meeting-notes-expert/scripts/validate_minutes.py --selftest
-      # 纪要结构化导出与质量评测（2026-11-18 新增）：两个工具都复用上面的校验器解析层，
-      # 依赖与本节一致，故放在同一 job 跑
+        if: env.SKILL_TOKEN != ''
+        run: python "$RUNNER_TEMP/meeting-notes-expert/scripts/validate_minutes.py" --selftest
+      - name: 未配置技能仓库 token 时说明跳过
+        if: env.SKILL_TOKEN == ''
+        run: echo "未配置 SKILL_REPO_TOKEN，跳过技能自检（技能已拆至 ADC1920/meeting-notes-expert）"
+      # 纪要结构化导出与质量评测：两个工具都复用校验器的解析层。
+      # 技能缺席时它们自己降级（找不到技能会有明确提示），不会因这个 job 变红。
       - name: 纪要导出与校验工具自检
         run: python tools/minutes_quality.py --selftest
       - name: 纪要质量评测基准自检
