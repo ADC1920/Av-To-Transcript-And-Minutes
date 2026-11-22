@@ -1,8 +1,8 @@
 # Av-To-Transcript-And-Minutes
 
-音视频到转写文稿、会议原文与结构化纪要的一条命令工具链：拆轨、人声分离、说话人分离、识别、字幕、规范排版全部串成一条管线。
+把音视频转成可用的文本底稿：拆轨、人声分离、说话人分离、识别、字幕、规范排版，一条命令跑完。
 
-默认完全离线，模型全部本地运行，无 API 密钥、无网络调用（首次下载模型除外）。也可以只把识别环节交给云端 ASR，本地保留说话人分离。
+默认全离线，模型本地运行，不需要 API 密钥（首次运行下载模型除外）。也可以只把识别环节交给云端 ASR，说话人分离始终留在本地。
 
 ```
 视频 / 音频（mp4 / mkv / mp3 / m4a / wav / …）
@@ -14,67 +14,69 @@
       └─ ⑤ 组稿与排版      转写文稿（普通）或会议原文（带时间戳与说话人）→ 规范 docx
 ```
 
-结构化纪要不由管线生成。管线产出带 `[分:秒] 说话人N：` 标签的会议原文，再由会话内 AI 按 [meeting-notes-expert](https://github.com/ADC1920/meeting-notes-expert) 模板提炼成纪要。**该技能是独立项目**，需单独安装（见下节「纪要技能」）。理解性工作交给 AI，确定性工作留给脚本。
+管线不生成纪要。它产出带 `[分:秒] 说话人N：` 标签的会议原文，再由会话内 AI 按 [meeting-notes-expert](https://github.com/ADC1920/meeting-notes-expert) 模板提炼。确定性工作留给脚本，理解性工作交给 AI。
 
 ```bash
 python av_to_transcript_and_minutes.py <视频/音频文件或文件夹> [-o 输出目录] [--meeting] [--srt] …
 ```
 
-当前版本 v2.6 ｜ MIT ｜ Windows / Linux / macOS ｜ Python 3.10+ ｜ 需 FFmpeg 在 PATH
+v2.6 ｜ Windows / Linux / macOS ｜ Python 3.10+ ｜ FFmpeg 需在 PATH
 
 ## 核心能力
 
-**识别引擎四选一**
+### 识别引擎四选一
 
 | 引擎 | 说明 |
 | --- | --- |
 | `qwen` | Qwen3-ASR-1.7B，默认，多语言 |
 | `aed` | FireRedASR2-AED，中英粤更准，带显存优化补丁 |
 | `auto` | 按 `--language` 路由，中英粤走 AED，其余走 Qwen；`--dialect` 声明方言时改走 Qwen |
-| `cloud` | 阿里云百炼，免显存；默认 message 通道，可选 omni 与 filetrans 子模型 |
+| `cloud` | 阿里云百炼，免显存；`--cloud-model auto` 有公网 URL 走 filetrans，否则回落 message |
 
 换引擎自动重转，不复用旧缓存。
 
-**说话人分离双引擎**
+### 说话人分离双引擎
 
 `pyannote` 用 community-1 分割模型，原生处理重叠语音，会议场景默认；`campp` 走 VAD + cam++ 声纹聚类，轻量，单人访谈够用。`--diarize-engine auto` 在会议模式探测 pyannote，未安装时回落 campp 并提示。
 
 - 人数约束：`--num-speakers` 最准，`--min-speakers` / `--max-speakers` 兜底
 - 长素材分块：超过 15 分钟自动分块（`--pyannote-chunk-s`，0 关闭），块间 30 秒重叠，跨块用声纹合并标签，内存峰值只与块长相关
-- 重叠语音不强行归属：`get_overlap()` 区间单列进 `overlaps` 字段
+- 重叠语音不强行归属：区间单列进 `overlaps` 字段
 - 声纹库 `--speaker-db` 跨文件复用身份，两条分离路线都支持
 - 双人分声道素材加 `--split-channels`，声道号直接当说话人
 
-**字幕与说话人日志**
+### 字幕与说话人日志
 
 `--srt` 出 SRT，`--vtt` 出 WebVTT（两者共用一次对齐，可同时开），`--rttm` 出标准 RTTM（pyannote.metrics / meeteval / dscore 直接读）。
 
-字幕对齐后端 `--align-engine auto|fa-zh|native`：`fa-zh` 是中文专用 38M 模型，当前实际生效；`native`（Qwen3-ForcedAligner-0.6B）代码路径就绪，但需要上游 transformers 支持 0.6B 宽度，当前版本不支持，`auto` 回落 `fa-zh`。非中文素材的字幕时间戳仍会偏。
+字幕对齐后端 `--align-engine auto|fa-zh|native`。`native` 指向 Qwen3-ForcedAligner-0.6B，多语言，比中文专用的 fa-zh 覆盖面广。该 checkpoint 的权重前缀与 hidden size 和 transformers 的 Qwen3ASR 实现不匹配，需要官方 `qwen-asr` 包才能加载；加载失败后自动回落 fa-zh，不报错。非中文素材用 fa-zh 时间戳仍会偏。
 
 字幕可读性三项兜底：超长且无标点的识别结果按字数硬切（切点优先退到软标点或空格）；`--min-dur` 默认 700ms 补足过短展示时间；`--max-cps` 默认 12 字每秒限制阅读速度，且不越过下一条字幕起点。
 
-字幕参数不进口缓存键。先跑转写、事后加 `--srt` 只补一遍对齐，不重跑识别。
+字幕参数不进缓存键。先跑转写、事后加 `--srt` 只补一遍对齐，不重跑识别。
 
-**专名质量**
+### 专名质量
 
 根目录放 `hotwords.txt`（热词，每行一个）与 `replace_dict.txt`（纠错词典，每行 `错=>对`）即自动加载，无需参数。热词走识别阶段偏置，词典走识别后确定性替换，内容都进缓存指纹，改动后旧缓存自动不复用。
 
-`--replace` 做临时确定性替换，`--replace-save` 把本次条目合并写回词典，专名修正可跨次积累。模板见 `*.example.txt`。
+`--replace` 做临时确定性替换，`--replace-save` 把本次条目合并写回词典，专名修正可跨次积累。同音异字可配 `--asr-extra "--fuzzy"` 启用拼音模糊匹配（需 pypinyin 与 rapidfuzz）。模板见 `*.example.txt`。
 
 `--itn` 中文逆文本正则化（三百二十万元转成 320万元），`--itn-backend auto|wtp|legacy` 选后端，装了 WeTextProcessing 就走它，否则用零依赖自写规则。
 
-**批量、续跑与可观测**
+### 批量、续跑与可观测
 
 - 输入文件夹时递归处理所有音视频；单个失败只计一次并继续，收尾退出码非零
 - 转写结果按参数指纹缓存，阈值、热词、人名、识别引擎、额外 ASR 参数、词典内容、响度归一化状态任一不同即互不复用
+- 长音频分批转写，每批完成即原子落盘，中途 OOM 或断电后重跑只补未完成批（`--asr-extra "--no-resume"` 关闭）
 - 批量时拉起常驻转写子进程，主引擎只加载一次；worker 异常自动回退逐文件子进程
 - `--watch DIR` 目录监视，发现新素材（大小稳定后）自动跑完整管线
 - `--log` 落 `run.log`，`manifest.json` 记录每个素材的参数、耗时、状态与实际产物
+- 会议原文里置信度低于 `--low-conf-mark`（默认 0.6）的段落行尾加【待校对】，`--no-conf-mark` 关闭
 - `--clean` 删中间件只留成稿，`--flat` 把成稿平铺到素材目录
 
-**其他**
+### 其他
 
-`--emotion` 出 8 类情绪打分（不做事音频事件检测）；`--denoise` 转写前 ZipEnhancer 降噪，仅对真实含 BGM 或强噪的素材有益；`--no-diarize` 单人素材跳过分离；响度自适应仅在峰值低于 -6 dBFS 且语音段 RMS 低于 -30 dBFS 时做 EBU R128 归一化，正常录音不动。
+`--emotion` 出 8 类情绪打分（不做事音频事件检测）；`--denoise` 转写前 ZipEnhancer 降噪，仅对真实含 BGM 或强噪的素材有益；`--no-diarize` 单人素材跳过分离；`--no-separate` 纯人声素材跳过 Demucs；响度自适应仅在峰值低于 -6 dBFS 且语音段 RMS 低于 -30 dBFS 时做 EBU R128 归一化，正常录音不动。
 
 ## 快速开始
 
@@ -105,6 +107,7 @@ GPU 加速先按 https://pytorch.org 装对应 CUDA 版本的 torch。依赖需�
 | 说话人分离（会议） | pyannote community-1 | ModelScope `pyannote/speaker-diarization-community-1` |
 | 说话人分离（轻量） | fsmn-vad + cam++ | 随 FunASR 下载 |
 | 人声分离 | htdemucs | 随 Demucs 下载 |
+| 多语言字幕对齐（可选） | Qwen3-ForcedAligner-0.6B | ModelScope `Qwen/Qwen3-ForcedAligner-0.6B` |
 
 pyannote 官方模型在 HuggingFace 是门控资源，ModelScope 有官方镜像且无需申请：
 
@@ -153,20 +156,23 @@ python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 | `--srt` / `--vtt` / `--rttm` | 字幕与说话人日志（共用一次对齐） |
 | `--align-engine auto\|fa-zh\|native` | 字幕对齐后端 |
 | `--min-dur` / `--max-cps` / `--max-line` / `--merge-gap` | 字幕最短时长、阅读速度、单条字数、合并间隔 |
-| `--names "0=张三,1=李四"` | 说话人真名映射 |
+| `--names "0=张三,1=李四"` | 说话人真名映射，不触发重转 |
 | `--hotwords` | 热词偏置，未指定时自动加载根目录 `hotwords.txt` |
 | `--replace "错=>对"` | 确定性专名纠错 |
 | `--replace-file` / `--replace-save` | 纠错词典读取与回写，裸写走根目录 `replace_dict.txt` |
 | `--itn` / `--itn-backend` | 中文逆文本正则化与后端选择 |
 | `--speaker-db` | 声纹库，裸写或 `auto` 用输出目录 `speaker_db.json` |
 | `--split-channels` | 双人分声道素材按声道分轨 |
+| `--threshold` | campp 声纹聚类阈值，默认 0.75 |
+| `--low-conf-mark` / `--no-conf-mark` | 低置信度段落标记阈值（默认 0.6）与关闭 |
+| `--asr-extra "--no-resume"` | 关闭引擎层分批转写的断点续跑 |
 | `--emotion` | 8 类情绪打分 |
 | `--denoise` | ZipEnhancer 降噪 |
 | `--vad auto\|fsmn\|firered` | VAD 后端，`auto` 按用途选 |
 | `--language` / `--dialect` | 强制语言 / 声明方言 |
+| `--asr-extra "--fuzzy --min-seg 300"` | 其余引擎参数原样透传，变更后自动重转 |
 | `--demucs-model` | 分离模型，换模型自动重跑 |
-| `--no-separate` | 跳过人声分离 |
-| `--no-asr` | 只拆轨与分离 |
+| `--no-separate` / `--no-asr` | 跳过人声分离 / 只拆轨与分离 |
 | `--watch DIR` | 目录监视 |
 | `--clean` / `--flat` | 清中间件 / 平铺成稿 |
 | `--log` / `--verbose` | 落运行日志 / 实时透传子进程输出 |
@@ -191,31 +197,30 @@ python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 
 会议原文顶部的发言概览给出每人段数、累计时长、占比、首末开口时间与重叠语音统计。提炼纪要时「谁占了六成发言、谁只说了两句」会直接改变权重与判断。
 
-纪要文档可再导出机器可读 JSON（待办表、决策列表、各节文本、文档状态）：
+管线收尾时，若同目录已有 `会议纪要-<stem>.md/.docx`，自动导出结构化 JSON 并跑校验。也可单独调用：
 
 ```bash
-# 技能已拆为独立项目，脚本路径按安装位置指定（此处以用户级安装为例）
-python "$HOME/.zcode/skills/meeting-notes-expert/scripts/validate_minutes.py" 会议纪要-x.docx --source 会议原文.txt --export 会议纪要-x.json
+python tools/minutes_quality.py 会议纪要-x.docx --export --check --source 会议原文-x.md
 ```
 
 导出结构为 schema_version 2，关键字段：
 
-- `action_items[]`：`task` / `owner` / `due` / `priority` / `status`（未开始／进行中／受阻／完成／取消／待定）/ `strength`（软性承诺）/ `source`（原文锚点）
+- `action_items[]`：`task` / `owner` / `due` / `priority` / `status` / `strength`（软性承诺）/ `source`（原文锚点）
 - `decisions[]`：`{text, source}` 对象数组；`decision_texts[]` 保留纯文本形态供旧消费方使用
 - `document_status`：`complete` / `degraded` / `failed`，与 `processing_warnings[]` 一起下发，不必翻日志判断这份纪要残不残
-
-待办表为七列（含状态），备注列写「出处：00:35 张三」与「强度：软性」。给了 `--source` 时校验器会核出处是否真在原文、责任人与该段说话人是否一致。六列旧稿只告警不判错，历史归档件重跑不会集体报错。
 
 ## 工具层
 
 | 工具 | 用途 |
 | --- | --- |
-| `tools/speaker_timeline.py` | 转写结果 / 会议原文 / RTTM 渲染成说话人泳道图 HTML 片段 |
+| `tools/speaker_timeline.py` | 转写结果 JSON 或会议原文 docx 渲染成说话人泳道图 HTML 片段，也可改用 `--rttm` 作数据源 |
 | `tools/meeting_index.py` | 跨会议检索，SQLite FTS5，`add` / `search` / `stats` / `open` |
+| `tools/minutes_quality.py` | 纪要结构化导出 + 技能自带校验器，一个入口 |
+| `tools/minutes_eval.py` | 纪要质量评测门禁：编造数字、数字与责任人溯源率、必填节齐全度 |
 | `tools/mcp_server.py` | MCP 工具服务（stdio），job 语义 |
 
 ```bash
-# 泳道图
+# 泳道图（转写结果 JSON 或会议原文 docx；也可 --rttm 指定日志）
 python tools/speaker_timeline.py out/会议原文-x.json -o 时间轴.html
 
 # 跨会议检索（索引落 ~/.av2m/meetings.db，AV2M_INDEX 可覆盖）
@@ -226,6 +231,9 @@ python tools/meeting_index.py search 胚布 白配检测 --speaker 张三
 python tools/meeting_index.py open --owner 张三
 python tools/meeting_index.py open --topic 结算改版 --since 2026-10-01
 
+# 纪要质量门禁，不达标退出码 1
+python tools/minutes_eval.py 会议纪要-x.md --source 会议原文-x.md --gate
+
 # MCP 服务（uv sync --extra mcp）
 python tools/mcp_server.py
 ```
@@ -233,6 +241,8 @@ python tools/mcp_server.py
 跨会议检索用 trigram 而不是 unicode61：中文没有词边界，unicode61 会把整句当成一个大 token，子串查询永远命中不了。trigram 按三字滑窗建索引，三字及以上任意子串可匹配，两字退到 LIKE 扫描。
 
 MCP 暴露 8 个工具：`transcribe_start/status/result/cancel/list`、`search_meetings`、`index_meetings`、`render_timeline`。`transcribe_start` 立即返回 `job_id` 不阻塞，状态落 `~/.av2m/jobs/`（`AV2M_JOBS` 可覆盖），进程重启后仍可查。幂等键是输入内容哈希加参数哈希，同一文件同一参数重复提交直接复用。参数只接受白名单，拼错的键会被拒，不会静默忽略。
+
+`minutes_eval.py` 只做能机械判定的指标。语义忠实度、无依据量化、说话人张冠李戴三类必须读语义，机械判定会把同义改写误判成编造，故列入报告的 `unjudged` 字段，不参与门禁。
 
 ## 项目结构
 
@@ -247,47 +257,51 @@ Av-To-Transcript-And-Minutes/
 ├── requirements.txt                  兼容入口
 ├── docs/
 │   ├── project-info.md               架构、模块表、本机环境与显存边界
-│   ├── landscape-2026-11.md          同类项目与模型格局（第一轮）
-│   ├── landscape-2026-11-r2.md       第二轮复核与论断对账
-│   └── optimization-roadmap-2026-11.md
+│   ├── landscape-2026-11*.md         四轮同类项目与模型格局调研
+│   ├── optimization-roadmap-2026-11.md
+│   ├── impl-plan-2026-11-r4.md
+│   └── design-specs/                 设计规格档
 ├── scripts/
 │   ├── make_fixtures.py              合成带标注的回归素材
-│   └── oss_upload_bridge.py          filetrans 的公网 URL 桥接
+│   ├── oss_upload_bridge.py          filetrans 的公网 URL 桥接
+│   └── check_skill_sync.py           独立技能与用户级安装的同步比对
 ├── tools/
 │   ├── speaker_timeline.py
 │   ├── meeting_index.py
+│   ├── minutes_quality.py
+│   ├── minutes_eval.py
 │   └── mcp_server.py
 ├── tests/
 │   ├── test_quality_baseline.py
 │   └── test_tools_units.py
 ├── skills/
-│   ├── funasr-transcribe/            转写技能与引擎
-│   │   ├── SKILL.md
-│   │   ├── references/advanced.md
-│   │   └── scripts/
-│   │       ├── qwen_asr.py           识别、分离、字幕、纠错
-│   │       ├── itn_zh.py             中文逆文本正则化
-│   │       ├── firered_mem_patch.py  AED 显存补丁
-│   │       ├── diarize.py
-│   │       └── test_*.py
-│   └── （纪要技能已拆为独立项目，不在本仓）
+│   └── funasr-transcribe/            转写技能与引擎
+│       ├── SKILL.md
+│       ├── references/advanced.md
+│       └── scripts/
+│           ├── qwen_asr.py           识别、分离、字幕、纠错
+│           ├── transcribe.py         FunASR 原生通道备选
+│           ├── itn_zh.py             中文逆文本正则化
+│           ├── firered_mem_patch.py  AED 显存补丁
+│           ├── diarize.py
+│           └── test_*.py
 └── .github/workflows/tests.yml
 ```
 
+纪要技能不在本仓，见下节。
+
 ## 纪要技能（独立项目）
 
-纪要的模板、校验器与排版脚本已拆到独立仓库 [ADC1920/meeting-notes-expert](https://github.com/ADC1920/meeting-notes-expert)，本仓不再携带副本。
-
-装法（任选其一，然后确认脚本可跑）：
+纪要的模板、校验器与排版脚本在独立仓库 [ADC1920/meeting-notes-expert](https://github.com/ADC1920/meeting-notes-expert)，本仓不携带副本。
 
 ```bash
 git clone https://github.com/ADC1920/meeting-notes-expert.git ~/.zcode/skills/meeting-notes-expert
 python "$HOME/.zcode/skills/meeting-notes-expert/scripts/validate_minutes.py" --selftest
 ```
 
-本仓的 `tools/minutes_quality.py` 与 `tools/meeting_index.py` 会按
-`MEETING_SKILL_DIR` → `~/.zcode/skills` → `~/.agents/skills` → `~/.claude/skills` 顺序
-自动找技能；找不到时降级（导出/索引按空处理并打印提示），不影响管线本身。
+本仓的 `tools/minutes_quality.py` 与 `tools/meeting_index.py` 按
+`MEETING_SKILL_DIR` → `~/.zcode/skills` → `~/.agents/skills` → `~/.claude/skills`
+顺序自动找技能；找不到时降级（导出/索引按空处理并打印提示），不影响管线本身。
 
 ## 验证与质量基线
 
@@ -306,14 +320,16 @@ python skills/funasr-transcribe/scripts/test_pyannote_chunking.py
 python skills/funasr-transcribe/scripts/test_itn_zh.py
 python skills/funasr-transcribe/scripts/test_cloud_units.py
 python skills/funasr-transcribe/scripts/test_cache_fingerprint.py
+python skills/funasr-transcribe/scripts/test_firered_mem_patch.py
 python tests/test_tools_units.py
+python tools/minutes_eval.py --selftest
 
-# 基准自检与纪要校验自检（后者需先装独立技能，见上节）
+# 基准自检与技能同步自检
 python benchmark_quality.py --selftest
-python "$HOME/.zcode/skills/meeting-notes-expert/scripts/validate_minutes.py" --selftest
+python scripts/check_skill_sync.py --selftest
 ```
 
-CI 分两个 job：离线 job 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；纪要 job 装 python-docx 与 jsonschema，跑结构校验自检。需要模型与显卡的 e2e 与质量基线在本地跑。
+CI 分四个 job。`offline` 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；`skill-minutes` 装 python-docx，跑两个纪要工具的自检；`engine-units` 装 funasr 与 soundfile，跑 51 项引擎纯函数单测；`quality-baseline` 只验证入口存在与环境自检，真实门槛在本机跑。需要模型与显卡的 e2e 与质量基线不在 CI 内。
 
 ### 质量基准
 
@@ -370,19 +386,17 @@ RTX 5070 Ti 16GB，28 分钟中文会议：
 
 **AED 显存三层防护。** 分块注意力（softmax 按行独立，数学等价）加时长感知分批，加 OOM 拆批与静音点二分兜底，再配 bf16 与 decoder mask 缓存。实测 4×107s 批量峰值显存 11.8GB 降到 3.5GB，推理提速 3 倍。不改官方源码，monkey-patch 可还原。
 
+**批级断点续跑只认分段边界。** partial 文件的计划键是 VAD 与聚类产出的分段边界序列，这两步是确定性的；识别参数一变，旧 partial 自然失效，不会被误用。
+
 **torchcodec 绕行。** pyannote 会带入 torchcodec，它与静态 FFmpeg 不兼容。链路用 soundfile 预载波形、把 numpy 波形直接传给 processor，绕开解码路径。仍遇报错可 `pip uninstall torchcodec`，管线不依赖它。
 
 ## 已知限制
 
 - 抢话极严重的会议仍可能过切（实测 35 簇收敛到 2 簇，但不保证 100%）；重叠区间只做标记，不拆分同一时段的双人文本
 - 说话人编号在不同次运行间可能互换，用 `--names` 固定映射，`--speaker-db` 跨文件复用身份
-- 非中文素材的字幕时间戳会偏，`native` 对齐器要等上游 transformers 支持 0.6B 宽度
+- 非中文素材的字幕时间戳会偏，`native` 对齐器要等上游支持 Qwen3-ForcedAligner 的权重结构
 - FireRedASR2-AED 是可选引擎，需另下模型与代码
 - WeTextProcessing 依赖 pynini，Windows 下需 MSVC 编译，装不上时 ITN 用自写规则
 - 规范 docx 排版依赖 `article-format` 技能，未安装时产出标准 docx
 - 质量基准需要人工标注素材，没有基线时优化效果只能靠主观判断
 - `--clean` 会删缓存与中间 wav，之后换参数重转要重新走分离
-
-## License
-
-[MIT](LICENSE)
