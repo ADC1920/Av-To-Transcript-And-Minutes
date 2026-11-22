@@ -45,16 +45,16 @@ jobs:
   # 2026-10-22 新增——此前 meeting-notes-expert 的脚本完全不在 CI 覆盖面内，
   # 其 docx 校验缺陷（只认字面 ##）因此长期未被发现。
   # 2026-11-22：技能已拆为独立私有仓库（ADC1920/meeting-notes-expert），本仓不再携带副本。
-  # 若配置了 SKILL_REPO_TOKEN secret 则拉取技能并跑完整自检；未配置则跳过技能部分，
-  # 只跑本仓自己的工具自检——不因缺少 secret 让 CI 变红。
+  # 技能自检只能在配了 SKILL_REPO_TOKEN 时跑；未配时本 job 仍要跑本仓自己的工具自检，
+  # 不能因为缺 secret 就整体失败。
+  # 踩过的坑：把 secret 放进 job 级 env 再在 step 的 if 里判断，secret 不存在时
+  # GitHub 会直接取消整个 job（日志只有一行 The operation was canceled），不是跳过。
+  # 所以 secret 只在真正需要它的 step 内引用，其余 step 不碰它。
   skill-minutes:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.10", "3.12"]
-    # secrets 不能直接用在 if 里；用 job 级 env 中转，step 里判断 env 是否为空
-    env:
-      SKILL_TOKEN: ${{ secrets.SKILL_REPO_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -62,20 +62,22 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: 安装技能依赖（docx 读写 + schema 校验）
         run: pip install python-docx jsonschema
-      - name: 拉取纪要技能（独立仓库，需 SKILL_REPO_TOKEN）
-        if: env.SKILL_TOKEN != ''
+      - name: 尝试拉取纪要技能（未配 secret 时本步失败但被忽略）
+        id: fetch
+        continue-on-error: true
+        env:
+          SKILL_TOKEN: ${{ secrets.SKILL_REPO_TOKEN }}
         run: |
+          if [ -z "$SKILL_TOKEN" ]; then
+            echo "未配置 SKILL_REPO_TOKEN，跳过技能拉取"
+            exit 1
+          fi
           git clone --depth 1 \
             "https://x-access-token:${SKILL_TOKEN}@github.com/ADC1920/meeting-notes-expert.git" \
             "$RUNNER_TEMP/meeting-notes-expert"
       - name: 结构校验自检（正例/负例/溯源/三态/docx 往返）
-        if: env.SKILL_TOKEN != ''
+        if: steps.fetch.outcome == 'success'
         run: python "$RUNNER_TEMP/meeting-notes-expert/scripts/validate_minutes.py" --selftest
-      - name: 未配置技能仓库 token 时说明跳过
-        if: env.SKILL_TOKEN == ''
-        run: echo "未配置 SKILL_REPO_TOKEN，跳过技能自检（技能已拆至 ADC1920/meeting-notes-expert）"
-      # 纪要结构化导出与质量评测：两个工具都复用校验器的解析层。
-      # 技能缺席时它们自己降级（找不到技能会有明确提示），不会因这个 job 变红。
       - name: 纪要导出与校验工具自检
         run: python tools/minutes_quality.py --selftest
       - name: 纪要质量评测基准自检
