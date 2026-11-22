@@ -341,13 +341,25 @@ def render_report(rep: dict) -> str:
 
 
 def selftest() -> int:
-    """自检：造一份含已知缺陷的纪要，验证每类指标都能被抓到。"""
+    """自检：造一份含已知缺陷的纪要，验证每类指标都能被抓到。
+
+    与 minutes_quality.py 同一口径：技能是独立仓库，本仓不携带副本，
+    「技能未安装」是合法部署形态（CI 就是这种）。此时本工具的全部指标都依赖
+    技能解析层，无从验证，跳过并说明；能判失败的只有「技能在但功能不对」。
+    """
     fails = []
 
     def ck(name, cond, detail=""):
         print(f"  {'PASS' if cond else 'FAIL'} {name}" + (f"  {detail}" if not cond else ""))
         if not cond:
             fails.append(name)
+
+    try:
+        _load_validator()
+    except FileNotFoundError:
+        print("  SKIP 技能未安装，跳过依赖它的全部指标断言")
+        print("SELFTEST PASS（技能未安装，仅验证了可安全跳过）")
+        return 0
 
     src = ("[00:10] 张三：这次要 3000 万的销售额。\n"
            "[00:20] 李四：毛利率定在 18 个点。\n")
