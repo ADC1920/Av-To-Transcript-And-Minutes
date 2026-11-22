@@ -57,8 +57,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: 安装技能依赖（docx 读写 + schema 校验）
-        run: pip install python-docx jsonschema
+      - name: 安装本仓工具依赖（仅 python-docx）
+        run: pip install python-docx
       - name: 纪要导出与校验工具自检
         run: python tools/minutes_quality.py --selftest
       - name: 纪要质量评测基准自检
