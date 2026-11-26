@@ -67,15 +67,22 @@ jobs:
   # MCP 契约job：装 mcp SDK，真起 stdio 子进程走 JSON-RPC 握手。
   # 只在装了 SDK 的环境验——主 job 里那 5 组 MCP 用例会 SKIP，
   # 协议层契约（outputSchema/annotations/resources 能否被客户端看见）只有这里能证明。
+  #
+  # 1.x 与 2.x 都要跑：2.x 把 FastMCP 改名 MCPServer、字段从 camelCase 改 snake_case，
+  # 2026-11-26 首次推送时就是因为只在本机 1.29 验过、CI 装到 2.3 才暴露的。
+  # 以后任一大版本再变，这个 matrix 会立刻抓到。
   mcp-e2e:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mcp-version: ["mcp>=1.0,<2.0", "mcp>=2.0,<3.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: 安装 MCP SDK
-        run: pip install mcp
+      - name: 安装 MCP SDK（${{ matrix.mcp-version }}）
+        run: pip install "${{ matrix.mcp-version }}"
       - name: MCP stdio 握手与工具调用
         run: python tests/test_mcp_e2e.py
 

@@ -23,6 +23,19 @@ SERVER = ROOT / "tools" / "mcp_server.py"
 passed = failed = skipped = 0
 
 
+def attr(obj, *names):
+    """跨 SDK 版本取属性。
+
+    1.x 的 pydantic 模型用 camelCase 字段名（serverInfo / inputSchema / uriTemplate），
+    2.x 全改成 snake_case（server_info / input_schema / uri_template）。
+    这里按给定顺序试，都不存在时抛 AttributeError 让调用方看见。
+    """
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    raise AttributeError(f"{type(obj).__name__} 没有这些属性：{names}")
+
+
 def check(name, cond, detail=""):
     global passed, failed
     if cond:
@@ -34,8 +47,15 @@ def check(name, cond, detail=""):
 
 
 async def run_session():
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
+    # SDK 1.x 与 2.x 的客户端入口不同：2.x 把 streamablehttp/stdio 客户端挪了位置，
+    # 但 stdio_client 在 2.x 仍在 mcp.client.stdio（迁移指南未列改名）。
+    # 先按 1.x 路径导，失败再试 2.x 的候选位置。
+    try:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+    except ImportError:
+        from mcp.client import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
 
     params = StdioServerParameters(command=sys.executable, args=[str(SERVER)],
                                    cwd=str(ROOT))
@@ -66,8 +86,8 @@ async def run_session():
         async with stdio_client(params_with_env) as (read, write):
             async with ClientSession(read, write) as session:
                 init = await session.initialize()
-                check("握手成功", init.serverInfo.name == "av-to-minutes",
-                      init.serverInfo.name)
+                check("握手成功", attr(init, "serverInfo", "server_info").name == "av-to-minutes",
+                      attr(init, "serverInfo", "server_info").name)
 
                 # 1. 工具发现
                 tools = await session.list_tools()
@@ -77,13 +97,13 @@ async def run_session():
                       {"export_minutes", "eval_minutes"} <= names, str(sorted(names)))
 
                 # 2. 客户端视角看 schema：每个工具都要有 outputSchema，参数要是对象
-                no_out = [t.name for t in tools.tools if not t.outputSchema]
+                no_out = [t.name for t in tools.tools if not attr(t, "outputSchema", "output_schema")]
                 check("客户端看到 outputSchema", not no_out, str(no_out))
                 no_ann = [t.name for t in tools.tools if not t.annotations]
                 check("客户端看到 annotations", not no_ann, str(no_ann))
                 ts = next(t for t in tools.tools if t.name == "transcribe_start")
                 check("客户端看到 options 具名字段",
-                      "TranscribeOptions" in json.dumps(ts.inputSchema), "")
+                      "TranscribeOptions" in json.dumps(attr(ts, "inputSchema", "input_schema")), "")
 
                 # 3. 真实调用只读工具
                 r = await session.call_tool("transcribe_list", {"limit": 5})
@@ -100,7 +120,7 @@ async def run_session():
                 check("分页提示不可截断", "未拉完" in p2.get("note", "") or
                       "还有" in p2.get("note", ""), p2.get("note", ""))
                 check("结构化结果同时有 structuredContent 或文本",
-                      bool(r2.structuredContent) or bool(r2.content), "")
+                      bool(attr(r2, "structuredContent", "structured_content")) or bool(r2.content), "")
 
                 r3 = await session.call_tool("transcribe_result",
                                              {"job_id": "jobdemo", "offset": 20, "limit": 10})
@@ -120,7 +140,7 @@ async def run_session():
                 try:
                     e = await session.call_tool("transcribe_status", {"job_id": "does-not-exist"})
                     err = "no-raise"
-                    if e.isError:
+                    if attr(e, "isError", "is_error"):
                         err = "isError"
                 except Exception as ex:
                     err = type(ex).__name__
@@ -128,9 +148,9 @@ async def run_session():
 
                 # 7. 资源模板
                 resources = await session.list_resource_templates()
-                uris = " ".join(str(t.uriTemplate) for t in resources.resourceTemplates)
-                check("三个资源模板可见", len(resources.resourceTemplates) == 3,
-                      str(len(resources.resourceTemplates)))
+                tpls = attr(resources, "resourceTemplates", "resource_templates")
+                uris = " ".join(str(attr(t, "uriTemplate", "uri_template")) for t in tpls)
+                check("三个资源模板可见", len(tpls) == 3, str(len(tpls)))
                 check("模板含 transcript", "transcript" in uris, uris)
 
                 # 8. 真读一个资源
@@ -174,14 +194,17 @@ def main():
         # build_server 缺 SDK 时抛 SystemExit，必须单独接住并报成可读失败
         check("服务端可启动", False, f"SystemExit: {e}")
     except Exception as e:
-        # asyncio 的 TaskGroup 会把子异常包成 ExceptionGroup（3.11+），
-        # 直接 str() 只剩一句「unhandled errors」，得展开成可读信息
+        # asyncio 的 TaskGroup 会把子异常包成 ExceptionGroup（3.11+）。
+        # 只打 type+str 会得到一句「unhandled errors」，看不到根因——
+        # 用 traceback 展开子异常，CI 上直接能读出是版本不兼容还是握手失败。
+        import traceback
+        detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         subs = getattr(e, "exceptions", None)
         if subs:
-            msgs = [f"{type(x).__name__}: {x}" for x in subs]
-            check("会话正常结束", False, " | ".join(msgs)[:300])
-        else:
-            check("会话正常结束", False, f"{type(e).__name__}: {e}")
+            for sub in subs:
+                detail += "".join(traceback.format_exception(
+                    type(sub), sub, sub.__traceback__))
+        check("会话正常结束", False, detail[-700:].replace("\n", " ⏎ "))
 
     print(f"\n合计 {passed + failed}，PASS {passed}，FAIL {failed}")
     return 0 if failed == 0 else 1

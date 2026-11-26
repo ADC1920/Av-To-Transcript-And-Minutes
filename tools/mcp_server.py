@@ -320,7 +320,13 @@ def list_recent(limit=20):
 
 def build_server():
     try:
-        from mcp.server.fastmcp import FastMCP, Context
+        # SDK 1.x 叫 FastMCP，2.x 改名为 MCPServer 且挪到 mcp.server.mcpserver。
+        # 两个都试：用户 `uv sync --extra mcp` 装的是最新版（2.x），
+        # 而本机历史环境可能还是 1.x，两边都要能起。
+        try:
+            from mcp.server.fastmcp import FastMCP, Context      # SDK 1.x
+        except ImportError:
+            from mcp.server.mcpserver import MCPServer as FastMCP, Context  # SDK 2.x
         from mcp.types import ToolAnnotations
     except ImportError:
         raise SystemExit("需要 MCP Python SDK：pip install mcp（或 uv sync --extra mcp）")

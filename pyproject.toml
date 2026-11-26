@@ -28,7 +28,9 @@ fuzzy = ["pypinyin", "rapidfuzz"]
 # oss2：filetrans 只接受公网 URL，scripts/oss_upload_bridge.py 靠它上传并签名
 cloud = ["dashscope", "requests", "oss2"]
 # MCP 工具服务（tools/mcp_server.py 依赖官方 Python SDK）
-mcp = ["mcp"]
+# 1.x 的 FastMCP 与 2.x 的 MCPServer 都已适配（见 build_server 的兼容导入）。
+# 上限卡 3.0：若 3.x 再改一次类名，宁可装不上，也不要装上了却静默起不来。
+mcp = ["mcp>=1.0,<3.0"]
 
 [tool.uv]
 # 本仓库是脚本集合不是可安装包：uv 只负责按本文件解析并锁定依赖，不构建 wheel。
