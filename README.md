@@ -178,6 +178,7 @@ python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 | `--watch DIR` | 目录监视 |
 | `--clean` / `--flat` | 清中间件 / 平铺成稿 |
 | `--log` / `--verbose` | 落运行日志 / 实时透传子进程输出 |
+| `--json` | 结果打成单个 JSON 到 stdout（进度走 stderr），供 agent 与脚本消费；退出码固定五档 |
 | `--force` | 重跑已处理素材 |
 
 完整参数见 `python av_to_transcript_and_minutes.py --help`。
@@ -247,7 +248,7 @@ MCP 暴露 10 个工具，覆盖从投递到验收的完整链路：
 | 工具 | 用途 |
 |---|---|
 | `transcribe_start` | 提交转写，立即返回 `job_id`；同内容同参数幂等复用 |
-| `transcribe_status` | 查状态，`wait_seconds` 可做有界长轮询（内部夹到 60 秒） |
+| `transcribe_status` | 查状态，`wait_seconds` 可做有界长轮询（上限 25 秒，见下） |
 | `transcribe_result` | 分页取逐段结果，返回 `has_more` 与「未拉完不得总结」硬提示 |
 | `transcribe_cancel` / `transcribe_list` | 取消任务、列出最近任务 |
 | `search_meetings` / `index_meetings` | 跨会议 FTS5 检索与建索引 |
@@ -262,6 +263,25 @@ MCP 暴露 10 个工具，覆盖从投递到验收的完整链路：
 - **大结果不塞上下文**。成稿挂在 `meeting://{stem}/transcript`、`/minutes`、`/timeline` 三个资源模板上，agent 按需读取；逐段内容用分页，不会把上万字稿件一次压进对话。
 
 `transcribe_start` 状态落 `~/.av2m/jobs/`（`AV2M_JOBS` 可覆盖），进程重启后仍可查。幂等键是输入内容哈希加参数哈希。参数只接受白名单，拼错的键会被拒。
+
+长轮询上限取 25 秒而不是常见的 60：MCP 客户端的工具调用超时普遍在 30 秒档（2026-11-26 在 ZCode 实测，设 60 秒时 30 秒即被掐断并报 timeout，等待全白费）。需要更久的等待就多次调用，每次都在客户端超时线以内。
+
+### 接入 MCP 客户端
+
+以 ZCode 为例，在 `~/.zcode/cli/config.json` 的 `mcp.servers` 下加一项即可，下次会话自动加载：
+
+```json
+{
+  "av2m": {
+    "type": "stdio",
+    "command": "<Python 解释器绝对路径>",
+    "args": ["<仓库路径>/tools/mcp_server.py"],
+    "enabled": true
+  }
+}
+```
+
+已在 ZCode 真实走查十个工具全部可调，覆盖「提交转写 → 轮询 → 分页取结果 → 纪要导出 → 质量门禁 → 索引检索 → 泳道图 → 资源读取」完整链路。SDK 1.x（`FastMCP`）与 2.x（`MCPServer`）都支持，CI 双版本各跑一遍。
 
 CLI 侧加 `--json`：stdout 只出一个可被 `jq .` 解析的 JSON 对象（进度与日志走 stderr），退出码固定为 `0` 成功 / `1` 有素材失败 / `2` 参数错误 / `20` 输入不存在 / `30` 参数冲突，错误体含 `code` 与 `suggestion`。不带 `--json` 时人类可读输出与旧版完全一致。
 
@@ -296,7 +316,7 @@ Av-To-Transcript-And-Minutes/
 │   └── mcp_server.py
 ├── tests/
 │   ├── test_quality_baseline.py
-│   ├── test_tools_units.py           工具层纯逻辑 + MCP 契约面（125 项）
+│   ├── test_tools_units.py           工具层纯逻辑 + MCP 契约面（137 项）
 │   └── test_mcp_e2e.py               MCP stdio 真实握手与工具调用（21 项）
 ├── skills/
 │   └── funasr-transcribe/            转写技能与引擎
@@ -348,12 +368,15 @@ python skills/funasr-transcribe/scripts/test_firered_mem_patch.py
 python tests/test_tools_units.py
 python tools/minutes_eval.py --selftest
 
+# MCP 服务契约（需 mcp SDK；未装时整体 SKIP）
+python tests/test_mcp_e2e.py
+
 # 基准自检与技能同步自检
 python benchmark_quality.py --selftest
 python scripts/check_skill_sync.py --selftest
 ```
 
-CI 分四个 job。`offline` 只装 numpy，跑语法检查与全 mock 单测，覆盖 Python 3.10 与 3.12；`skill-minutes` 装 python-docx，跑两个纪要工具的自检；`engine-units` 装 funasr 与 soundfile，跑 51 项引擎纯函数单测；`quality-baseline` 只验证入口存在与环境自检，真实门槛在本机跑。需要模型与显卡的 e2e 与质量基线不在 CI 内。
+CI 分五组 job，展开后 8 个 matrix 实例。`offline`（3.10 / 3.12）只装 numpy，跑语法检查与全 mock 单测——它同时守着一条契约：工具的纯函数必须零依赖可导入；`skill-minutes`（3.10 / 3.12）装 python-docx，跑两个纪要工具的自检；`engine-units` 装 funasr 与 soundfile，跑引擎纯函数单测；`mcp-e2e`（mcp 1.x / 2.x 各一档）真起 stdio 子进程走 JSON-RPC 握手，验协议层契约；`quality-baseline` 只验证入口存在与环境自检，真实门槛在本机跑。需要模型与显卡的 e2e 与质量基线不在 CI 内。
 
 ### 质量基准
 
@@ -413,6 +436,8 @@ RTX 5070 Ti 16GB，28 分钟中文会议：
 **批级断点续跑只认分段边界。** partial 文件的计划键是 VAD 与聚类产出的分段边界序列，这两步是确定性的；识别参数一变，旧 partial 自然失效，不会被误用。
 
 **torchcodec 绕行。** pyannote 会带入 torchcodec，它与静态 FFmpeg 不兼容。链路用 soundfile 预载波形、把 numpy 波形直接传给 processor，绕开解码路径。仍遇报错可 `pip uninstall torchcodec`，管线不依赖它。
+
+**工具面按「agent 能自己用对」设计，不按「参数齐全」设计。** 转写选项是有类型的模型而非自由 dict，枚举值收进 schema，互斥组合在提交时拒绝——这三条都是为了把错误提前到调用那一刻，而不是让 agent 轮询到 failed 再翻日志。代价是每加一个参数要同时改模型与命令行映射表（有导入期断言兜着）。
 
 ## 已知限制
 
