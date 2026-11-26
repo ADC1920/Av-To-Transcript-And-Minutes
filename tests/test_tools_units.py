@@ -314,6 +314,10 @@ def test_mcp_options_model():
     print("[10] MCP：options 有类型模型（schema 自描述）")
     import mcp_server as m
 
+    if not getattr(m, "_PYDANTIC_OK", False):
+        print("  SKIP 未安装 pydantic（uv sync --extra mcp）")
+        return
+
     # 模型字段数必须与命令行映射表一致，否则漏字段会静默丢弃参数
     check("字段数与白名单一致",
           len(m.TranscribeOptions.model_fields) == len(m._ALLOWED_OPTIONS))

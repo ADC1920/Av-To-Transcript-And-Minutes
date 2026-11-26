@@ -35,85 +35,103 @@ import time
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+# pydantic 只在起 MCP server 与用 TranscribeOptions 时才需要。本模块的纯函数
+# （build_cmd / job_key / 参数映射 / 命令行拼装）必须能在零依赖环境导入——
+# CI 的 offline job 只装 numpy，顶层硬导入会让 131 项单测整体崩在 import 阶段。
+# 缺依赖时用具名错误代替 ImportError，让调用方能给出可读结论。
+try:
+    from pydantic import BaseModel, ConfigDict, Field, model_validator
+    _PYDANTIC_OK = True
+except ImportError:                                    # pragma: no cover
+    _PYDANTIC_OK = False
+    BaseModel = ConfigDict = Field = model_validator = None
+
+
+def require_pydantic():
+    """用到模型前调一次；缺 pydantic 时给出安装指引而不是 NameError。"""
+    if not _PYDANTIC_OK:
+        raise SystemExit(
+            "TranscribeOptions 需要 pydantic（它是 mcp SDK 的依赖）："
+            "pip install mcp  或  uv sync --extra mcp")
 
 ROOT = Path(__file__).resolve().parent.parent
 PIPELINE = ROOT / "av_to_transcript_and_minutes.py"
 JOBS_DIR = Path(os.environ.get("AV2M_JOBS") or (Path.home() / ".av2m" / "jobs"))
 
 
-class TranscribeOptions(BaseModel):
-    """转写选项。单一事实源——schema、校验与命令行拼装都从这里出，
-    不再维护「白名单集合 + bool 映射表 + 值映射表」三张需要人工保持一致的表。
+if _PYDANTIC_OK:
+    class TranscribeOptions(BaseModel):
+        """转写选项。单一事实源——schema、校验与命令行拼装都从这里出，
+        不再维护「白名单集合 + bool 映射表 + 值映射表」三张需要人工保持一致的表。
 
-    对外暴露成有类型的字段后，agent 从 inputSchema 就能看到每个参数的类型与合法取值，
-    拼错在 schema 校验阶段即失败，不必等运行到 build_cmd 才报错。
-    """
-
-    model_config = ConfigDict(extra="forbid")   # 拼错的键直接拒，不静默忽略
-
-    # —— 布尔开关 ——
-    meeting: bool = Field(False, description="产出带时间戳与说话人标签的会议原文（默认产出转写文稿）")
-    no_diarize: bool = Field(False, description="跳过说话人分离，单人素材更快；与 meeting 互斥")
-    srt: bool = Field(False, description="额外产出 SRT 字幕文件")
-    vtt: bool = Field(False, description="额外产出 WebVTT 字幕文件")
-    rttm: bool = Field(False, description="额外产出标准 RTTM 说话人日志，供外部复核工具直读")
-    itn: bool = Field(False, description="启用逆文本正则化，把「二零二六年」规整成 2026 年")
-    emotion: bool = Field(False, description="标注每段语音的情绪")
-    denoise: bool = Field(False, description="人声增强前处理，适用嘈杂或带背景音乐的素材")
-    split_channels: bool = Field(False, description="按声道拆分后分别转写，适用双轨录音")
-    no_separate: bool = Field(False, description="跳过人声/背景音分离，纯人声素材可省大量时间")
-
-    # —— 带值参数 ——
-    diarize_engine: Optional[Literal["campp", "pyannote", "auto"]] = Field(
-        None, description="说话人分离引擎。auto=会议用 pyannote、其余用 campp")
-    asr_engine: Optional[Literal["qwen", "aed", "auto", "cloud"]] = Field(
-        None, description="识别引擎。qwen/aed 本地，cloud 走百炼云端，auto 按语言路由")
-    vad: Optional[Literal["auto", "fsmn", "firered"]] = Field(
-        None, description="VAD 后端，auto 按素材自动选择")
-    num_speakers: Optional[int] = Field(
-        None, ge=1, description="已知说话人数，精确人数最准（仅 pyannote 引擎）")
-    min_speakers: Optional[int] = Field(None, ge=1, description="说话人数下限（仅 pyannote 引擎）")
-    max_speakers: Optional[int] = Field(None, ge=1, description="说话人数上限，不确定人数时用它更稳")
-    language: Optional[str] = Field(None, description="指定语言，如 zh / en / ja；不填则自动识别")
-    names: Optional[str] = Field(None, description="说话人改名，形如「1=张三,2=李四」")
-    hotwords: Optional[str] = Field(None, description="热词表文件路径，提升专有名词识别率")
-    replace: Optional[str] = Field(None, description="确定性替换，形如「错词=>对词」，可重复逗号分隔")
-    speaker_db: Optional[str] = Field(
-        None, description="声纹库路径，跨文件复用说话人身份；传 auto 用默认位置")
-    output: Optional[str] = Field(None, description="输出目录；默认 <输入所在目录>/separated_out")
-
-    def to_cli(self) -> dict:
-        """转成 build_cmd 认的扁平 dict：只保留显式设置过的项（exclude_unset 保住
-        「传 False 与不传」的区别——不传时用管线默认值，传 False 才显式关闭）。"""
-        out = {}
-        for name, val in self.model_dump(exclude_unset=True).items():
-            if name in _BOOL_FLAGS:
-                if val:
-                    out[name] = True
-            elif val not in (None, "", False):
-                out[name] = val
-        return out
-
-    @model_validator(mode="after")
-    def _check_mutual_exclusion(self):
-        """互斥组合必须在提交时就拒。放到子进程里炸的话，transcribe_start 已经返回了
-        job_id，agent 拿到的是 queued，要等轮询到 failed 才知道参数错了——
-        而错误原因埋在 run.log 里。这与「参数错误应在 schema 校验阶段失败」的原则冲突。
+        对外暴露成有类型的字段后，agent 从 inputSchema 就能看到每个参数的类型与合法取值，
+        拼错在 schema 校验阶段即失败，不必等运行到 build_cmd 才报错。
         """
-        if self.meeting and self.no_diarize:
-            raise ValueError("meeting 与 no_diarize 互斥：--meeting 需要说话人分离产出说话人标签")
-        lo, hi = self.min_speakers, self.max_speakers
-        if lo and hi and lo > hi:
-            raise ValueError(f"min_speakers({lo}) 不能大于 max_speakers({hi})")
-        if self.num_speakers and (lo or hi):
-            # 管线里 num_speakers 优先级更高，同时给会让 min/max 静默失效
-            raise ValueError("num_speakers 与 min_speakers/max_speakers 不要同时给；"
-                             "已知人数用 num_speakers，不确定才用区间")
-        return self
+
+        model_config = ConfigDict(extra="forbid")   # 拼错的键直接拒，不静默忽略
+
+        # —— 布尔开关 ——
+        meeting: bool = Field(False, description="产出带时间戳与说话人标签的会议原文（默认产出转写文稿）")
+        no_diarize: bool = Field(False, description="跳过说话人分离，单人素材更快；与 meeting 互斥")
+        srt: bool = Field(False, description="额外产出 SRT 字幕文件")
+        vtt: bool = Field(False, description="额外产出 WebVTT 字幕文件")
+        rttm: bool = Field(False, description="额外产出标准 RTTM 说话人日志，供外部复核工具直读")
+        itn: bool = Field(False, description="启用逆文本正则化，把「二零二六年」规整成 2026 年")
+        emotion: bool = Field(False, description="标注每段语音的情绪")
+        denoise: bool = Field(False, description="人声增强前处理，适用嘈杂或带背景音乐的素材")
+        split_channels: bool = Field(False, description="按声道拆分后分别转写，适用双轨录音")
+        no_separate: bool = Field(False, description="跳过人声/背景音分离，纯人声素材可省大量时间")
+
+        # —— 带值参数 ——
+        diarize_engine: Optional[Literal["campp", "pyannote", "auto"]] = Field(
+            None, description="说话人分离引擎。auto=会议用 pyannote、其余用 campp")
+        asr_engine: Optional[Literal["qwen", "aed", "auto", "cloud"]] = Field(
+            None, description="识别引擎。qwen/aed 本地，cloud 走百炼云端，auto 按语言路由")
+        vad: Optional[Literal["auto", "fsmn", "firered"]] = Field(
+            None, description="VAD 后端，auto 按素材自动选择")
+        num_speakers: Optional[int] = Field(
+            None, ge=1, description="已知说话人数，精确人数最准（仅 pyannote 引擎）")
+        min_speakers: Optional[int] = Field(None, ge=1, description="说话人数下限（仅 pyannote 引擎）")
+        max_speakers: Optional[int] = Field(None, ge=1, description="说话人数上限，不确定人数时用它更稳")
+        language: Optional[str] = Field(None, description="指定语言，如 zh / en / ja；不填则自动识别")
+        names: Optional[str] = Field(None, description="说话人改名，形如「1=张三,2=李四」")
+        hotwords: Optional[str] = Field(None, description="热词表文件路径，提升专有名词识别率")
+        replace: Optional[str] = Field(None, description="确定性替换，形如「错词=>对词」，可重复逗号分隔")
+        speaker_db: Optional[str] = Field(
+            None, description="声纹库路径，跨文件复用说话人身份；传 auto 用默认位置")
+        output: Optional[str] = Field(None, description="输出目录；默认 <输入所在目录>/separated_out")
+
+        def to_cli(self) -> dict:
+            """转成 build_cmd 认的扁平 dict：只保留显式设置过的项（exclude_unset 保住
+            「传 False 与不传」的区别——不传时用管线默认值，传 False 才显式关闭）。"""
+            out = {}
+            for name, val in self.model_dump(exclude_unset=True).items():
+                if name in _BOOL_FLAGS:
+                    if val:
+                        out[name] = True
+                elif val not in (None, "", False):
+                    out[name] = val
+            return out
+
+        @model_validator(mode="after")
+        def _check_mutual_exclusion(self):
+            """互斥组合必须在提交时就拒。放到子进程里炸的话，transcribe_start 已经返回了
+            job_id，agent 拿到的是 queued，要等轮询到 failed 才知道参数错了——
+            而错误原因埋在 run.log 里。这与「参数错误应在 schema 校验阶段失败」的原则冲突。
+            """
+            if self.meeting and self.no_diarize:
+                raise ValueError("meeting 与 no_diarize 互斥：--meeting 需要说话人分离产出说话人标签")
+            lo, hi = self.min_speakers, self.max_speakers
+            if lo and hi and lo > hi:
+                raise ValueError(f"min_speakers({lo}) 不能大于 max_speakers({hi})")
+            if self.num_speakers and (lo or hi):
+                # 管线里 num_speakers 优先级更高，同时给会让 min/max 静默失效
+                raise ValueError("num_speakers 与 min_speakers/max_speakers 不要同时给；"
+                                 "已知人数用 num_speakers，不确定才用区间")
+            return self
 
 
-# 布尔开关 → 命令行 flag；其余字段统一走 _VALUE_FLAGS
+    # 布尔开关 → 命令行 flag；其余字段统一走 _VALUE_FLAGS
 _BOOL_FLAGS = {
     "meeting": "--meeting", "no_diarize": "--no-diarize", "srt": "--srt",
     "vtt": "--vtt", "rttm": "--rttm", "itn": "--itn", "emotion": "--emotion",
@@ -127,15 +145,18 @@ _VALUE_FLAGS = {
     "hotwords": "--hotwords", "replace": "--replace", "speaker_db": "--speaker-db",
     "vad": "--vad", "output": "--output",
 }
-# 白名单由模型字段派生，不再手写第二份
-_ALLOWED_OPTIONS = set(TranscribeOptions.model_fields)
+# 白名单 = 两张映射表的键。有 pydantic 时再断言它与模型字段完全一致，
+# 保证「agent 能传的参数」与「能拼成命令行的参数」不会各自漂移。
+_mapped = set(_BOOL_FLAGS) | set(_VALUE_FLAGS)
+_ALLOWED_OPTIONS = set(_mapped)
 
 # 字段必须全部有命令行映射，否则新增字段会被 to_cli 静默丢弃（agent 传了却不生效）。
 # 在导入期就断，比在运行期排查「参数没起作用」便宜得多。
-_mapped = set(_BOOL_FLAGS) | set(_VALUE_FLAGS)
-assert _ALLOWED_OPTIONS == _mapped, (
-    f"TranscribeOptions 字段与命令行映射表不一致："
-    f"缺映射={sorted(_ALLOWED_OPTIONS - _mapped)}，多余={sorted(_mapped - _ALLOWED_OPTIONS)}")
+if _PYDANTIC_OK:
+    assert set(TranscribeOptions.model_fields) == _mapped, (
+        f"TranscribeOptions 字段与命令行映射表不一致："
+        f"缺映射={sorted(set(TranscribeOptions.model_fields) - _mapped)}，"
+        f"多余={sorted(_mapped - set(TranscribeOptions.model_fields))}")
 
 
 def now():
@@ -238,6 +259,7 @@ def start_job(path, options):
     if not src.is_file():
         raise ValueError(f"文件不存在：{src}")
     # options 可以是 TranscribeOptions 或普通 dict（测试与内部调用传 dict）
+    require_pydantic()
     opts = options if isinstance(options, TranscribeOptions) else TranscribeOptions(**options)
     flat = opts.to_cli()
     jid = job_key(src, flat)

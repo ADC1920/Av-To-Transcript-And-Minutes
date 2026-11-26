@@ -158,12 +158,30 @@ def main():
     from mcp import ClientSession  # noqa: F401
 
     print("[E2E] MCP stdio 握手与工具调用")
+    # 环境自检：SDK 与 pydantic 任一缺失都直接报出来，别让它以
+    # 「TaskGroup 1 sub-exception」这种不可读形态出现（CI 首次踩过）。
+    try:
+        import importlib.metadata as md
+        print(f"  env: mcp={md.version('mcp')} pydantic={md.version('pydantic')} "
+              f"python={sys.version.split()[0]}")
+    except Exception as e:
+        print(f"  env: 版本读取失败 {type(e).__name__}: {e}")
     try:
         asyncio.run(asyncio.wait_for(run_session(), timeout=120))
     except asyncio.TimeoutError:
         check("整体不超时", False, "120s")
+    except SystemExit as e:
+        # build_server 缺 SDK 时抛 SystemExit，必须单独接住并报成可读失败
+        check("服务端可启动", False, f"SystemExit: {e}")
     except Exception as e:
-        check("会话正常结束", False, f"{type(e).__name__}: {e}")
+        # asyncio 的 TaskGroup 会把子异常包成 ExceptionGroup（3.11+），
+        # 直接 str() 只剩一句「unhandled errors」，得展开成可读信息
+        subs = getattr(e, "exceptions", None)
+        if subs:
+            msgs = [f"{type(x).__name__}: {x}" for x in subs]
+            check("会话正常结束", False, " | ".join(msgs)[:300])
+        else:
+            check("会话正常结束", False, f"{type(e).__name__}: {e}")
 
     print(f"\n合计 {passed + failed}，PASS {passed}，FAIL {failed}")
     return 0 if failed == 0 else 1
