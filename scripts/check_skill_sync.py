@@ -36,9 +36,13 @@ from pathlib import Path
 SKIP_DIRS = {"__pycache__", "backups", ".git"}
 SKIP_SUFFIXES = (".bak", ".pyc")
 SKIP_PATTERNS = (r"\.bak-", r"\.bak$")
-# 仓库级配置文件：独立仓库是技能自己的仓，本仓副本只是被嵌进别人的仓，
+# 仓库级配置与开发资料：独立仓库是技能自己的仓，本仓副本只是被嵌进别人的仓，
 # 两者的 .gitignore/.gitattributes 本就该不同（副本的忽略规则由所在仓决定），不算漂移。
-REPO_CONFIG_FILES = {".gitignore", ".gitattributes", ".gitmodules"}
+# AGENTS.md 同理——它是给改这个仓的人看的开发规则，技能使用者不需要，
+# 装到 ~/.zcode/skills 也不会被读取。README/CHANGELOG 仍参与比对，因为使用者会看。
+REPO_CONFIG_FILES = {".gitignore", ".gitattributes", ".gitmodules", "AGENTS.md"}
+# 整目录不参与技能分发比对：.github/ 是 CI 配置，只对仓库自身有意义
+REPO_ONLY_DIRS = {".github"}
 
 
 def iter_skill_files(root: Path):
@@ -49,6 +53,8 @@ def iter_skill_files(root: Path):
         rel = p.relative_to(root)
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
+        if any(part in REPO_ONLY_DIRS for part in rel.parts[:-1]):
+            continue          # 仓库专属目录（.github 等）不参与技能分发比对
         if p.suffix in SKIP_SUFFIXES:
             continue
         if p.name in REPO_CONFIG_FILES:
@@ -193,6 +199,14 @@ def selftest() -> int:
             '---\nname: t\nmetadata:\n  version: "1.0.0"\n---\n# t\n', encoding="utf-8")
         (up / ".gitignore").write_text("*.pyc\n", encoding="utf-8")
         check("独立仓库的 .gitignore 不算漂移", main(up_argv) == 0)
+
+        # 9b. 仓库专属基础设施不算技能内容差异
+        # 2026-11-26 实测：独立仓库加了 .github/workflows/tests.yml 与 AGENTS.md 后，
+        # 比对误报「用户级缺文件」，因为它们只对仓库有意义、装到 ~/.zcode/skills 无用途。
+        (up / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+        (up / ".github" / "workflows" / "tests.yml").write_text("on: push\n", encoding="utf-8")
+        (up / "AGENTS.md").write_text("# 开发规则\n", encoding="utf-8")
+        check(".github 与 AGENTS.md 不算漂移", main(up_argv) == 0)
 
         # 10. 本仓无副本时，权威源正确回退到独立仓库（删副本后的主场景）
         check("本仓无副本仍能工作",
