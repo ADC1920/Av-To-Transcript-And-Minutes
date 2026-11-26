@@ -491,7 +491,7 @@ def test_mcp_status_longpoll():
         try:
             server = m.build_server()
             fn = server._tool_manager.get_tool("transcribe_status").fn
-            # 已完成的任务应立即返回，不该等满 60 秒
+            # 已完成的任务应立即返回，不该等满整个等待窗口
             import time as _t
             t0 = _t.time()
             r = asyncio.run(fn("j2", wait_seconds=60))
@@ -499,7 +499,9 @@ def test_mcp_status_longpoll():
             check("已完成任务不等待", took < 2.0, f"{took:.2f}s")
             check("状态为 completed", r.status == "completed", r.status)
             check("回报实际等待时长", r.waited_seconds < 2.0, str(r.waited_seconds))
-            # wait_seconds 上限夹到 60，避免撞客户端超时
+            # 等待窗口必须夹在客户端超时线以内（ZCode 30 秒掐断，留余量取 25）
+            check("等待上限不超过客户端超时线",
+                  m.WAIT_SECONDS_MAX <= 25, str(m.WAIT_SECONDS_MAX))
             r2 = asyncio.run(fn("j2", wait_seconds=99999))
             check("超长等待被夹紧", r2.waited_seconds < 2.0, str(r2.waited_seconds))
             # 不存在的任务必须报错而不是返回空壳
@@ -634,6 +636,48 @@ def test_mcp_minutes_tools():
             check("缺 source 被拒", True)
 
 
+def test_mcp_artifact_lookup():
+    print("[17] MCP：产物定位（job_id / 素材名 / 泳道图固定名）")
+    import mcp_server as m
+
+    with tempfile.TemporaryDirectory() as td:
+        jobs = Path(td) / "jobs"
+        out = Path(td) / "out"
+        # 两个 job，各自的 timeline.html 同名——这是最容易张冠李戴的场景
+        for jid, stem in (("jobA", "alpha"), ("jobB", "beta")):
+            jd = jobs / jid
+            jd.mkdir(parents=True)
+            (jd / "job.json").write_text(json.dumps({
+                "job_id": jid, "status": "completed",
+                "source": str(out / stem / f"{stem}.wav"),
+                "output": str(out), "created_at": "2026-11-26 10:00:00",
+            }, ensure_ascii=False), encoding="utf-8")
+            (jd / "timeline.html").write_text(f"<div>{jid}</div>", encoding="utf-8")
+            (out / stem).mkdir(parents=True)
+            (out / stem / f"会议原文-{stem}.md").write_text(f"# {stem}\n", encoding="utf-8")
+
+        old = m.JOBS_DIR
+        m.JOBS_DIR = jobs
+        try:
+            # 用 job_id 必须命中自己的那份，不能被遍历顺序带偏
+            pa = m._find_artifact("jobA", ("时间轴", "timeline"), (".html",))
+            pb = m._find_artifact("jobB", ("时间轴", "timeline"), (".html",))
+            check("job_id 定位泳道图 A", pa and "jobA" in pa.read_text(encoding="utf-8"),
+                  str(pa))
+            check("job_id 定位泳道图 B", pb and "jobB" in pb.read_text(encoding="utf-8"),
+                  str(pb))
+            # 固定文件名 timeline.html 也要认（render_timeline 默认就落这个名）
+            check("认固定名 timeline.html", pa is not None and pa.name == "timeline.html")
+            # 素材名走 output 目录找成稿
+            pm = m._find_artifact("alpha", ("会议原文",), (".md",))
+            check("素材名定位成稿", pm and pm.name == "会议原文-alpha.md", str(pm))
+            # 找不到返回 None，不抛异常
+            check("找不到返回 None",
+                  m._find_artifact("不存在", ("会议原文",), (".md",)) is None)
+        finally:
+            m.JOBS_DIR = old
+
+
 def main():
     test_manifest_item()
     test_mcp_params()
@@ -651,6 +695,7 @@ def main():
     test_mcp_resources()
     test_cli_json_contract()
     test_mcp_minutes_tools()
+    test_mcp_artifact_lookup()
     print(f"\n合计 {passed + failed}，PASS {passed}，FAIL {failed}")
     return 0 if failed == 0 else 1
 

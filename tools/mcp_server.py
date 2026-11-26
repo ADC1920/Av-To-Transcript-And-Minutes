@@ -58,6 +58,12 @@ ROOT = Path(__file__).resolve().parent.parent
 PIPELINE = ROOT / "av_to_transcript_and_minutes.py"
 JOBS_DIR = Path(os.environ.get("AV2M_JOBS") or (Path.home() / ".av2m" / "jobs"))
 
+# 长轮询单次等待上限（秒）。取 25 而不是常见的 60：MCP 客户端的工具调用超时
+# 普遍在 30 秒档（ZCode 实测 30 秒即掐断），等满 60 秒会被客户端先杀掉，
+# 调用方拿到的是 timeout 错误而不是「还没完成，请继续轮询」这个有用信息。
+# 需要更长的等待就多次调用，每次都在客户端超时线以内。
+WAIT_SECONDS_MAX = 25
+
 
 if _PYDANTIC_OK:
     class TranscribeOptions(BaseModel):
@@ -450,11 +456,12 @@ def build_server():
 
         何时用：提交任务后跟进进度；或想知道任务为何失败（看 error 与 log 路径）。
         何时不用：要取转写内容用 transcribe_result——本工具只回状态，不回逐段文本。
-        长轮询：wait_seconds 大于 0 时最多等这么久（内部夹到 60 秒，避免撞客户端调用超时），
-        任务提前结束就提前返回。默认 0 即立即返回，与旧行为一致。
+        长轮询：wait_seconds 大于 0 时最多等这么久，任务提前结束就提前返回。
+        上限按客户端能力收紧到 25 秒——2026-11-26 在 ZCode 实测：设 60 秒时
+        客户端 30 秒就掐断调用并报 timeout，等待全白费。默认 0 即立即返回。
         状态取值：queued / running / completed / failed / cancelled。
         """
-        wait = max(0, min(int(wait_seconds or 0), 60))
+        wait = max(0, min(int(wait_seconds or 0), WAIT_SECONDS_MAX))
         started = time.time()
         data = read_job(job_id)
         if not data:
@@ -735,23 +742,40 @@ def build_server():
 def _find_artifact(stem: str, prefixes, exts):
     """找某个素材的产物文件，返回第一个命中的路径。
 
+    stem 既可以是素材名（如 dialog），也可以是 job_id（如 5d94993214d2a69a）——
+    agent 手里通常只有 job_id，而素材名要自己从路径里推。两种都认。
+
     查找顺序：先把每个 job 的 output 目录纳入候选（成稿真正落地的地方），
     再加上 jobs 目录自身（泳道图等 MCP 生成物落在这里）。
     """
-    bases = []
-    if JOBS_DIR.is_dir():
-        for d in JOBS_DIR.iterdir():
-            if not d.is_dir():
-                continue
-            bases.append(d)                          # 泳道图等 MCP 直出物
-            jf = d / "job.json"
-            if jf.is_file():
-                try:
-                    o = json.loads(jf.read_text(encoding="utf-8")).get("output")
-                    if o and Path(o).is_dir():
-                        bases.append(Path(o))        # 成稿真正所在的输出目录
-                except ValueError:
-                    pass
+    # job_id 形态的 stem：直接命中该 job 目录，避免遍历时拿到别的任务的同名产物
+    # （timeline.html 在每个 job 目录里都叫这个名字，顺序遍历必然张冠李戴）
+    exact = JOBS_DIR / stem
+    if exact.is_dir():
+        bases = [exact]
+        jf = exact / "job.json"
+        if jf.is_file():
+            try:
+                o = json.loads(jf.read_text(encoding="utf-8")).get("output")
+                if o and Path(o).is_dir():
+                    bases.append(Path(o))
+            except ValueError:
+                pass
+    else:
+        bases = []
+        if JOBS_DIR.is_dir():
+            for d in JOBS_DIR.iterdir():
+                if not d.is_dir():
+                    continue
+                bases.append(d)                      # 泳道图等 MCP 直出物
+                jf = d / "job.json"
+                if jf.is_file():
+                    try:
+                        o = json.loads(jf.read_text(encoding="utf-8")).get("output")
+                        if o and Path(o).is_dir():
+                            bases.append(Path(o))    # 成稿真正所在的输出目录
+                    except ValueError:
+                        pass
     for base in bases:
         for sub in (base / stem, base):
             if not sub.is_dir():
@@ -761,11 +785,13 @@ def _find_artifact(stem: str, prefixes, exts):
                     p = sub / f"{pre}-{stem}{ext}"
                     if p.is_file():
                         return p
-            # 泳道图没有固定前缀，认 <stem>.html
+            # 泳道图没有固定命名：render_timeline 落到 job 目录下叫 timeline.html，
+            # 也可能用户指定了 <stem>.html。两个都认，否则资源永远读不到。
             if "timeline" in prefixes:
-                p2 = sub / f"{stem}.html"
-                if p2.is_file():
-                    return p2
+                for name in (f"{stem}.html", "timeline.html"):
+                    p2 = sub / name
+                    if p2.is_file():
+                        return p2
     return None
 
 
