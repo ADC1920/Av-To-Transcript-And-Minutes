@@ -420,6 +420,23 @@ VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts",
               ".wmv", ".m4v", ".3gp", ".mpg", ".mpeg"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma", ".amr"}
 MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS
+
+# 退出码分区：给程序消费（--json、MCP、CI）用稳定契约，一旦发布不得改名或改值。
+# 0 成功 / 1 有素材失败 / 2 参数错误 / 20 输入不存在 / 30 参数互斥冲突。
+# 参考 gh CLI 的做法：只定义少数几档并明确「单个命令可能另有细分」，不做穷举。
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_INPUT_MISSING = 20
+EXIT_CONFLICT = 30
+
+# 错误码 → 建议动作。--json 模式下随错误一起返回，让 agent 知道下一步该改什么。
+ERROR_HINTS = {
+    EXIT_USAGE: "检查参数拼写与取值；加 --help 看完整参数表",
+    EXIT_INPUT_MISSING: "确认路径存在；目录模式下确认里面有受支持的音视频文件",
+    EXIT_CONFLICT: "去掉互斥参数中的一个；--meeting 与 --no-diarize 不能同时使用",
+    EXIT_FAILED: "看 items 里各素材的 error 与 artifacts；单素材失败不影响其余素材",
+}
 # 源音轨编码 → 无损 copy 时的容器扩展名（codec 名不带点；aac 之外的冷门编码落 mka 万能容器）
 AUDIO_EXT = {"aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
              "opus": ".opus", "vorbis": ".ogg", "ac3": ".ac3", "eac3": ".eac3"}
@@ -827,6 +844,18 @@ def call_asr(vocals: Path, opts: dict, force: bool = False, tag: str = None):
     # 写缓存后统一再过一遍覆盖：子进程按 --names 写好了 spk_name，但分轨与云端
     # 通道各有自己的赋值路径，这里以 spk 下标为准收口，避免不同通道行为不一致。
     return apply_name_overrides(payload, opts.get("names"))
+
+
+def emit_error(json_out: bool, code: int, message: str) -> None:
+    """统一错误输出：--json 模式打结构化错误对象到 stdout，否则维持原有中文提示。
+    错误体含 code 与 suggestion，agent 不必解析人话就能决定下一步。"""
+    hint = ERROR_HINTS.get(code, "")
+    if json_out:
+        # 这些错误点都发生在 stdout 改道之前，所以直接写当前 stdout 即可
+        print(json.dumps({"error": True, "code": code, "message": message,
+                          "suggestion": hint}, ensure_ascii=False), flush=True)
+    else:
+        print(message, file=sys.stderr)
 
 
 def manifest_item(media: Path, out_dir: Path, status: str, detail, seconds: float) -> dict:
@@ -1643,9 +1672,15 @@ def main():
                          "裸写或 auto=根目录 replace_dict.txt")
     ap.add_argument("--replace-save", nargs="?", const="auto", default=None,
                     help="把本次纠错条目合并写回词典（裸写或 auto=根目录 replace_dict.txt，键同新值覆盖）")
+    ap.add_argument("--json", action="store_true", dest="json_out",
+                    help="把运行结果打成单个 JSON 对象输出到 stdout（供 agent / 脚本消费）；"
+                         "进度与日志仍走 stderr，人类可读输出默认不变。"
+                         "退出码固定：0 成功 / 1 有素材失败 / 2 参数错误 / 20 输入不存在 / 30 参数冲突")
     args = ap.parse_args()
     if args.meeting and args.no_diarize:
-        sys.exit("--meeting 需要说话人分离产出说话人标签，不能与 --no-diarize 同用")
+        emit_error(args.json_out, EXIT_CONFLICT,
+                   "--meeting 需要说话人分离产出说话人标签，不能与 --no-diarize 同用")
+        return EXIT_CONFLICT
 
     if args.watch:
         # 监视模式下本进程只做投递：把本次除 input/--watch 外的全部参数原样透传给
@@ -1661,6 +1696,10 @@ def main():
                 continue
             if tok.startswith("--watch="):
                 continue
+            # --json 是本次调用的输出契约，不该透传给每个子进程——
+            # 否则子进程各自往 stdout 打 JSON，watch 主进程的输出就乱了。
+            if tok == "--json":
+                continue
             if not tok.startswith("-") and Path(tok) == Path(args.watch):
                 continue   # 位置参数（若用户同时给了 input 且等于 watch 目录）
             passthrough.append(tok)
@@ -1670,12 +1709,14 @@ def main():
         ap.error("缺少输入：请给出文件/文件夹，或用 --watch DIR 进入监视模式")
     src = Path(args.input)
     if not src.exists():
-        sys.exit(f"输入不存在：{src}")
+        emit_error(args.json_out, EXIT_INPUT_MISSING, f"输入不存在：{src}")
+        return EXIT_INPUT_MISSING
     out_dir = Path(args.output) if args.output else (
         src.parent / "separated_out" if src.is_file() else src / "separated_out")
     if src.is_file():
         if src.suffix.lower() not in MEDIA_EXTS:
-            sys.exit(f"不支持的文件类型：{src.suffix}")
+            emit_error(args.json_out, EXIT_USAGE, f"不支持的文件类型：{src.suffix}")
+            return EXIT_USAGE
         medias = [src]
     else:
         # 排除输出目录：默认输出就落在输入目录下的 separated_out，其拆轨产物
@@ -1689,7 +1730,8 @@ def main():
             p for p in src.rglob("*")
             if p.suffix.lower() in MEDIA_EXTS and not _is_under(p, out_abs))
     if not medias:
-        sys.exit("没找到视频/音频文件")
+        emit_error(args.json_out, EXIT_INPUT_MISSING, "没找到视频/音频文件")
+        return EXIT_INPUT_MISSING
 
     # auto：会议模式走 pyannote（重叠语音更准），其余走 campp（轻量）。
     # pyannote 未安装时回落 campp 并提示——否则 --meeting 会在子进程里
@@ -1770,7 +1812,9 @@ def main():
         extra += split_asr_extra(args.asr_extra)
     for bad in RESERVED_ASR_ARGS:
         if bad in extra:
-            sys.exit(f"--asr-extra 不允许传入管线保留参数：{bad}")
+            emit_error(args.json_out, EXIT_USAGE,
+                       f"--asr-extra 不允许传入管线保留参数：{bad}")
+            return EXIT_USAGE
     opts = {"threshold": args.threshold, "diarize_engine": diarize_engine,
             "hotwords": args.hotwords, "names": args.names, "srt": args.srt, "vtt": args.vtt,
             "engine": args.asr_engine if args.asr_engine != "qwen" else None,
@@ -1785,6 +1829,12 @@ def main():
             "max_line": args.max_line,
             # 低置信度标记阈值：纯渲染层参数，不进缓存键（改阈值不该触发重转）
             "low_conf_mark": None if args.no_conf_mark else args.low_conf_mark}
+
+    # --json 模式：stdout 只允许出现最后那一个 JSON 对象，其余人类可读输出全部改道 stderr。
+    # 不这么做的话 agent 拿到的 stdout 会混着进度行，管道给 jq 直接解析失败。
+    json_stdout = sys.stdout if args.json_out else None
+    if args.json_out:
+        sys.stdout = sys.stderr
 
     # 日志落盘：终端与 run.log 双写，批量跑完还能回溯
     log_path = None
@@ -1864,6 +1914,7 @@ def main():
 
     # 运行清单：把本次结果写成机器可读的一份记录，供后续索引、报表与 MCP 查询使用。
     # 写盘失败不影响已产出的成稿，只提示一行。
+    manifest = None
     try:
         manifest = {
             "schema_version": 1,
@@ -1892,11 +1943,31 @@ def main():
         sys.stderr = sys.stderr.streams[0]
         log_handle.close()
         print(f"[日志] 已写入 {log_path}")
-
     # 退出码反映是否有素材失败：批量里个别失败仍会产出其余成稿（不该整批算崩），
     # 但调用方（脚本 / CI / --watch 子进程）必须能靠退出码区分「全成功」与「有失败」。
     # 部分成功的语义是「产出了部分结果但未全成」，统一按 1 返回。
-    return 1 if (fail or invalid) else 0
+    rc = EXIT_FAILED if (fail or invalid) else EXIT_OK
+
+    # --json：把本次运行结果作为单个 JSON 对象打到 stdout，供 agent / 脚本直接消费。
+    # 与 manifest.json 内容同源（同一个 dict），不另算一套，避免两处口径漂移。
+    if args.json_out:
+        payload = dict(manifest) if manifest else {
+            "schema_version": 1, "duration_seconds": round(elapsed, 1),
+            "output_dir": str(out_dir),
+            "summary": {"completed": ok, "redocx": redocx, "resrt": resrt,
+                        "novoice": novoice, "skipped": skip, "failed": fail,
+                        "no_audio_track": invalid},
+            "items": items,
+        }
+        payload["exit_code"] = rc
+        payload["success"] = rc == EXIT_OK
+        if rc != EXIT_OK:
+            payload["suggestion"] = ERROR_HINTS.get(EXIT_FAILED, "")
+        # 写到被改道之前的原始 stdout；此时 sys.stdout 可能仍指向 stderr 或 _Tee
+        print(json.dumps(payload, ensure_ascii=False),
+              file=json_stdout or sys.stdout, flush=True)
+
+    return rc
 
 
 if __name__ == "__main__":
