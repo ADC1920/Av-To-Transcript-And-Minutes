@@ -310,6 +310,326 @@ def test_minutes_eval():
     check("selftest 入口可跑", callable(me.selftest))
 
 
+def test_mcp_options_model():
+    print("[10] MCP：options 有类型模型（schema 自描述）")
+    import mcp_server as m
+
+    # 模型字段数必须与命令行映射表一致，否则漏字段会静默丢弃参数
+    check("字段数与白名单一致",
+          len(m.TranscribeOptions.model_fields) == len(m._ALLOWED_OPTIONS))
+    check("所有字段都有映射",
+          set(m.TranscribeOptions.model_fields) == set(m._BOOL_FLAGS) | set(m._VALUE_FLAGS))
+
+    # 枚举必须收敛，否则 agent 传错值要到运行时才发现
+    schema = m.TranscribeOptions.model_json_schema()
+    asr = schema["properties"]["asr_engine"]
+    enum_vals = next((x["enum"] for x in asr.get("anyOf", []) if "enum" in x), None)
+    check("asr_engine 枚举进 schema", enum_vals == ["qwen", "aed", "auto", "cloud"], str(enum_vals))
+    check("禁止额外字段", schema.get("additionalProperties") is False)
+
+    # 拼错的键在模型层被拒
+    try:
+        m.TranscribeOptions(拼错的键=True)
+        check("模型拒绝未知字段", False)
+    except Exception:
+        check("模型拒绝未知字段", True)
+
+    # to_cli 只保留显式设置项：不传与传 False 必须区分开
+    check("空模型不产生参数", m.TranscribeOptions().to_cli() == {})
+    check("显式 True 产生参数", m.TranscribeOptions(meeting=True).to_cli() == {"meeting": True})
+    check("显式 False 不产生参数", m.TranscribeOptions(meeting=False).to_cli() == {})
+    check("带值参数保留", m.TranscribeOptions(num_speakers=2).to_cli() == {"num_speakers": 2})
+
+    # 互斥组合必须在提交时拒绝。否则 transcribe_start 已返回 job_id，
+    # agent 要轮询到 failed 才知道参数错，而原因埋在 run.log 里。
+    for kw, label in (
+        ({"meeting": True, "no_diarize": True}, "meeting 与 no_diarize 互斥"),
+        ({"min_speakers": 5, "max_speakers": 2}, "min>max 被拒"),
+        ({"num_speakers": 2, "min_speakers": 1}, "num 与区间同时给被拒"),
+    ):
+        try:
+            m.TranscribeOptions(**kw)
+            check(label, False, str(kw))
+        except Exception:
+            check(label, True)
+    # 合法组合不能被误伤
+    check("meeting + num_speakers 合法",
+          m.TranscribeOptions(meeting=True, num_speakers=2).to_cli()
+          == {"meeting": True, "num_speakers": 2})
+    check("min/max 区间合法",
+          m.TranscribeOptions(min_speakers=2, max_speakers=4).to_cli()
+          == {"min_speakers": 2, "max_speakers": 4})
+
+
+def _has_mcp_sdk():
+    """CI 的最小 job 不装 mcp；没有它就跳过需要起 server 的用例，而不是报 FAIL。"""
+    try:
+        import mcp  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def test_mcp_tool_contracts():
+    print("[11] MCP：工具契约面（schema / 注解 / 描述）")
+    import mcp_server as m
+
+    if not _has_mcp_sdk():
+        print("  SKIP 未安装 mcp SDK（uv sync --extra mcp）")
+        return
+
+    server = m.build_server()
+    tools = server._tool_manager.list_tools()
+    check("工具数 10 个", len(tools) == 10, str(len(tools)))
+
+    names = {t.name for t in tools}
+    check("含纪要导出工具", "export_minutes" in names)
+    check("含纪要评测工具", "eval_minutes" in names)
+
+    # 每个工具都必须有 outputSchema 与注解——这是 agent 能可靠消费的前提
+    no_schema = [t.name for t in tools if not t.output_schema]
+    no_ann = [t.name for t in tools if not t.annotations]
+    check("全部工具都有 outputSchema", not no_schema, str(no_schema))
+    check("全部工具都有 annotations", not no_ann, str(no_ann))
+
+    # 只读工具必须标 readOnlyHint，写工具不能误标
+    by_name = {t.name: t for t in tools}
+    readonly = {"transcribe_status", "transcribe_result", "transcribe_list",
+                "search_meetings", "eval_minutes"}
+    for n in readonly:
+        check(f"{n} 标为只读", by_name[n].annotations.readOnlyHint is True)
+    check("transcribe_cancel 标为破坏性",
+          by_name["transcribe_cancel"].annotations.destructiveHint is True)
+    check("transcribe_start 标为幂等",
+          by_name["transcribe_start"].annotations.idempotentHint is True)
+
+    # 描述必须够长且写明「何时不用」——短描述是 agent 选错工具的主因
+    short = [(t.name, len(t.description or "")) for t in tools if len(t.description or "") < 100]
+    check("描述均超过 100 字符", not short, str(short))
+    lacks_when_not = [t.name for t in tools if "何时不用" not in (t.description or "")]
+    check("描述都写了何时不用", not lacks_when_not, str(lacks_when_not))
+
+    # transcribe_start 的 options 必须展开成完整字段定义，而不是裸 dict
+    ts = by_name["transcribe_start"]
+    defs = ts.parameters.get("$defs") or {}
+    opts = defs.get("TranscribeOptions") or {}
+    check("options 展开为具名字段", len(opts.get("properties") or {}) == 22,
+          str(len(opts.get("properties") or {})))
+    check("options 禁止额外字段", opts.get("additionalProperties") is False)
+
+
+def test_mcp_result_pagination_note():
+    print("[12] MCP：分页语义（has_more 与不可截断提示）")
+    import mcp_server as m
+
+    if not _has_mcp_sdk():
+        print("  SKIP 未安装 mcp SDK（uv sync --extra mcp）")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        jobs = Path(td) / "jobs"
+        src = Path(td) / "m.wav"
+        src.write_bytes(b"x" * 2000)
+        out = Path(td) / "out"
+        (out / "m").mkdir(parents=True)
+        lines = [{"spk": 1, "spk_name": "甲", "start_ms": i * 1000,
+                  "end_ms": i * 1000 + 900, "text": f"第{i}句"} for i in range(250)]
+        (out / "m" / "转写结果-m.json").write_text(
+            json.dumps({"lines": lines, "speakers": ["甲"]}, ensure_ascii=False),
+            encoding="utf-8")
+        jdir = jobs / "job1"
+        jdir.mkdir(parents=True)
+        (jdir / "job.json").write_text(json.dumps({
+            "job_id": "job1", "status": "completed", "source": str(src),
+            "output": str(out), "created_at": "2026-11-26 10:00:00",
+        }, ensure_ascii=False), encoding="utf-8")
+
+        old = m.JOBS_DIR
+        m.JOBS_DIR = jobs
+        try:
+            server = m.build_server()
+            fn = server._tool_manager.get_tool("transcribe_result").fn
+            r1 = fn("job1")                      # 默认 200 段，总量 250
+            check("首页标记 has_more", r1.has_more is True)
+            check("首页给 next_offset", r1.next_offset == 200, str(r1.next_offset))
+            check("首页提示未拉完", "未拉完" in r1.note or "还有" in r1.note, r1.note)
+            check("首页提示不要断言未讨论", "未讨论" in r1.note, r1.note)
+            r2 = fn("job1", offset=200)
+            check("末页 has_more 为假", r2.has_more is False)
+            check("末页无 next_offset", r2.next_offset is None)
+            check("末页提示可总结", "可以基于" in r2.note, r2.note)
+            check("总段数正确", r2.total == 250, str(r2.total))
+            check("末页段数正确", len(r2.segments) == 50, str(len(r2.segments)))
+        finally:
+            m.JOBS_DIR = old
+
+
+def test_mcp_status_longpoll():
+    print("[13] MCP：状态查询有界长轮询")
+    import asyncio
+    import mcp_server as m
+
+    if not _has_mcp_sdk():
+        print("  SKIP 未安装 mcp SDK（uv sync --extra mcp）")
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        jobs = Path(td) / "jobs"
+        jdir = jobs / "j2"
+        jdir.mkdir(parents=True)
+        (jdir / "job.json").write_text(json.dumps({
+            "job_id": "j2", "status": "completed", "source": "a.wav",
+            "created_at": "2026-11-26 10:00:00", "finished_at": "2026-11-26 10:01:00",
+            "exit_code": 0}, ensure_ascii=False), encoding="utf-8")
+
+        old = m.JOBS_DIR
+        m.JOBS_DIR = jobs
+        try:
+            server = m.build_server()
+            fn = server._tool_manager.get_tool("transcribe_status").fn
+            # 已完成的任务应立即返回，不该等满 60 秒
+            import time as _t
+            t0 = _t.time()
+            r = asyncio.run(fn("j2", wait_seconds=60))
+            took = _t.time() - t0
+            check("已完成任务不等待", took < 2.0, f"{took:.2f}s")
+            check("状态为 completed", r.status == "completed", r.status)
+            check("回报实际等待时长", r.waited_seconds < 2.0, str(r.waited_seconds))
+            # wait_seconds 上限夹到 60，避免撞客户端超时
+            r2 = asyncio.run(fn("j2", wait_seconds=99999))
+            check("超长等待被夹紧", r2.waited_seconds < 2.0, str(r2.waited_seconds))
+            # 不存在的任务必须报错而不是返回空壳
+            try:
+                asyncio.run(fn("nope"))
+                check("未知任务报错", False)
+            except ValueError:
+                check("未知任务报错", True)
+        finally:
+            m.JOBS_DIR = old
+
+
+def test_mcp_resources():
+    print("[14] MCP：成稿资源模板")
+    import mcp_server as m
+    if not _has_mcp_sdk():
+        print("  SKIP 未安装 mcp SDK（uv sync --extra mcp）")
+        return
+    server = m.build_server()
+    templates = server._resource_manager.list_templates()
+    check("三个资源模板", len(templates) == 3, str(len(templates)))
+    uris = []
+    for t in templates:
+        uri = getattr(t, "uri_template", None) or getattr(t, "uriTemplate", "")
+        uris.append(str(uri))
+    joined = " ".join(uris)
+    check("含 transcript 资源", "transcript" in joined, joined)
+    check("含 minutes 资源", "minutes" in joined, joined)
+    check("含 timeline 资源", "timeline" in joined, joined)
+
+
+def test_cli_json_contract():
+    print("[15] CLI：--json 与退出码契约")
+    sys.path.insert(0, str(ROOT))
+    import importlib
+    import av_to_transcript_and_minutes as av
+    importlib.reload(av)
+
+    # 退出码分区必须稳定且互不相同
+    codes = {av.EXIT_OK, av.EXIT_FAILED, av.EXIT_USAGE,
+             av.EXIT_INPUT_MISSING, av.EXIT_CONFLICT}
+    check("退出码五档互不相同", len(codes) == 5, str(sorted(codes)))
+    check("每档都有建议动作",
+          all(c in av.ERROR_HINTS for c in (av.EXIT_USAGE, av.EXIT_INPUT_MISSING,
+                                            av.EXIT_CONFLICT, av.EXIT_FAILED)))
+
+    # 用子进程验证真实行为：不模拟，直接跑入口
+    import subprocess
+    entry = str(ROOT / "av_to_transcript_and_minutes.py")
+
+    def run(*argv):
+        return subprocess.run([sys.executable, entry, *argv],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", cwd=str(ROOT))
+
+    r = run("/definitely/not/here.wav", "--json")
+    check("输入不存在退出码 20", r.returncode == 20, str(r.returncode))
+    try:
+        payload = json.loads(r.stdout)
+        check("stdout 是合法 JSON", True)
+        check("错误体含 code", payload.get("code") == 20, str(payload.get("code")))
+        check("错误体含 suggestion", bool(payload.get("suggestion")))
+        check("错误体标 error", payload.get("error") is True)
+    except ValueError:
+        check("stdout 是合法 JSON", False, r.stdout[:120])
+
+    r2 = run(str(ROOT / "README.md"), "--meeting", "--no-diarize", "--json")
+    check("参数冲突退出码 30", r2.returncode == 30, str(r2.returncode))
+    check("冲突错误体可解析", "code" in r2.stdout and "30" in r2.stdout, r2.stdout[:120])
+
+    r3 = run(str(ROOT / "README.md"), "--json")
+    check("不支持类型退出码 2", r3.returncode == 2, str(r3.returncode))
+
+    # 无 --json 时保持原有行为：错误走 stderr，stdout 为空
+    r4 = run("/definitely/not/here.wav")
+    check("默认模式不进 JSON", r4.stdout.strip() == "", r4.stdout[:80])
+    check("默认模式错误在 stderr", "不存在" in r4.stderr, r4.stderr[:80])
+
+    # --watch 模式下 --json 不该透传给子进程，否则每个子进程各自往 stdout 打 JSON。
+    # 直接验透传过滤逻辑，不启常驻进程（watch 是死循环，起进程测会挂住）。
+    import inspect
+    src = inspect.getsource(av.main)
+    check("watch 分支显式排除 --json", 'if tok == "--json"' in src, "")
+
+
+def test_mcp_minutes_tools():
+    print("[16] MCP：纪要导出与评测工具（真实样例）")
+    import mcp_server as m
+
+    sample = ROOT / "samples" / "会议纪要.md"
+    if not sample.is_file():
+        print("  SKIP 缺少 samples/会议纪要.md")
+        return
+    if not _has_mcp_sdk():
+        print("  SKIP 未安装 mcp SDK（uv sync --extra mcp）")
+        return
+
+    server = m.build_server()
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "minutes.json"
+        # 导出：必须真产出 JSON 且计数回填，agent 不必解析 stdout
+        fn = server._tool_manager.get_tool("export_minutes").fn
+        r = fn(minutes=str(sample), out=str(out))
+        check("导出退出码 0", r.exit_code == 0, str(r.exit_code))
+        check("导出文件存在", r.exported and out.is_file())
+        check("待办计数已回填", r.action_items > 0, str(r.action_items))
+        check("决策计数已回填", r.decisions > 0, str(r.decisions))
+        check("节数已回填", r.sections > 0, str(r.sections))
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        check("导出内容含 action_items", "action_items" in payload)
+
+        # 评测：gate=false 时 verdict 与 exit_code 解耦，必须看 verdict
+        ev = server._tool_manager.get_tool("eval_minutes").fn
+        r2 = ev(minutes=str(sample), source=str(sample), gate=False)
+        check("评测返回 verdict", r2.verdict in ("pass", "fail"), str(r2.verdict))
+        check("评测给 metrics", bool(r2.metrics))
+        check("评测列 unjudged", len(r2.unjudged) >= 3, str(len(r2.unjudged)))
+        check("非 gate 模式退出码不反映合格与否",
+              r2.exit_code == 0 or r2.verdict == "fail", "")
+
+        # gate=true 时 verdict 与退出码必须一致
+        r3 = ev(minutes=str(sample), source=str(sample), gate=True)
+        expect = 0 if r3.verdict == "pass" else 1
+        check("gate 模式退出码与 verdict 一致",
+              r3.exit_code == expect, f"exit={r3.exit_code} verdict={r3.verdict}")
+
+        # 缺 source 必须明确报错，不能悄悄算出错误指标
+        try:
+            ev(minutes=str(sample))
+            check("缺 source 被拒", False)
+        except ValueError:
+            check("缺 source 被拒", True)
+
+
 def main():
     test_manifest_item()
     test_mcp_params()
@@ -320,6 +640,13 @@ def main():
     test_fmt_ts()
     test_minutes_quality()
     test_minutes_eval()
+    test_mcp_options_model()
+    test_mcp_tool_contracts()
+    test_mcp_result_pagination_note()
+    test_mcp_status_longpoll()
+    test_mcp_resources()
+    test_cli_json_contract()
+    test_mcp_minutes_tools()
     print(f"\n合计 {passed + failed}，PASS {passed}，FAIL {failed}")
     return 0 if failed == 0 else 1
 

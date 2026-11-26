@@ -21,7 +21,7 @@ jobs:
       - name: 安装最小依赖
         run: pip install numpy
       - name: 语法检查（全部脚本）
-        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tools/*.py skills/funasr-transcribe/scripts/*.py
+        run: python -m py_compile av_to_transcript_and_minutes.py test_pipeline_e2e.py benchmark_quality.py scripts/make_fixtures.py tests/test_quality_baseline.py tests/test_tools_units.py tests/test_mcp_e2e.py tools/*.py skills/funasr-transcribe/scripts/*.py
       - name: tools 工具单测（清单/MCP 参数/索引/泳道图，零依赖）
         run: python tests/test_tools_units.py
       - name: ITN 单测（零依赖）
@@ -63,6 +63,21 @@ jobs:
         run: python tools/minutes_quality.py --selftest
       - name: 纪要质量评测基准自检
         run: python tools/minutes_eval.py --selftest
+
+  # MCP 契约job：装 mcp SDK，真起 stdio 子进程走 JSON-RPC 握手。
+  # 只在装了 SDK 的环境验——主 job 里那 5 组 MCP 用例会 SKIP，
+  # 协议层契约（outputSchema/annotations/resources 能否被客户端看见）只有这里能证明。
+  mcp-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 MCP SDK
+        run: pip install mcp
+      - name: MCP stdio 握手与工具调用
+        run: python tests/test_mcp_e2e.py
 
   # 引擎单测job：装 funasr（Linux 上自动带 CPU torch）+ soundfile，跑 51 项纯函数单测
   engine-units:

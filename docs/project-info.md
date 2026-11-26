@@ -6,7 +6,7 @@
 
 - `av_to_transcript_and_minutes.py`：主入口。负责拆轨（ffmpeg）、人声分离（demucs）、调用转写引擎、组稿与 docx 排版。
 - `skills/funasr-transcribe/scripts/qwen_asr.py`：转写引擎。四选一：`qwen`（本地 Qwen3-ASR）、`aed`（本地 FireRedASR2-AED）、`cloud`（阿里云百炼）、`auto`（按语言路由）。
-- `skills/meeting-notes-expert/`：纪要提炼技能，含七节模板与 `validate_minutes.py` 结构校验器。
+- 纪要提炼技能：**独立仓库** `github.com/ADC1920/meeting-notes-expert`，含七节模板与 `validate_minutes.py` 结构校验器。本仓不携带副本，按 `MEETING_SKILL_DIR` → 用户级目录依次定位，未安装时降级。
 
 关键分层：**识别可上云，说话人分离始终在本地**。`--meeting` 或带说话人的转写依赖本地 funasr VAD + cam++ 声纹聚类；`--no-diarize` 单人场景才有纯云端轻量路径。
 
@@ -110,7 +110,11 @@ job 状态落 `~/.av2m/jobs/<job_id>/job.json`（可用 `AV2M_JOBS` 覆盖），
 - 第二轮复核（v2.6 后，含调研论断对账与新增否决项）：`docs/landscape-2026-11-r2.md`
 - 云端引擎接口细节：`skills/funasr-transcribe/scripts/qwen_asr.py` 头部注释（含三通道实测记录）
 - 说话人分离算法：同文件 `run_vad` / cam++ 聚类段
-- 纪要模板与校验规则：`skills/meeting-notes-expert/SKILL.md` 与 `references/minutes-schema.json`
+- 纪要模板与校验规则：独立仓库 `github.com/ADC1920/meeting-notes-expert` 的 `SKILL.md` 与
+  `references/minutes-schema.json`（用户级安装于 `~/.zcode/skills/meeting-notes-expert`）
+- 第三轮调研（纪要质量闭环）：`docs/landscape-2026-11-r3.md`
+- 第四轮调研（输出范式字段层）：`docs/landscape-2026-11-r4.md`
+- 第五轮调研（agent 调用面）：`docs/landscape-2026-11-r5.md`
 
 ## 参考资源
 

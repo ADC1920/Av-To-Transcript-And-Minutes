@@ -242,7 +242,28 @@ python tools/mcp_server.py
 
 跨会议检索用 trigram 而不是 unicode61：中文没有词边界，unicode61 会把整句当成一个大 token，子串查询永远命中不了。trigram 按三字滑窗建索引，三字及以上任意子串可匹配，两字退到 LIKE 扫描。
 
-MCP 暴露 8 个工具：`transcribe_start/status/result/cancel/list`、`search_meetings`、`index_meetings`、`render_timeline`。`transcribe_start` 立即返回 `job_id` 不阻塞，状态落 `~/.av2m/jobs/`（`AV2M_JOBS` 可覆盖），进程重启后仍可查。幂等键是输入内容哈希加参数哈希，同一文件同一参数重复提交直接复用。参数只接受白名单，拼错的键会被拒，不会静默忽略。
+MCP 暴露 10 个工具，覆盖从投递到验收的完整链路：
+
+| 工具 | 用途 |
+|---|---|
+| `transcribe_start` | 提交转写，立即返回 `job_id`；同内容同参数幂等复用 |
+| `transcribe_status` | 查状态，`wait_seconds` 可做有界长轮询（内部夹到 60 秒） |
+| `transcribe_result` | 分页取逐段结果，返回 `has_more` 与「未拉完不得总结」硬提示 |
+| `transcribe_cancel` / `transcribe_list` | 取消任务、列出最近任务 |
+| `search_meetings` / `index_meetings` | 跨会议 FTS5 检索与建索引 |
+| `render_timeline` | 说话人泳道图 HTML |
+| `export_minutes` | 纪要结构化导出成 JSON（待办、决策、各节） |
+| `eval_minutes` | 纪要质量门禁（编造数字、溯源率、必填节、出处覆盖） |
+
+三个设计要点：
+
+- **参数自描述**。`transcribe_start` 的 `options` 是 Pydantic 模型，22 个字段的类型与合法枚举值全部进 `inputSchema`，`additionalProperties: false`。agent 拼错参数在 schema 校验阶段就失败，不必等运行时。
+- **结构化输出**。每个工具声明 `outputSchema` 并返回结构化结果，字段名是稳定契约。工具还带 `readOnlyHint`/`destructiveHint`/`idempotentHint` 注解，将来要做只读模式可直接按注解过滤注册。
+- **大结果不塞上下文**。成稿挂在 `meeting://{stem}/transcript`、`/minutes`、`/timeline` 三个资源模板上，agent 按需读取；逐段内容用分页，不会把上万字稿件一次压进对话。
+
+`transcribe_start` 状态落 `~/.av2m/jobs/`（`AV2M_JOBS` 可覆盖），进程重启后仍可查。幂等键是输入内容哈希加参数哈希。参数只接受白名单，拼错的键会被拒。
+
+CLI 侧加 `--json`：stdout 只出一个可被 `jq .` 解析的 JSON 对象（进度与日志走 stderr），退出码固定为 `0` 成功 / `1` 有素材失败 / `2` 参数错误 / `20` 输入不存在 / `30` 参数冲突，错误体含 `code` 与 `suggestion`。不带 `--json` 时人类可读输出与旧版完全一致。
 
 `minutes_eval.py` 只做能机械判定的指标。语义忠实度、无依据量化、说话人张冠李戴三类必须读语义，机械判定会把同义改写误判成编造，故列入报告的 `unjudged` 字段，不参与门禁。
 
@@ -259,7 +280,7 @@ Av-To-Transcript-And-Minutes/
 ├── requirements.txt                  兼容入口
 ├── docs/
 │   ├── project-info.md               架构、模块表、本机环境与显存边界
-│   ├── landscape-2026-11*.md         四轮同类项目与模型格局调研
+│   ├── landscape-2026-11*.md         五轮同类项目与模型格局调研
 │   ├── optimization-roadmap-2026-11.md
 │   ├── impl-plan-2026-11-r4.md
 │   └── design-specs/                 设计规格档
@@ -275,7 +296,8 @@ Av-To-Transcript-And-Minutes/
 │   └── mcp_server.py
 ├── tests/
 │   ├── test_quality_baseline.py
-│   └── test_tools_units.py
+│   ├── test_tools_units.py           工具层纯逻辑 + MCP 契约面（125 项）
+│   └── test_mcp_e2e.py               MCP stdio 真实握手与工具调用（21 项）
 ├── skills/
 │   └── funasr-transcribe/            转写技能与引擎
 │       ├── SKILL.md
