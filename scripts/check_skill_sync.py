@@ -73,6 +73,11 @@ def digest(path: Path) -> str:
     return hashlib.md5(norm_bytes(path.read_bytes())).hexdigest()
 
 
+def ver_tuple(v: str) -> tuple:
+    """版本号转可比较元组；非数字段忽略，空串返回 ()（不参与比较）。"""
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
 def read_version(skill_dir: Path) -> str:
     """从 SKILL.md frontmatter 读 version，读不到返回空串（不拦，只提示）。"""
     skill_md = skill_dir / "SKILL.md"
@@ -213,6 +218,18 @@ def selftest() -> int:
               main(["--repo-root", str(base / "empty-repo"), "--user-root", str(user_root),
                     "--upstream-root", str(up)]) == 0)
 
+        # 11. 用户级版本反超权威源时，--fix 必须拒绝（否则静默降级）
+        # 2026-11-26 实测：本机独立仓库停在 v1.15.1、用户级已到 v1.17.1，
+        # 若不拦，--fix 会把用户级三个版本的新改动全部覆盖回旧版。
+        (user_skill / "SKILL.md").write_text(
+            '---\nname: t\nmetadata:\n  version: "2.0.0"\n---\n# 用户级已更新\n', encoding="utf-8")
+        user_before = (user_skill / "SKILL.md").read_text(encoding="utf-8")
+        check("用户级领先时 --fix 应拒绝并 exit 1", main(up_argv + ["--fix"]) == 1)
+        check("拒绝后用户级文件未被改写",
+              (user_skill / "SKILL.md").read_text(encoding="utf-8") == user_before)
+        (user_skill / "SKILL.md").write_text(
+            '---\nname: t\nmetadata:\n  version: "1.0.0"\n---\n# t\n', encoding="utf-8")
+
     print(f"\nSELFTEST {'PASS' if not failed else 'FAIL'}（{passed} 通过 / {failed} 失败）")
     return 0 if not failed else 1
 
@@ -254,6 +271,15 @@ def main(argv=None):
     rv, uv = read_version(source), read_version(user)
     print(f"{tag} v{rv or '?'}  →  用户级 v{uv or '?'}")
 
+    # 2026-11-26 实测：独立仓库本机停在 v1.15.1 而用户级已到 v1.17.1，
+    # 此时 --fix 会把用户级单向降级回旧版。版本反超一律拒绝覆盖。
+    user_ahead = bool(ver_tuple(uv) and ver_tuple(rv) and ver_tuple(uv) > ver_tuple(rv))
+    if args.fix and user_ahead:
+        print(f"拒绝 --fix：用户级 v{uv} 比{tag} v{rv} 新，覆盖会丢失用户级改动。",
+              file=sys.stderr)
+        print(f"先把{tag}更新到同版本（git pull 或手工同步）再跑一次。", file=sys.stderr)
+        return 1
+
     missing_in_user, missing_in_repo, differing = compare(source, user, args.verbose)
 
     if args.fix:
@@ -294,7 +320,10 @@ def main(argv=None):
     if problems:
         for p in problems:
             print(f"[DIFF] {p}")
-        print(f"结论：不同步（--fix 把{tag}覆盖到用户级；本仓残留副本与独立仓库需手工对齐）")
+        hint = f"（--fix 把{tag}覆盖到用户级；本仓残留副本与独立仓库需手工对齐）"
+        if user_ahead:
+            hint = "（用户级版本更新，需先更新权威源；--fix 已被拒绝）"
+        print(f"结论：不同步{hint}")
         return 1
     print("结论：已比对的所有位置一致")
     return 0
