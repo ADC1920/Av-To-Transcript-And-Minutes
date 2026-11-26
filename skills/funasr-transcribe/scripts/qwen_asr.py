@@ -111,6 +111,118 @@ CLOUD_MODELS = {"message": "qwen-audio-3.1-asr-flash-message",
                 "omni": "qwen3.8-omni-flash",
                 "filetrans": "qwen-audio-3.1-asr-flash-filetrans"}
 
+# ---- 碎段外语误识别兜底 ----
+# 症状：pyannote 把两人对谈切成大量 0.3 秒级碎片，碎段单独送云端（无上下文）时，
+# 多语种模型会按声学特征猜语种，把「嗯」「啊」这类应答输出成韩文/日文/越南文。
+# 实测（2026-11-26，112 分钟双人对谈）：51 个杂字段中位时长 0.32 秒、最长 0.64 秒，
+# 扩边 ±1 秒重识别后 50/50 不再出现外语——证明是上下文缺失而非模型能力问题。
+# 这里只做字符级兜底：文本够短且含外来字符时判为语气词噪音，不改识别结果本身。
+FOREIGN_SCRIPT_RANGES = (
+    (0x0E00, 0x0E7F),   # 泰文（实测出现过「อือ」）
+    (0x1100, 0x11FF),   # 谚文字母
+    (0xAC00, 0xD7A3),   # 谚文音节
+    (0x3040, 0x30FF),   # 日文假名
+    (0x1EA0, 0x1EF9),   # 越南语声调拉丁字母
+)
+SHORT_SEG_MAX_CHARS = 8          # 超过这个字数就按正常语句对待，不兜底
+# 依据：实测杂字串最长「Thế nào?」（7 字符）、「김민수입니다」（6 字符）；
+# 正常中文应答「嗯」「啊」「对对」都在 2 字内。8 字上限能覆盖实测全部杂字，
+# 又不会碰到真实短句（「这个是什么」5 字但无外来字符，本来就不触发）。
+
+
+def is_foreign_script(text):
+    """文本是否含谚文/假名/越南语声调字符"""
+    return any(lo <= ord(ch) <= hi for ch in text for lo, hi in FOREIGN_SCRIPT_RANGES)
+
+
+def scrub_foreign_filler(text, max_chars=SHORT_SEG_MAX_CHARS):
+    """碎段外语误识别兜底：短段且含外来字符时替换为语气词，返回 (新文本, 是否替换)。
+
+    为什么只处理短段：长句里出现外来字符往往是真实混语（人名拼写、英文术语），
+    替换会破坏原意。短段在两人对谈里几乎只可能「嗯」「啊」这类应答，
+    此时外来字符不是真实语种，是上下文缺失导致的语种误判。
+
+    替换成「嗯」而不是删除：保留该段的时间轴占位，避免下游按段对齐时错位；
+    也保留了「此处有人应答」这一事实信息。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return text, False
+    # 只数语言字符，标点不算长度（「嗯。」「아.」都应视为单字）
+    lang_chars = [ch for ch in stripped if ch not in PUNCT and not ch.isspace()]
+    if len(lang_chars) > max_chars:
+        return text, False
+    body = "".join(lang_chars)
+    if not is_foreign_script(body):
+        return text, False
+    # 混合段（外来字符 + 正常中文词）不替换：无法判断哪部分是噪音
+    if any("\u4e00" <= ch <= "\u9fff" for ch in body):
+        return text, False
+    return "嗯。", True
+
+
+def rescue_short_segments(units, audio, ctx, infer):
+    """碎段扩边重识别：只确认该段是否是有效语音，不改写文本。
+
+    为什么不做「扩边后提取语气词」：实测 50 个碎段里只有 12 个（24%）能把语气词
+    定位到目标区间，9 个取到的是邻居发言、29 个提取不到。把这种结果写进原文，
+    等于用 1/4 的收益换 3/4 的错误内容风险。文本改写统一交给 scrub_foreign_filler。
+
+    这里扩边识别后的用途只有两个：
+      1. 扩边后仍然完全没有文字 → 判为静音/噪音段，标记 silent 供下游丢弃；
+      2. 扩边后有内容 → 说明这段确实有人说话，保留其占位（文本仍由字符兜底）。
+    开关默认关闭，因为它要多花一次云端调用，收益只是区分真静音。
+    """
+    import soundfile as sf
+
+    pad = int(ctx["pad_ms"]) * 16
+    max_ms = int(ctx["max_ms"])
+    tmp_dir = Path(tempfile.mkdtemp(prefix="qwen_asr_rescue_")).resolve()
+    atexit.register(lambda d=tmp_dir: shutil.rmtree(d, ignore_errors=True))
+
+    targets = []
+    for i, u in enumerate(units):
+        if u["end_ms"] - u["start_ms"] > max_ms:
+            continue
+        if not is_foreign_script(u["text"]):
+            continue
+        targets.append(i)
+    if not targets:
+        return 0, 0
+
+    paths = []
+    for n, i in enumerate(targets):
+        u = units[i]
+        a = max(0, u["start_ms"] * 16 - pad)
+        b = min(len(audio), u["end_ms"] * 16 + pad)
+        p = tmp_dir / f"rescue_{n:04d}.wav"
+        sf.write(str(p), audio[a:b], 16000)
+        paths.append(str(p))
+
+    parsed = infer(paths, resume=None)
+    confirmed = silent = 0
+    for i, p in zip(targets, parsed):
+        txt = ((p or {}).get("transcription") or "").strip()
+        if not txt:
+            units[i]["silent"] = True
+            silent += 1
+            continue
+        # 有内容但不可信（可能含邻居发言）：只记「确认有人说话」，不动文本
+        units[i]["speech_confirmed"] = True
+        confirmed += 1
+    return confirmed, silent
+
+
+def scrub_units(units, log=print):
+    """统一兜底：短段含外来字符的替换为「嗯。」，返回替换段数"""
+    n = 0
+    for u in units:
+        u["text"], hit = scrub_foreign_filler(u.get("text") or "")
+        n += 1 if hit else 0
+    if n:
+        log(f"[5a] 碎段外语兜底: {n} 段替换为「嗯。」（碎段单独识别缺上下文导致语种误判）")
+    return n
+
 
 def resolve_model_path():
     return str(MS_CACHE) if MS_CACHE.is_dir() else REPO_ID
@@ -1942,6 +2054,14 @@ def run_single(argv=None):
     ap.add_argument("--merge-gap", type=int, default=800, help="相邻同说话人合并间隔阈值ms(默认800,设0关闭)")
     ap.add_argument("--min-seg", type=int, default=400,
                     help="过短语音段并入相邻段的阈值ms(默认400,0=关闭;碎段声纹不稳易造假说话人)")
+    ap.add_argument("--rescue-short", action="store_true",
+                    help="碎段扩边确认(默认关)：短段被识别成外语时，前后各扩一段重识别，"
+                         "只用来区分「真静音」与「确实有人说话」，不改写文本。"
+                         "文本改写由内置字符兜底完成，故本开关只多识别出几个静音段，代价是每段多一次云端调用")
+    ap.add_argument("--rescue-pad-ms", type=int, default=1000,
+                    help="--rescue-short 的前后扩展时长ms(默认1000；太短仍缺上下文，太长会混入对方发言)")
+    ap.add_argument("--rescue-max-ms", type=int, default=1500,
+                    help="--rescue-short 只处理不超过此长度的段(默认1500ms)；更长的段出现外语多为真实混语")
     ap.add_argument("--max-unit", type=int, default=60000,
                     help="发言块时长上限ms,超出强制切分(默认60000,0=关闭;超长块单次自回归转写极慢)")
     ap.add_argument("--vad", choices=["auto", "fsmn", "firered"], default="auto",
@@ -2333,6 +2453,14 @@ def run_single(argv=None):
                 u["language"] = p.get("language")
                 if p.get("confidence") is not None:
                     u["confidence"] = p["confidence"]
+            if args.rescue_short:
+                confirmed, silent = rescue_short_segments(units, audio,
+                                                          {"pad_ms": args.rescue_pad_ms,
+                                                           "max_ms": args.rescue_max_ms},
+                                                          infer)
+                if confirmed or silent:
+                    log(f"[2a] 碎段扩边确认: {confirmed} 段确认有语音，{silent} 段判为静音")
+            scrub_units(units, log=log)
             texts = [u["text"] for u in units]
             if use_aed and aed_ts_usable(parsed):
                 aligns = aed_aligns_from(parsed)
@@ -2543,6 +2671,8 @@ def run_single(argv=None):
                     db[names.get(c) or db_names.get(c) or f"说话人{c}"] = cen
                 save_speaker_db(speaker_db_path, db)
                 log(f"[4c] 声纹库已更新: {speaker_db_path}（共 {len(db)} 条）")
+    # 碎段外语处理分两步：先按需扩边重识别（--rescue-short），再字符兜底，
+    # 见下方 rescue_short_segments / scrub_units。
     for u, p in zip(units, parsed):
         u["text"] = p["transcription"]
         u["language"] = p.get("language")
@@ -2554,6 +2684,15 @@ def run_single(argv=None):
         # 只在有值时下发，避免给 lines 塞一堆 null 干扰下游判断。
         if p.get("confidence") is not None:
             u["confidence"] = p["confidence"]
+    # 碎段外语：先按需扩边确认语音有效性（默认关），再做字符兜底（默认开）
+    if args.rescue_short:
+        confirmed, silent = rescue_short_segments(units, audio,
+                                                  {"pad_ms": args.rescue_pad_ms,
+                                                   "max_ms": args.rescue_max_ms},
+                                                  infer)
+        if confirmed or silent:
+            log(f"[5a] 碎段扩边确认: {confirmed} 段确认有语音，{silent} 段判为静音")
+    scrub_units(units, log=log)
     aligns = None
     if use_aed and all(p.get("timestamp") for p in parsed):
         if all(len(p["timestamp"]) == len(p["transcription"]) for p in parsed):
@@ -2589,7 +2728,9 @@ def run_single(argv=None):
         print(f"{label} [{mm1:02d}:{ss1:02d}-{mm2:02d}:{ss2:02d}] {text}")
         lines.append({"spk": u["spk"], "spk_name": u["spk_name"], "start_ms": s_ms, "end_ms": e_ms,
                       "text": text, "language": u.get("language"),
-                      **({"confidence": u["confidence"]} if u.get("confidence") is not None else {})})
+                      **({"confidence": u["confidence"]} if u.get("confidence") is not None else {}),
+                      **({"silent": True} if u.get("silent") else {}),
+                      **({"speech_confirmed": True} if u.get("speech_confirmed") else {})})
 
     emotions = analyze_emotion(audio_path, args.device) if args.emotion else None
     if emotions:

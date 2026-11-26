@@ -72,6 +72,7 @@ v2.6 ｜ Windows / Linux / macOS ｜ Python 3.10+ ｜ FFmpeg 需在 PATH
 - `--watch DIR` 目录监视，发现新素材（大小稳定后）自动跑完整管线
 - `--log` 落 `run.log`，`manifest.json` 记录每个素材的参数、耗时、状态与实际产物
 - 会议原文里置信度低于 `--low-conf-mark`（默认 0.6）的段落行尾加【待校对】，`--no-conf-mark` 关闭
+- 碎段外语兜底默认开启：两人对谈被切成大量 0.3 秒级碎片时，碎段单独送识别会缺上下文、把「嗯」「啊」输出成韩文/日文/越南文/泰文，这些短段统一改写为「嗯。」，时间轴占位保留
 - `--clean` 删中间件只留成稿，`--flat` 把成稿平铺到素材目录
 
 ### 其他
@@ -171,6 +172,7 @@ python av_to_transcript_and_minutes.py 会议录音.m4a --meeting
 | `--vad auto\|fsmn\|firered` | VAD 后端，`auto` 按用途选 |
 | `--language` / `--dialect` | 强制语言 / 声明方言 |
 | `--asr-extra "--fuzzy --min-seg 300"` | 其余引擎参数原样透传，变更后自动重转 |
+| `--asr-extra "--rescue-short"` | 碎段扩边确认（默认关）：区分真静音与有人说话，不改写文本 |
 | `--demucs-model` | 分离模型，换模型自动重跑 |
 | `--no-separate` / `--no-asr` | 跳过人声分离 / 只拆轨与分离 |
 | `--watch DIR` | 目录监视 |
