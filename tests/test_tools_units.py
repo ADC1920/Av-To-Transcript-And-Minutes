@@ -365,6 +365,19 @@ def test_mcp_options_model():
           == {"min_speakers": 2, "max_speakers": 4})
 
 
+def _ann(annotations, *names):
+    """跨 SDK 版本取注解字段。
+
+    1.x 的 ToolAnnotations 用 camelCase（readOnlyHint），2.x 改成 snake_case
+    （read_only_hint）；工具对象自身的 output_schema / parameters 两个版本同名。
+    按给定顺序试，与 tests/test_mcp_e2e.py 的 attr() 同一套约定。
+    """
+    for n in names:
+        if hasattr(annotations, n):
+            return getattr(annotations, n)
+    raise AttributeError(f"{type(annotations).__name__} 没有这些属性：{names}")
+
+
 def _has_mcp_sdk():
     """CI 的最小 job 不装 mcp；没有它就跳过需要起 server 的用例，而不是报 FAIL。"""
     try:
@@ -401,11 +414,14 @@ def test_mcp_tool_contracts():
     readonly = {"transcribe_status", "transcribe_result", "transcribe_list",
                 "search_meetings", "eval_minutes"}
     for n in readonly:
-        check(f"{n} 标为只读", by_name[n].annotations.readOnlyHint is True)
+        check(f"{n} 标为只读",
+              _ann(by_name[n].annotations, "readOnlyHint", "read_only_hint") is True)
     check("transcribe_cancel 标为破坏性",
-          by_name["transcribe_cancel"].annotations.destructiveHint is True)
+          _ann(by_name["transcribe_cancel"].annotations,
+               "destructiveHint", "destructive_hint") is True)
     check("transcribe_start 标为幂等",
-          by_name["transcribe_start"].annotations.idempotentHint is True)
+          _ann(by_name["transcribe_start"].annotations,
+               "idempotentHint", "idempotent_hint") is True)
 
     # 描述必须够长且写明「何时不用」——短描述是 agent 选错工具的主因
     short = [(t.name, len(t.description or "")) for t in tools if len(t.description or "") < 100]
